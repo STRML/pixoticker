@@ -56,7 +56,6 @@ static esp_timer_handle_t s_guard = nullptr;
 #ifndef PXT_RELAY_KEY
 #define PXT_RELAY_KEY ""
 #endif
-static volatile uint32_t s_tel_errors = 0;
 static volatile uint32_t s_pull_frames = 0;
 static volatile uint32_t s_pull_errors = 0;
 static volatile uint32_t s_pull_seq = 0;
@@ -158,7 +157,6 @@ static String buildStateJson() {
   j += "\"pull_dns\":\"" + String(s_pull_dns) + "\",";
   j += "\"pull_phase\":\"" + String(s_pull_phase) + "\",";
   j += "\"wifi\":" + String((int)WiFi.status()) + ",";
-  j += "\"tel_errors\":" + String(s_tel_errors) + ",";
   j += "\"tls_err\":\"" + String(s_tls_err) + "\",";
   j += "\"tls_fails\":" + String(s_tls_fails) + ",";
   j += "\"tls_mode\":\"" + String(s_tls_insecure ? "insecure" : "verified") + "\",";
@@ -178,36 +176,19 @@ static bool clockReady() {
   return time(nullptr) > 1700000000;  // 2023-11-14
 }
 
-// Private link to the relay: the panel only dials out, so this is how the
-// outside world learns what the panel is doing.
-static void telemetryTask(void *) {
-  char line[160];
-  for (;;) {
-    delay(30000);
-    if (!strlen(PXT_RELAY_KEY) || WiFi.status() != WL_CONNECTED || !clockReady()) continue;
-    if (!s_healthy) continue;  // one TLS session at a time while starting up
-    String body = buildStateJson();
-    WiFiClientSecure sc;
-    if (s_tls_insecure) sc.setInsecure();
-    else sc.setCACert(RELAY_CA);
-    sc.setTimeout(10);
-    WiFiClient &c = sc;
-    if (!c.connect(PXT_RELAY_HOST, PXT_RELAY_PORT)) {
-      s_tel_errors++;
-      continue;
-    }
-    String req = String("POST /pxt/device HTTP/1.1\r\nHost: ") + PXT_RELAY_HOST +
-                 "\r\nX-Api-Key: " PXT_RELAY_KEY +
-                 "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
-                 String(body.length()) + "\r\n\r\n" + body;
-    c.print(req);
-    uint32_t t0 = millis();
-    while (millis() - t0 < 4000 && (c.connected() || c.available())) {
-      if (!c.available()) { delay(10); continue; }
-      c.read();
-    }
-    c.stop();
-  }
+// The panel only dials out. Rather than open a second TLS session just to
+// report itself (the handshake needs a contiguous block the pull already
+// holds), the state rides the pull request as a header the relay stores.
+static String stateHeader() {
+  String j = "{\"build\":\"" + String(__DATE__ " " __TIME__) +
+             "\",\"uptime\":" + String(millis() / 1000) +
+             ",\"heap\":" + String(ESP.getFreeHeap()) +
+             ",\"maxblock\":" + String(ESP.getMaxAllocHeap()) +
+             ",\"frames\":" + String((uint32_t)s_pull_frames) +
+             ",\"errors\":" + String((uint32_t)s_pull_errors) +
+             ",\"rssi\":" + String(WiFi.RSSI()) +
+             ",\"tls\":\"" + String(s_tls_insecure ? "insecure" : "verified") + "\"}";
+  return j;
 }
 
 static bool bodyArg(String &out) {
@@ -915,6 +896,7 @@ static void pullTask(void *) {
     set_phase("request");
     String req = String("GET /pxt/stream?enc=rle&since=") + String(s_pull_seq) +
                  " HTTP/1.1\r\nHost: " + PXT_RELAY_HOST + "\r\nX-Api-Key: " PXT_RELAY_KEY +
+                 "\r\nX-Pxt-State: " + stateHeader() +
                  "\r\nConnection: close\r\n\r\n";
     c.print(req);
     char line[160];
@@ -1030,7 +1012,6 @@ void setup() {
 
   if (strlen(PXT_RELAY_KEY) && strlen(PXT_RELAY_HOST)) {
     xTaskCreatePinnedToCore(pullTask, "pull", 8192, nullptr, 1, nullptr, 0);
-    xTaskCreatePinnedToCore(telemetryTask, "tel", 8192, nullptr, 1, nullptr, 0);
   }
 
   s_http.on("/", HTTP_GET, handleRoot);

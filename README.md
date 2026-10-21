@@ -145,10 +145,14 @@ bootloader is the only reliable way back.
 
 - One TLS session at a time while starting up: the ESP32 needs a contiguous
   block for the RSA handshake, and two sessions do not fit.
-- Telemetry (`POST /device`) needs a second TLS session once frames flow; if
-  the heap is tight it retries every 30 seconds and counts failures in
-  `tel_errors`.
+- The panel reports its state in an `X-Pxt-State` header on the stream request,
+  so telemetry costs no second TLS session. A relay that never sees the panel
+  reconnect will show a stale `device_age`.
 - The relay keeps no history: a client that reconnects gets the newest frame.
+
+`src/relay_ca.h` pins ISRG Root X1, the Let's Encrypt anchor. A relay on any
+other certificate needs its own root pasted there, or the panel falls back to
+unverified TLS after five failures.
 
 ## License
 

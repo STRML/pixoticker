@@ -165,6 +165,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _stream(self, last, op_since=0, enc="raw"):
+        # The panel reports itself on the request rather than opening a second
+        # TLS session it cannot afford: the handshake needs a contiguous block
+        # the stream already holds.
+        state = self.headers.get("X-Pxt-State")
+        if state:
+            try:
+                dev = json.loads(state)
+                dev["_seen"] = int(time.time())
+                with STATE.lock:
+                    STATE.device = dev
+            except Exception:
+                pass
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Transfer-Encoding", "chunked")
