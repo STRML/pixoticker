@@ -4,6 +4,7 @@
   tools/pixels_demo.py [host]        # draws a moving band across the panel
   tools/pixels_demo.py [host] x y r g b
 """
+import os
 import sys
 import time
 import urllib.request
@@ -15,7 +16,8 @@ BASE = f"http://{HOST}"
 def post(path, body, timeout=10):
     # text/plain keeps the body in the "plain" arg; form-encoding would split it.
     req = urllib.request.Request(BASE + path, data=body.encode(), method="POST",
-                                 headers={"Content-Type": "text/plain"})
+                                 headers={"Content-Type": "text/plain",
+                                          "X-Api-Key": os.environ.get("PXT_RELAY_KEY", "")})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode()
 

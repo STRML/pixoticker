@@ -17,7 +17,7 @@ renderer ──POST /frame──▶ relay ──TLS stream──▶ ESP32 ──
 
 ```
 src/                firmware (Arduino, ESP32)
-  main.cpp          boot, HTTP API, relay pull loop, OTA, WiFiManager
+  main.cpp          boot, HTTP API, relay pull loop, OTA, Wi-Fi setup page
   panel.cpp/.h      HUB75 setup, drawing, panel configuration
   relay_ca.h        ISRG Root X1, pinned so the relay chain verifies
   secrets.h.example  copy to secrets.h: relay host, port, key
@@ -65,10 +65,16 @@ tools/
    }
    ```
 
-4. Push a frame:
+4. Push a frame. Straight to the panel while you are on its access point:
 
    ```sh
-   tools/render.py 192.168.4.1 --watch 60
+   PXT_RELAY_KEY=... tools/render.py 192.168.4.1 --watch 60
+   ```
+
+   Through the relay, from anywhere (a 128x64 RGB565 file is 16384 bytes):
+
+   ```sh
+   curl -H "X-Api-Key: $KEY" --data-binary @frame.565 https://relay.example.com/pxt/frame
    ```
 
 ## Configuration
@@ -89,21 +95,24 @@ without the key.
 
 ## Panel API
 
-Served on the panel's own address (`192.168.4.1` on its access point):
+Served on the panel's own address (`192.168.4.1` on its access point). Every route
+that changes the device needs the relay key in an `X-Api-Key` header (the Wi-Fi
+setup form takes it as a field). A build with no key configured leaves the API
+open, which suits the bench and nothing else.
 
 | Route | Method | Purpose |
 |---|---|---|
 | `/state` | GET | heap, pull counters, TLS mode, panel config |
-| `/frame` | GET/POST | read the current frame as a PNG, or post raw RGB565/RGB888 |
+| `/frame` | GET/POST | read the frame as raw RGB565, or post it base64 encoded (RGB565 or RGB888) |
 | `/pixel`, `/pixels` | POST | set one or many pixels |
 | `/brightness` | POST | 0–255 |
-| `/panel` | POST | module layout: width, height, module size, serpentine |
-| `/panel/try` | POST | apply a layout for a few seconds, then revert |
-| `/test` | GET | colour bars |
+| `/panel` | POST | module layout: `across`, `down`, `serp`, `invclk`, `modh`; saves and reboots |
+| `/panel/try` | POST | apply a layout now under the boot watchdog; saved if the panel starts |
+| `/test` | GET | ruler: border, corner markers, 16 px ticks |
 | `/u` | POST | firmware upload |
 | `/update` | GET | upload page |
 | `/safe` | POST | boot into safe mode (no panel init) |
-| `/reboot` | GET | restart |
+| `/reboot` | POST | restart |
 
 ## Relay protocol
 
@@ -113,7 +122,7 @@ four-byte magic, a big-endian sequence number, then the payload:
 ```
 PXTF + seq + 16384 bytes     raw frame, 128×64 RGB565
 PXTR + seq + runs            the same frame, run encoded: hi, lo, count
-PXTO + n + json              one op: brightness, ota, panel config, reboot
+PXTO + n + json              one op: brightness, ota, reboot
 ```
 
 `PXTR` is only used when the client asks for it (`/stream?enc=rle`) and the
@@ -121,8 +130,8 @@ encoded form is smaller. On a typical chart it is 2.5 KB against 16 KB, which
 matters because a panel's receive window and the round trip cap throughput far
 below its Wi-Fi link speed.
 
-Relay routes: `POST /frame`, `GET /stream?since=N&enc=rle`, `GET /latest`,
-`POST /device`, `POST /op`, `POST /fw`, `GET /health`.
+Relay routes: `POST /frame`, `GET /stream?since=N&enc=rle`, `GET /next`, `GET /raw`,
+`GET /latest`, `POST /op`, `GET`/`POST /device`, `GET /fw`, `GET /health`.
 
 Frames are written straight into the display buffer as they arrive, so a
 truncated frame never reaches the panel and a new one is only shown once it is
@@ -134,7 +143,7 @@ tear free.
 The panel never trusts the image it just booted blindly. On first boot after an
 update it waits for one complete frame; if none arrives it resets into the
 previous image. A boot counter plus a one-shot timer catches a panel
-configuration that hangs boot, and `/safe` (or five reboots in a row) boots
+configuration that hangs boot, and `/safe` (or two failed boots in a row) boots
 with the panel disabled so the HTTP API stays reachable.
 
 **Dump your own stock firmware before replacing it.** The vendor image is not

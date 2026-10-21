@@ -10,6 +10,7 @@ Charts are drawn here, so the ESP32 only needs to receive pixels.
 import argparse
 import base64
 import json
+import os
 import time
 import urllib.parse
 import urllib.request
@@ -99,7 +100,8 @@ def push(host, px):
     payload = base64.b64encode(bytes(body))
     req = urllib.request.Request(
         f"http://{host}/frame?fmt=rgb565", data=payload, method="POST",
-        headers={"Content-Type": "text/plain"})
+        headers={"Content-Type": "text/plain",
+                 "X-Api-Key": os.environ.get("PXT_RELAY_KEY", "")})
     with urllib.request.urlopen(req, timeout=20) as r:
         return r.read().decode()
 

@@ -7,7 +7,7 @@ HOST="${1:-192.168.4.1}"
 BIN="${2:-.pio/build/esp32dev/firmware.bin}"
 
 [ -f "$BIN" ] || { echo "no image: $BIN"; exit 1; }
-SIZE=$(stat -f%z "$BIN")
+SIZE=$(wc -c < "$BIN" | tr -d " ")
 echo "image: $BIN ($SIZE bytes)"
 
 echo "before:"
@@ -17,7 +17,7 @@ echo "uploading..."
 # /u reads server->upload(): multipart only. Expect: off, the ESP32 server
 # answers before the body otherwise. Retry once, the parser is occasionally flaky.
 upload() {
-  curl -sS -m 180 -H 'Expect:' -F "update=@$BIN;type=application/octet-stream" "http://$HOST/u"
+  curl -sS -m 180 -H 'Expect:' -H "X-Api-Key: ${PXT_RELAY_KEY:-}" -F "update=@$BIN;type=application/octet-stream" "http://$HOST/u"
 }
 RESP=$(upload || true)
 case "$RESP" in

@@ -1,7 +1,8 @@
 // PixoTicker replacement firmware: network-driven HUB75 display.
 //
 // Recovery model:
-//   * WiFiManager runs first, with the vendor's AP name "PixoTicker".
+//   * The soft AP "PixoTicker" (the vendor's name) comes up on every boot and
+//     serves a Wi-Fi setup page at /wifi.
 //   * A soft AP with the same name stays up after every successful boot.
 //   * POST /u accepts a firmware image (same path the vendor portal exposes).
 //   * RTC boot counter + 8 s one-shot timer: a panel configuration that hangs
@@ -150,6 +151,47 @@ static void guardDisarm() {
 }
 
 // ---------------------------------------------------------------- http
+
+// Every route that changes the device needs the relay key in X-Api-Key. A build
+// with no key configured leaves the API open, for bench use on the access point.
+static bool keyMatches(const String &supplied) {
+  const char *want = PXT_RELAY_KEY;
+  size_t n = strlen(want);
+  if (supplied.length() != n) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < n; i++) diff |= (uint8_t)(supplied[i] ^ want[i]);
+  return diff == 0;
+}
+
+static bool authed() {
+  return !strlen(PXT_RELAY_KEY) || keyMatches(s_http.header("X-Api-Key"));
+}
+
+static bool requireAuth() {
+  if (authed()) return true;
+  s_http.send(401, "text/plain", "key required");
+  return false;
+}
+
+static void onAuth(const char *uri, HTTPMethod m, WebServer::THandlerFunction f) {
+  s_http.on(uri, m, [f]() {
+    if (requireAuth()) f();
+  });
+}
+
+static String htmlEscape(const String &in) {
+  String out;
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '"') out += "&quot;";
+    else if (c == '\'') out += "&#39;";
+    else out += c;
+  }
+  return out;
+}
 
 static void sendJson(const String &body) {
   s_http.sendHeader("Access-Control-Allow-Origin", "*");
@@ -500,12 +542,13 @@ class OtaHandler : public RequestHandler {
   void upload(WebServer &srv, const String &u, HTTPUpload &up) override {
     (void)srv;
     (void)u;
-    otaChunk(up);
+    if (authed()) otaChunk(up);
   }
   bool handle(WebServer &srv, HTTPMethod m, const String &u) override {
     (void)srv;
     (void)m;
     (void)u;
+    if (!requireAuth()) return true;
     handleUpdateDone();
     return true;
   }
@@ -513,9 +556,14 @@ class OtaHandler : public RequestHandler {
 
 static const char UPDATE_FORM[] PROGMEM =
     "<!doctype html><html><body style='font-family:sans-serif;background:#111;color:#eee'>"
-    "<h2>PixoTicker firmware</h2><form method='POST' action='/u' enctype='multipart/form-data'>"
-    "<input type='file' name='update' accept='.bin'><button>Update</button></form>"
-    "<p><a href='/state' style='color:#4af'>state</a></p></body></html>";
+    "<h2>PixoTicker firmware</h2>"
+    "<p><input id='k' type='password' placeholder='key'></p>"
+    "<p><input id='f' type='file' accept='.bin'><button onclick='go()'>Update</button></p>"
+    "<pre id='o'></pre>"
+    "<script>function go(){var f=document.getElementById('f').files[0],d=new FormData();"
+    "d.append('update',f);fetch('/u',{method:'POST',headers:{'X-Api-Key':document.getElementById('k').value},"
+    "body:d}).then(function(r){return r.text()}).then(function(t){document.getElementById('o').textContent=t})}"
+    "</script><p><a href='/state' style='color:#4af'>state</a></p></body></html>";
 
 static void handleUpdatePage() { s_http.send_P(200, "text/html", UPDATE_FORM); }
 
@@ -526,7 +574,7 @@ static void handleRoot() {
              "<li><a href='/wifi' style='color:#4af'>/wifi</a> (network)</li>"
              "<li><a href='/test' style='color:#4af'>/test</a> (ruler)</li>"
              "<li><a href='/update' style='color:#4af'>/update</a> (OTA)</li>"
-             "<li>POST /frame, /pixel, /pixels, /brightness, /panel, /safe</li></ul></body>";
+             "<li>POST /frame, /pixel, /pixels, /brightness, /panel, /safe (X-Api-Key)</li></ul></body>";
   s_http.send(200, "text/html", j);
 }
 
@@ -535,16 +583,22 @@ static void handleWifiPage() {
   String page = "<!doctype html><body style='font-family:sans-serif;background:#111;color:#eee'>"
                 "<h2>WiFi</h2><ul>";
   for (int i = 0; i < n; i++)
-    page += "<li>" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)</li>";
+    page += "<li>" + htmlEscape(WiFi.SSID(i)) + " (" + String(WiFi.RSSI(i)) + " dBm)</li>";
   page += "</ul><form method='POST' action='/wifisave'>"
           "<p>SSID<br><input name='s' maxlength='32'></p>"
           "<p>Password<br><input name='p' type='password' maxlength='64'></p>"
+          "<p>Panel key<br><input name='k' type='password'></p>"
           "<button>Save and reboot</button></form></body>";
   WiFi.scanDelete();
   s_http.send(200, "text/html", page);
 }
 
 static void handleWifiSave() {
+  // A browser form cannot set a header, so this route takes the key as a field.
+  if (strlen(PXT_RELAY_KEY) && !keyMatches(s_http.arg("k"))) {
+    s_http.send(401, "text/plain", "key required");
+    return;
+  }
   String s = s_http.arg("s"), p = s_http.arg("p");
   s_prefs.begin("pxt", false);
   s_prefs.putString("ssid", s);
@@ -695,6 +749,10 @@ static void promoteInstalled() {
   s_prefs.end();
 }
 
+static String s_ota_path, s_ota_sha;
+static size_t s_ota_want = 0;
+static volatile bool s_ota_pending = false;
+
 static void otaOp(const char *js) {
   String path = jsonStr(js, "path");
   String sha = jsonStr(js, "sha256");
@@ -713,9 +771,19 @@ static void otaOp(const char *js) {
     Serial.println("[ota] already running this image");
     return;
   }
-  Serial.printf("[ota] %s %u\n", path.c_str(), (unsigned)want);
-  if (!otaFrom(path, want, sha)) return;
-  rememberInstalled(sha);
+  // The stream still holds a TLS session and a second handshake does not fit
+  // beside it, so the pull task runs the download after it closes the stream.
+  s_ota_path = path;
+  s_ota_sha = sha;
+  s_ota_want = want;
+  s_ota_pending = true;
+}
+
+static void otaRun() {
+  s_ota_pending = false;
+  Serial.printf("[ota] %s %u\n", s_ota_path.c_str(), (unsigned)s_ota_want);
+  if (!otaFrom(s_ota_path, s_ota_want, s_ota_sha)) return;
+  rememberInstalled(s_ota_sha);
   Serial.println("[ota] written, restarting");
   delay(300);
   ESP.restart();
@@ -799,7 +867,7 @@ struct FrameSink {
           mode = 0;
           win = 0;
         } else if (opneed > sizeof(opbuf) - 1) {
-          skipn = (uint8_t)(opneed - 1);  // drop the body, keep the stream aligned
+          skipn = opneed;  // drop the whole body, keep the stream aligned
           mode = 3;
           win = 0;
         }
@@ -997,6 +1065,7 @@ static void pullTask(void *) {
         s_pull_frames = sink.frames;
         s_pull_seq = sink.seq;
       }
+      if (s_ota_pending) break;
     }
   stream_end:
     if (sink.frames) {
@@ -1005,6 +1074,7 @@ static void pullTask(void *) {
     }
 
     c.stop();
+    if (s_ota_pending) otaRun();
     delay(300);
   }
 }
@@ -1062,19 +1132,19 @@ void setup() {
   s_http.on("/wifi", HTTP_GET, handleWifiPage);
   s_http.on("/wifisave", HTTP_POST, handleWifiSave);
   s_http.on("/state", HTTP_GET, handleState);
-  s_http.on("/test", HTTP_GET, handleTest);
-  s_http.on("/frame", HTTP_POST, handleFramePost);
+  onAuth("/test", HTTP_GET, handleTest);
+  onAuth("/frame", HTTP_POST, handleFramePost);
   s_http.on("/frame", HTTP_GET, handleFrameGet);
-  s_http.on("/pixel", HTTP_POST, handlePixel);
-  s_http.on("/pixels", HTTP_POST, handlePixels);
-  s_http.on("/brightness", HTTP_POST, handleBrightness);
-  s_http.on("/panel", HTTP_POST, handlePanelCfg);
-  s_http.on("/panel/try", HTTP_POST, handlePanelTry);
-  s_http.on("/boots", HTTP_POST, handleBootsReset);
-  s_http.on("/safe", HTTP_POST, handleSafe);
+  onAuth("/pixel", HTTP_POST, handlePixel);
+  onAuth("/pixels", HTTP_POST, handlePixels);
+  onAuth("/brightness", HTTP_POST, handleBrightness);
+  onAuth("/panel", HTTP_POST, handlePanelCfg);
+  onAuth("/panel/try", HTTP_POST, handlePanelTry);
+  onAuth("/boots", HTTP_POST, handleBootsReset);
+  onAuth("/safe", HTTP_POST, handleSafe);
   s_http.on("/update", HTTP_GET, handleUpdatePage);
   s_http.addHandler(new OtaHandler());
-  s_http.on("/reboot", HTTP_GET, []() {
+  onAuth("/reboot", HTTP_POST, []() {
     s_http.send(200, "text/plain", "rebooting");
     delay(300);
     ESP.restart();
@@ -1083,12 +1153,14 @@ void setup() {
     if (s_http.method() == HTTP_OPTIONS) {
       s_http.sendHeader("Access-Control-Allow-Origin", "*");
       s_http.sendHeader("Access-Control-Allow-Methods", "GET,POST");
-      s_http.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+      s_http.sendHeader("Access-Control-Allow-Headers", "Content-Type,X-Api-Key");
       s_http.send(204);
       return;
     }
     s_http.send(404, "text/plain", "not found");
   });
+  static const char *kHeaders[] = {"X-Api-Key"};
+  s_http.collectHeaders(kHeaders, 1);
   s_http.begin();
   Serial.printf("[pxt] http up, heap=%u, boots=%u, panel=%d\n", ESP.getFreeHeap(),
                 (unsigned)s_boots, panel_active());

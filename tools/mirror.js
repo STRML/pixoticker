@@ -4,6 +4,7 @@
 // does the capture and the upload, so the host Mac only runs the browser.
 //
 //   window.__PXT_HOST = '192.168.4.1';   // default
+//   window.__PXT_KEY = '...';            // the panel key, if the build has one
 //   window.__mirror.running = false;      // stop
 //
 // WebGL canvases clear their drawing buffer after compositing, so a capture
@@ -56,8 +57,8 @@
         bin += String.fromCharCode.apply(null, raw.subarray(i, i + 4096));
       fetch(`http://${HOST}/frame?fmt=rgb565`, {
         method: "POST",
-        mode: "no-cors", // panel sends no CORS headers on /frame
-        headers: { "Content-Type": "text/plain" },
+        mode: "cors", // the panel answers the preflight for X-Api-Key
+        headers: { "Content-Type": "text/plain", "X-Api-Key": window.__PXT_KEY || "" },
         body: btoa(bin),
       });
       window.__mirror.sent++;
