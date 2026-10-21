@@ -98,6 +98,19 @@ static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return (uint16_t)(((r & 0xF8) << 8) | ((b & 0xFC) << 3) | (g >> 3));
 }
 
+// The display buffer always matches the active layout. A stale buffer from a
+// smaller layout would be read and written past its end.
+static size_t s_fb_px = 0;
+
+static bool ensureFb(const PanelCfg &c) {
+  size_t px = (size_t)panelWidth(c) * panelHeight(c);
+  if (s_fb && s_fb_px == px) return true;
+  free(s_fb);
+  s_fb = (uint16_t *)calloc(px, sizeof(uint16_t));
+  s_fb_px = s_fb ? px : 0;
+  return s_fb != nullptr;
+}
+
 // ---------------------------------------------------------------- guard
 
 static void guardExpired(void *) {
@@ -406,8 +419,7 @@ static void handlePanelTry() {
     s_cfg = c;
     savePanel(c);
     s_boots = 0;
-    uint16_t w = panelWidth(c), h = panelHeight(c);
-    if (!s_fb) s_fb = (uint16_t *)calloc((size_t)w * h, sizeof(uint16_t));
+    ensureFb(c);
     panel_setBrightness(s_brightness);
   }
   sendJson("{\"ok\":" + String(ok ? "true" : "false") +
@@ -803,7 +815,8 @@ struct FrameSink {
       } else {
         rpphase = 0;
         uint16_t v = ((uint16_t)rphi << 8) | rplo;
-        for (uint8_t k = 0; k < b && runpix < 8192; k++) s_fb[runpix++] = v;
+        for (uint8_t k = 0; k < b && runpix < 8192; k++, runpix++)
+          if (runpix < s_fb_px) s_fb[runpix] = v;
         if (runpix >= 8192) finish();
       }
       return;
@@ -837,10 +850,13 @@ struct FrameSink {
       }
       return;
     }
-    if (got & 1)
-      s_fb[got >> 1] = (uint16_t)((s_fb[got >> 1] & 0xFF00) | b);
-    else
-      s_fb[got >> 1] = (uint16_t)(((uint16_t)b << 8) | (s_fb[got >> 1] & 0xFF));
+    // The wire frame is always 128x64; pixels past the active layout are dropped.
+    if ((got >> 1) < s_fb_px) {
+      if (got & 1)
+        s_fb[got >> 1] = (uint16_t)((s_fb[got >> 1] & 0xFF00) | b);
+      else
+        s_fb[got >> 1] = (uint16_t)(((uint16_t)b << 8) | (s_fb[got >> 1] & 0xFF));
+    }
     got++;
     if (got == 16384) finish();
   }
@@ -936,7 +952,8 @@ static void pullTask(void *) {
         uint8_t b = rx[i];
         if (!in_payload) {
           if (b == '\n') {
-            hex[hexn < (int)sizeof(hex) - 1 ? hexn : (int)sizeof(hex) - 1] = 0;
+            if (hexn == 0) continue;  // CRLF closing the previous chunk
+            hex[hexn] = 0;
             long n = strtol(hex, nullptr, 16);
             hexn = 0;
             if (n <= 0) goto stream_end;
@@ -1001,8 +1018,7 @@ void setup() {
     guardDisarm();
     if (ok) {
       s_boots = 0;
-      uint16_t w = panelWidth(s_cfg), h = panelHeight(s_cfg);
-      s_fb = (uint16_t *)calloc((size_t)w * h, sizeof(uint16_t));
+      ensureFb(s_cfg);
       panel_setBrightness(s_brightness);
     } else {
       Serial.println("[pxt] panel begin failed, network only");
@@ -1094,8 +1110,7 @@ static void serialLine(String line) {
         s_cfg = c;
         savePanel(c);
         s_boots = 0;
-        uint16_t w = panelWidth(c), h = panelHeight(c);
-        if (!s_fb) s_fb = (uint16_t *)calloc((size_t)w * h, sizeof(uint16_t));
+        ensureFb(c);
         panel_setBrightness(s_brightness);
         panel_test_pattern();
       }
