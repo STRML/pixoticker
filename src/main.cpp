@@ -882,6 +882,18 @@ struct FrameSink {
       }
       return;
     }
+    if (mode == 4 && need_seq > 0) {
+      // The sequence number precedes the runs; reading it as a run shifts
+      // every later (hi, lo, count) triple by one byte.
+      seqb[4 - need_seq] = b;
+      if (--need_seq == 0) {
+        seq = ((uint32_t)seqb[0] << 24) | ((uint32_t)seqb[1] << 16) |
+              ((uint32_t)seqb[2] << 8) | seqb[3];
+        runpix = 0;
+        rpphase = 0;
+      }
+      return;
+    }
     if (mode == 4) {
       // hi, lo, count: the panel decodes runs instead of raw pixels because
       // its receive window will not carry 16 KB per frame at stream rate.
