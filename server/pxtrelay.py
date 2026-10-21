@@ -206,7 +206,7 @@ class Handler(BaseHTTPRequestHandler):
                 for op in ops:
                     # One op per message: the firmware buffer is small, and a
                     # batch that overflows would be dropped after /op said ok.
-                    body = json.dumps([op]).encode()
+                    body = json.dumps([op], separators=(",", ":")).encode()
                     if len(body) > OP_MAX_BYTES:
                         continue
                     payload = b"PXTO" + bytes([len(body)]) + body
@@ -292,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError
             except Exception:
                 return self._json(400, {"error": "bad op"})
-            if len(json.dumps([op])) > OP_MAX_BYTES:
+            if len(json.dumps([op], separators=(",", ":"))) > OP_MAX_BYTES:
                 return self._json(413, {"error": "op too large"})
             with STATE.lock:
                 STATE.seq += 1
