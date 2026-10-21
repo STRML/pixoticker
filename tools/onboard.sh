@@ -30,6 +30,12 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 HOSTNAME_="${PXT_RELAY_HOST:-}"
 KEYVAL="${PXT_RELAY_KEY:-}"
+# Fall back to src/secrets.h so the header comment holds.
+secret() { sed -n "s/^#define $1 \"\(.*\)\".*/\1/p" src/secrets.h 2>/dev/null | head -1; }
+if [ -f src/secrets.h ]; then
+  [ -n "$HOSTNAME_" ] || HOSTNAME_="$(secret PXT_RELAY_HOST)"
+  [ -n "$KEYVAL" ] || KEYVAL="$(secret PXT_RELAY_KEY)"
+fi
 if [ -z "$KEYVAL" ] && [ -n "${PXT_KEY_FILE:-}" ]; then
   [ -f "$PXT_KEY_FILE" ] || fail "missing $PXT_KEY_FILE"
   KEYVAL="$(cat "$PXT_KEY_FILE")"
@@ -59,7 +65,7 @@ curl -sS -m 5 "http://$HOST/state" || fail "no /state from $HOST"
 echo
 
 echo "== flash"
-tools/flash.sh "$HOST" "$BIN"
+PXT_RELAY_KEY="$KEYVAL" tools/flash.sh "$HOST" "$BIN"
 
 echo "== verify (up to 2 min)"
 frames=0

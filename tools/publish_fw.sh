@@ -13,14 +13,16 @@ set -euo pipefail
 SSH_HOST="${PXT_RELAY_SSH:-}"
 URL="${PXT_RELAY_URL:-}"
 KEYVAL="${PXT_RELAY_KEY:-}"
+RELAY_HOST="${PXT_RELAY_HOST:-}"
 BIN=".pio/build/esp32dev/firmware.bin"
 cd "$(dirname "$0")/.."
 
 [ -n "$URL" ] || { echo "set PXT_RELAY_URL, for example https://relay.example.com/pxt"; exit 1; }
 [ -n "$SSH_HOST" ] || { echo "set PXT_RELAY_SSH to the host that serves the relay"; exit 1; }
 [ -n "$KEYVAL" ] || { echo "set PXT_RELAY_KEY"; exit 1; }
+[ -n "$RELAY_HOST" ] || { echo "set PXT_RELAY_HOST: an image built without it never dials out"; exit 1; }
 
-PLATFORMIO_BUILD_FLAGS="-DPXT_RELAY_HOST=\\\"${PXT_RELAY_HOST:-}\\\" -DPXT_RELAY_KEY=\\\"${KEYVAL}\\\"" pio run -e esp32dev >/dev/null
+PLATFORMIO_BUILD_FLAGS="-DPXT_RELAY_HOST=\\\"${RELAY_HOST}\\\" -DPXT_RELAY_KEY=\\\"${KEYVAL}\\\"" pio run -e esp32dev >/dev/null
 
 [ "${#KEYVAL}" -ge 16 ] || { echo "key too short"; exit 1; }
 grep -a -q -F -- "$KEYVAL" "$BIN" || { echo "refusing: relay key is not embedded in $BIN"; exit 1; }

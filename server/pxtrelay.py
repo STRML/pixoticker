@@ -77,7 +77,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _auth(self, q):
         supplied = self.headers.get("X-Api-Key") or (q.get("key", [""])[0])
-        return bool(self.key) and hmac.compare_digest(supplied, self.key)
+        return bool(self.key) and hmac.compare_digest(supplied.encode(), self.key.encode())
 
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
@@ -103,8 +103,15 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    @staticmethod
+    def _int(q, name, default):
+        try:
+            return int(q.get(name, [str(default)])[0])
+        except ValueError:
+            return default
+
     def _since(self, q):
-        since = int(q.get("since", ["0"])[0])
+        since = self._int(q, "since", 0)
         # A restart reseeds the counter; a cursor from a previous run can sit
         # above it. Without this the stream waits until it catches up (hours).
         return 0 if since > STATE.seq else since
@@ -121,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(401, {"error": "unauthorized"})
         if u.path == "/next":
             since = self._since(q)
-            wait = min(30, max(0, int(q.get("wait", ["25"])[0])))
+            wait = min(30, max(0, self._int(q, "wait", 25)))
             deadline = time.time() + wait
             with STATE.lock:
                 while STATE.seq <= since and time.time() < deadline:
@@ -131,7 +138,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream(self._since(q), enc=q.get("enc", ["raw"])[0])
         if u.path == "/raw":
             since = self._since(q)
-            wait = min(30, max(0, int(q.get("wait", ["25"])[0])))
+            wait = min(30, max(0, self._int(q, "wait", 25)))
             deadline = time.time() + wait
             with STATE.lock:
                 while STATE.seq <= since and time.time() < deadline:
@@ -242,7 +249,10 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if not self._auth(q):
             return self._json(401, {"error": "unauthorized"})
-        n = int(self.headers.get("Content-Length", "0"))
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            n = 0
         if n <= 0 or n > max(MAX_FRAME, 8192):
             return self._json(413, {"error": "bad size"})
         body = self.rfile.read(n)
@@ -306,7 +316,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global MAX_FRAME
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18100)
     ap.add_argument("--bind", default="127.0.0.1")
