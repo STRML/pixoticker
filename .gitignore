@@ -1,0 +1,17 @@
+# build output
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# local secrets: relay host, port and key
+src/secrets.h
+
+# firmware images and flash dumps of the vendor's stock firmware
+*.bin
+!assets/*.bin
+dumps/
+
+# scratch
+.scratch/
+*.log
+.DS_Store
