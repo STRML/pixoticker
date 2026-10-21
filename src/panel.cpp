@@ -1,6 +1,8 @@
 #include "panel.h"
 
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // Pin map for the PixoTicker board (Tronbyt BOARD_PIXOTICKER).
 // One 64x32 HUB75 module per chain position.
@@ -21,8 +23,18 @@ static const int8_t P_OE = 25;
 
 static MatrixPanel_I2S_DMA *s_matrix = nullptr;
 static PanelCfg s_cfg = {2, 2, 0, 1};
+static SemaphoreHandle_t s_mu = xSemaphoreCreateRecursiveMutex();
+
+void panel_lock() { xSemaphoreTakeRecursive(s_mu, portMAX_DELAY); }
+void panel_unlock() { xSemaphoreGiveRecursive(s_mu); }
+
+struct PanelGuard {
+  PanelGuard() { panel_lock(); }
+  ~PanelGuard() { panel_unlock(); }
+};
 
 bool panel_begin(const PanelCfg &cfg) {
+  PanelGuard g;
   if (cfg.across == 0 || cfg.down == 0 || cfg.across * cfg.down > 4) return false;
   s_cfg = cfg;
 
@@ -53,6 +65,7 @@ bool panel_begin(const PanelCfg &cfg) {
 }
 
 void panel_end() {
+  PanelGuard g;
   if (s_matrix) {
     s_matrix->stopDMAoutput();
     delete s_matrix;
@@ -60,9 +73,13 @@ void panel_end() {
   }
 }
 
-bool panel_active() { return s_matrix != nullptr; }
+bool panel_active() {
+  PanelGuard g;
+  return s_matrix != nullptr;
+}
 
 void panel_setBrightness(uint8_t level) {
+  PanelGuard g;
   if (s_matrix) s_matrix->setBrightness8(level);
 }
 
@@ -85,6 +102,7 @@ static inline void map_px(int x, int y, int *ox, int *oy) {
 }
 
 void panel_show(const uint16_t *fb) {
+  PanelGuard g;
   if (!s_matrix || !fb) return;
   uint16_t w = panelWidth(s_cfg);
   int mh = s_cfg.modH ? s_cfg.modH : MODULE_H;

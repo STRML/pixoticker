@@ -30,5 +30,11 @@ void panel_show(const uint16_t *fb);
 void panel_setBrightness(uint8_t level);  // 0..255
 void panel_test_pattern();
 
+// The pull task draws while HTTP handlers reconfigure. Hold this around any
+// run of writes to the display buffer; panel_* calls take it themselves, and it
+// is recursive, so nesting is safe.
+void panel_lock();
+void panel_unlock();
+
 // true when a panel was initialised this boot.
 bool panel_active();

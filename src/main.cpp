@@ -62,12 +62,20 @@ static volatile uint32_t s_pull_seq = 0;
 static volatile int32_t s_pull_code = 0;
 static volatile uint32_t s_tls_fails = 0;
 static volatile bool s_tls_insecure = false;
+static uint32_t s_insecure_at = 0;
+static const int TLS_VERIFY_FAILED = -0x2700;  // MBEDTLS_ERR_X509_CERT_VERIFY_FAILED
+static const uint32_t TLS_RETRY_MS = 30UL * 60 * 1000;
 static volatile bool s_tls_verified = false;
 static char s_tls_err[64] = "";
 static volatile uint32_t s_ops_applied = 0;
 static char s_pull_dns[24] = "?";
 static char s_pull_phase[24] = "idle";
 static void set_phase(const char *p) { snprintf(s_pull_phase, sizeof(s_pull_phase), "%s", p); }
+
+// Hold a freshly flashed image in "pending verify" so the bootloader rolls it
+// back if it resets before a frame arrives. Without this override the Arduino
+// core marks every image valid at boot. The symbol is C, so it needs C linkage.
+extern "C" bool verifyRollbackLater() { return true; }
 
 // ---------------------------------------------------------------- config
 
@@ -104,10 +112,13 @@ static size_t s_fb_px = 0;
 
 static bool ensureFb(const PanelCfg &c) {
   size_t px = (size_t)panelWidth(c) * panelHeight(c);
-  if (s_fb && s_fb_px == px) return true;
-  free(s_fb);
-  s_fb = (uint16_t *)calloc(px, sizeof(uint16_t));
-  s_fb_px = s_fb ? px : 0;
+  panel_lock();  // the pull task writes s_fb under this lock
+  if (!s_fb || s_fb_px != px) {
+    free(s_fb);
+    s_fb = (uint16_t *)calloc(px, sizeof(uint16_t));
+    s_fb_px = s_fb ? px : 0;
+  }
+  panel_unlock();
   return s_fb != nullptr;
 }
 
@@ -881,6 +892,10 @@ static void pullTask(void *) {
       delay(1000);
       continue;
     }
+    if (s_tls_insecure && millis() - s_insecure_at > TLS_RETRY_MS) {
+      s_tls_insecure = false;  // try the verified chain again
+      s_tls_fails = 0;
+    }
     WiFiClientSecure sc;
     if (s_tls_insecure) sc.setInsecure();  // still encrypted, chain unverified
     else sc.setCACert(RELAY_CA);
@@ -898,17 +913,21 @@ static void pullTask(void *) {
       char err[64] = "";
       int rc = sc.lastError(err, sizeof(err));
       snprintf(s_tls_err, sizeof(s_tls_err), "%d %s", rc, err);
-      s_tls_fails = s_tls_fails + 1;
+      // Only a rejected certificate counts. A dropped link or a refused TCP
+      // connect says nothing about the chain and must not downgrade the session.
+      s_tls_fails = (rc == TLS_VERIFY_FAILED) ? s_tls_fails + 1 : 0;
       if (!s_tls_insecure && s_tls_fails >= 5) {
-        // Keep the display alive while the chain or clock is sorted out; the
-        // key still travels inside TLS.
+        // Keep the display alive while the chain is sorted out; the key still
+        // travels inside TLS, and the verified chain is retried every 30 minutes.
         s_tls_insecure = true;
+        s_insecure_at = millis();
         Serial.println("[pull] verification failed five times, unverified TLS");
       }
       delay(3000);
       continue;
     }
     s_tls_verified = !s_tls_insecure;
+    s_tls_fails = 0;
     set_phase("request");
     String req = String("GET /pxt/stream?enc=rle&since=") + String(s_pull_seq) +
                  " HTTP/1.1\r\nHost: " + PXT_RELAY_HOST + "\r\nX-Api-Key: " PXT_RELAY_KEY +
@@ -948,6 +967,7 @@ static void pullTask(void *) {
         continue;
       }
       idle = millis();
+      panel_lock();
       for (int i = 0; i < r; i++) {
         uint8_t b = rx[i];
         if (!in_payload) {
@@ -956,7 +976,10 @@ static void pullTask(void *) {
             hex[hexn] = 0;
             long n = strtol(hex, nullptr, 16);
             hexn = 0;
-            if (n <= 0) goto stream_end;
+            if (n <= 0) {
+              panel_unlock();
+              goto stream_end;
+            }
             left = n;
             in_payload = true;
           } else if (b != '\r' && hexn < (int)sizeof(hex) - 1) {
@@ -969,6 +992,7 @@ static void pullTask(void *) {
           in_payload = false;  // the trailing CRLF is skipped by the header state
         }
       }
+      panel_unlock();
       if (sink.frames) {
         s_pull_frames = sink.frames;
         s_pull_seq = sink.seq;
@@ -1026,6 +1050,10 @@ void setup() {
 #endif
   }
 
+  if (!strlen(PXT_RELAY_KEY) || !strlen(PXT_RELAY_HOST)) {
+    // Offline build: no frame will ever prove the image, so trust it now.
+    esp_ota_mark_app_valid_cancel_rollback();
+  }
   if (strlen(PXT_RELAY_KEY) && strlen(PXT_RELAY_HOST)) {
     xTaskCreatePinnedToCore(pullTask, "pull", 8192, nullptr, 1, nullptr, 0);
   }

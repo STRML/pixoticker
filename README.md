@@ -152,7 +152,8 @@ bootloader is the only reliable way back.
 
 `src/relay_ca.h` pins ISRG Root X1, the Let's Encrypt anchor. A relay on any
 other certificate needs its own root pasted there, or the panel falls back to
-unverified TLS after five failures.
+unverified TLS after five rejected certificates, and retries the verified chain
+every 30 minutes.
 
 ## License
 
