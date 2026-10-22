@@ -67,12 +67,14 @@ class Screen:
         self.d = ImageDraw.Draw(self.img)
         self.cols = COLS
 
-    def price(self, symbol, value, change):
-        """Header row: symbol and change on the left, the number on the right."""
+    def price(self, symbol, value, change, period):
+        """Header row: symbol, the change over `period` ("24h", "30d") on the
+        left, the number on the right."""
         pct = f"{change:+.1f}%"
         color = UP if change >= 0 else DOWN
-        font.draw(self.d, (1, 0), symbol, FG)
-        font.draw(self.d, (1 + font.width(symbol + " "), 0), pct, color)
+        x = font.draw(self.d, (1, 0), symbol, FG) + font.ADVANCE
+        x = font.draw(self.d, (x, 0), period, DIM) + font.ADVANCE
+        font.draw(self.d, (x, 0), pct, color)
         num = f"${value:,.2f}"
         font.draw(self.d, (W - 1 - font.width(num), 0), num, FG)
 

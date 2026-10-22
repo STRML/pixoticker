@@ -117,6 +117,10 @@ without the key.
 
 ## Shipping firmware
 
+> **Broken for now:** the panel stops the download after 64 KB, so nothing
+> installs ([issue 2](https://github.com/STRML/pixoticker/issues/2)). Flash over
+> USB or the access point until that's fixed.
+
 The panel has no inbound port, so firmware reaches it the same way frames do.
 Set four variables and run `tools/publish_fw.sh`:
 
