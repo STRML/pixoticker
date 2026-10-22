@@ -42,6 +42,7 @@ tools/
   screen.py         layout helper: chart band over five lines of text
   font46.py         4x6 pixel font (X11 Misc-Fixed, public domain)
   bdf2font.py       turn a BDF font into a table like font46.py
+  test_publish_fw.py  loopback checks for publish_fw.sh (no hardware needed)
 ```
 
 The examples push straight to the panel and send `PXT_RELAY_KEY` as
@@ -134,9 +135,13 @@ The script:
 2. Copies it to `~/firmware/pxt.bin` on the relay host and checks the SHA-256
    the relay serves from `/fw`.
 3. Queues `{"type":"ota","path":"/pxt/fw","size":N,"sha256":"..."}`.
-4. Re-queues the op every 10 s for up to three minutes. It stops once the
-   panel reports a restart (a new build, or uptime going backwards) and the
-   relay has streamed the restarted panel a frame.
+4. Re-queues the op every 10 s for up to three minutes, until the panel
+   reports a restart (a new build, or uptime going backwards) and the relay has
+   streamed the restarted panel a frame.
+5. Watches the new build for 60 s (`PXT_SETTLE`). A build that crashes drawing
+   its first frames is rolled back by the bootloader, so the script exits 0
+   only if the same build is still up and has not restarted. A rollback or a
+   restart exits 3, and a `/device` it cannot read exits 2.
 
 The panel closes its stream before it downloads, since a second TLS session
 doesn't fit beside the first. It installs only when the size and SHA-256 match,

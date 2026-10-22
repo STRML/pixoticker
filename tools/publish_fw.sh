@@ -14,6 +14,7 @@ SSH_HOST="${PXT_RELAY_SSH:-}"
 URL="${PXT_RELAY_URL:-}"
 KEYVAL="${PXT_RELAY_KEY:-}"
 RELAY_HOST="${PXT_RELAY_HOST:-}"
+SETTLE="${PXT_SETTLE:-60}"  # seconds the new build must hold before success
 BIN=".pio/build/esp32dev/firmware.bin"
 cd "$(dirname "$0")/.."
 
@@ -60,6 +61,32 @@ queue_op() {
   fi
 }
 
+# _sent > 0 only says the relay wrote a frame to the new build. A build that
+# crashes drawing it resets, and the bootloader puts the old image back, so the
+# new build has to hold for SETTLE seconds before this counts as a success.
+settle() {  # build, uptime and _seen when the new build first got a frame
+  sleep "$SETTLE"
+  local b u s
+  b="$(device_field build)"
+  u="$(device_field uptime)"
+  s="$(device_field _seen)"
+  if [ -z "$b" ] || [ -z "$u" ] || [ -z "$s" ]; then
+    echo "could not read /device after ${SETTLE}s; check the panel before trusting ${1}"
+    return 2
+  fi
+  if [ "$b" != "$1" ]; then
+    echo "panel went back to ${b}: ${1} did not survive its first frames"
+    return 3
+  fi
+  # A reconnect without a restart reports uptime grown by the time between the
+  # two connects; a restart reports it near zero.
+  if [ $((u + 5)) -lt $(($2 + s - $3)) ]; then
+    echo "panel restarted during the ${SETTLE}s check (uptime ${u}s): ${1} may be crash-looping"
+    return 3
+  fi
+  echo "panel running ${b} (uptime ${u}s, held ${SETTLE}s)"
+}
+
 echo "published ${SIZE} bytes sha256 ${SHA} (device build before: ${before_build:-unknown})"
 queue_op
 
@@ -78,8 +105,8 @@ for _ in $(seq 1 18); do
     # count only refreshes when it reconnects, so it reads zero here.
     frames="$(device_field _sent)"
     if [ -n "$frames" ] && [ "$frames" -gt 0 ]; then
-      echo "panel running ${now_build} (uptime ${now_up}s, ${frames} frames)"
-      exit 0
+      echo "panel restarted into ${now_build} and was sent a frame; watching it for ${SETTLE}s"
+      settle "$now_build" "$now_up" "$(device_field _seen)" && exit 0 || exit $?
     fi
     echo "panel restarted but reports no frames yet; waiting"
   fi
