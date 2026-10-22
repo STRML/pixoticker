@@ -70,6 +70,9 @@ STATE = State()
 
 class Handler(BaseHTTPRequestHandler):
     server_version = VERSION
+    # The stream is chunked, which HTTP/1.0 does not define. Every other
+    # response carries a Content-Length, so keep-alive is safe.
+    protocol_version = "HTTP/1.1"
     key = ""
 
     def log_message(self, fmt, *args):
@@ -250,6 +253,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
+        self.close_connection = True
 
     def _snapshot(self, since):
         return {
@@ -262,13 +266,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        # Both early answers leave the body unread, so the connection cannot
+        # carry another request.
         if not self._auth(q):
+            self.close_connection = True
             return self._json(401, {"error": "unauthorized"})
         try:
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             n = 0
         if n <= 0 or n > max(MAX_FRAME, 8192):
+            self.close_connection = True
             return self._json(413, {"error": "bad size"})
         body = self.rfile.read(n)
 
