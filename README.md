@@ -25,6 +25,7 @@ src/                firmware (Arduino, ESP32)
   secrets.h.example  copy to secrets.h: relay host, port, key
 server/
   pxtrelay.py       relay: frame store, stream, ops, firmware hosting
+  test_relay.py     loopback checks for the relay (python3 server/test_relay.py)
 tools/
   onboard.sh        build, flash over the air, verify frames arrive
   publish_fw.sh     ship a firmware image to the panel through the relay
@@ -36,6 +37,21 @@ tools/
   pixels_demo.py    colour and geometry checks
   mirror.js         mirror a browser canvas of any website onto the panel
   serial_cmd.py     serial helpers
+  orderbook.js      example: live Deribit BTC-PERPETUAL depth (bun)
+  ccusage.py        example: Claude Code spend from ccusage, daily bars
+  screen.py         layout helper: chart band over five lines of text
+  font46.py         4x6 pixel font (X11 Misc-Fixed, public domain)
+  bdf2font.py       turn a BDF font into a table like font46.py
+```
+
+The examples push straight to the panel and send `PXT_RELAY_KEY` as
+`X-Api-Key`; `ccusage.py --relay URL` goes through the relay instead.
+
+```sh
+export PXT_RELAY_KEY=...
+bun tools/orderbook.js 192.168.4.1          # 8 fps by default
+tools/ccusage.py 192.168.4.1 --watch 300    # needs ccusage on PATH
+tools/screen.py --out preview.png           # needs pillow
 ```
 
 ## Quick start
