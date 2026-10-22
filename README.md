@@ -5,7 +5,9 @@ ESP32 (no PSRAM, 4 MB flash). The panel draws whatever frames a remote relay
 hands it, over a single outbound TLS connection, so it needs no inbound ports,
 no port forwarding and no laptop left running on the same network.
 
-The display is a 128×64 panel built from two 64×32 modules.
+The display is a 128×64 panel built from two 64×64 modules side by side
+(1/32 scan, FM6126A drivers). The module layout is a runtime setting, so other
+HUB75 layouts of up to four modules work too.
 
 ```
 renderer ──POST /frame──▶ relay ──TLS stream──▶ ESP32 ──HUB75──▶ panel
@@ -25,7 +27,10 @@ server/
   pxtrelay.py       relay: frame store, stream, ops, firmware hosting
 tools/
   onboard.sh        build, flash over the air, verify frames arrive
+  publish_fw.sh     ship a firmware image to the panel through the relay
   flash.sh          POST a firmware image to a panel
+  flash_serial.py   serial flash and full flash dump, for recovery
+  mon.py            capture the boot log over serial
   render.py         draw a chart or text and push it as a frame
   pull.py           long-poll the relay and repaint a local network panel
   pixels_demo.py    colour and geometry checks
@@ -93,6 +98,35 @@ The relay reads its key from `--key-file` (default `~/.pxt_relay_key`), binds
 loopback by default so nginx terminates TLS, and serves nothing to a client
 without the key.
 
+## Shipping firmware
+
+The panel has no inbound port, so firmware reaches it the same way frames do.
+Set four variables and run `tools/publish_fw.sh`:
+
+```sh
+export PXT_RELAY_URL=https://relay.example.com/pxt   # relay base URL
+export PXT_RELAY_SSH=relay-host                      # ssh name of the relay host
+export PXT_RELAY_HOST=relay.example.com              # built into the image
+export PXT_RELAY_KEY=...                             # built into the image
+tools/publish_fw.sh
+```
+
+The script:
+
+1. Rebuilds the image with the relay host and key, and refuses an image that
+   doesn't contain the key.
+2. Copies it to `~/firmware/pxt.bin` on the relay host and checks the SHA-256
+   the relay serves from `/fw`.
+3. Queues `{"type":"ota","path":"/pxt/fw","size":N,"sha256":"..."}`.
+4. Re-queues the op every 10 s for up to three minutes. It stops once the
+   panel reports a restart (a new build, or uptime going backwards) and the
+   relay has streamed the restarted panel a frame.
+
+The panel closes its stream before it downloads, since a second TLS session
+doesn't fit beside the first. It installs only when the size and SHA-256 match,
+and it ignores an op for the image it already runs, so a re-queued op never
+reinstalls.
+
 ## Panel API
 
 Served on the panel's own address (`192.168.4.1` on its access point). Every route
@@ -108,11 +142,46 @@ open, which suits the bench and nothing else.
 | `/brightness` | POST | 0–255 |
 | `/panel` | POST | module layout: `across`, `down`, `serp`, `invclk`, `modh`; saves and reboots |
 | `/panel/try` | POST | apply a layout now under the boot watchdog; saved if the panel starts |
+| `/boots` | POST | reset the boot counter |
 | `/test` | GET | ruler: border, corner markers, 16 px ticks |
 | `/u` | POST | firmware upload |
 | `/update` | GET | upload page |
 | `/safe` | POST | boot into safe mode (no panel init) |
 | `/reboot` | POST | restart |
+
+Frames are 128×64 RGB565, big-endian. The panel is wired with green and blue
+swapped, so a client that packs RGB565 itself has to swap them too:
+
+```
+((r & 0xF8) << 8) | ((b & 0xFC) << 3) | (g >> 3)
+```
+
+`/pixel`, `/pixels`, RGB888 frames and the relay's `fmt=888` do the swap for
+you. Frame bodies posted to the panel are base64 because its web server keeps a
+plain body in a NUL-terminated string, where the first 0x00 byte would cut the
+frame short. The relay's `POST /frame` takes raw bytes. Firmware uploads to
+`/u` need `Expect:` turned off (`curl -H 'Expect:'`), or the server answers
+before the body arrives.
+
+## Mirror a browser canvas
+
+`tools/mirror.js` streams any same-origin `<canvas>` to the panel, so a
+browser game or chart becomes the display. Set the panel address, then paste
+the script into the page console or inject it over the DevTools protocol:
+
+```js
+window.__PXT_HOST = "192.168.4.1";
+window.__PXT_KEY = "...";           // only if the build has a key
+// paste tools/mirror.js here
+window.__mirror.running = false;    // stop
+```
+
+The script letterboxes the canvas into 128×64, skips identical frames, and sends
+at most about 11 frames a second. WebGL canvases clear their drawing buffer
+after each composite, so a capture from a timer reads an empty buffer about
+half the time and the panel flickers. The script wraps `requestAnimationFrame`
+and captures right after the page's own draw callback instead. Uploads use
+`mode: "cors"`; the panel answers the preflight for `X-Api-Key`.
 
 ## Relay protocol
 
@@ -133,6 +202,18 @@ below its Wi-Fi link speed.
 Relay routes: `POST /frame`, `GET /stream?since=N&enc=rle`, `GET /next`, `GET /raw`,
 `GET /latest`, `POST /op`, `GET`/`POST /device`, `GET /fw`, `GET /health`.
 
+Four rules keep the stream current:
+
+- A new stream gets only the ops posted after it connected. Replaying a queued
+  `reboot` on every reconnect would restart the panel forever.
+- Each op travels in its own chunk, capped at 180 bytes, because the firmware's
+  op buffer is small.
+- The sequence counter starts from the clock. When a client sends a `since`
+  above it (a cursor from before a relay restart), the relay treats it as zero.
+- The stream sends at most 4 frames a second (`STREAM_FPS`) through a 32 KB
+  socket buffer. A slow panel then slows the relay down instead of falling
+  minutes behind a queue of stale frames.
+
 Frames are written straight into the display buffer as they arrive, so a
 truncated frame never reaches the panel and a new one is only shown once it is
 complete. `panel_show` copies into the DMA buffer and flips, so updates are
@@ -150,14 +231,33 @@ with the panel disabled so the HTTP API stays reachable.
 included here and must not be redistributed; a full 4 MB read over the serial
 bootloader is the only reliable way back.
 
+When the panel's Wi-Fi is gone, the USB serial port still works:
+
+```sh
+tools/flash_serial.py --dump stock.bin   # full 4 MB read; run before the first write
+tools/flash_serial.py                    # write the newest build to 0x10000
+tools/mon.py                             # reset and print the boot log
+tools/serial_cmd.py state                # also test, reboot, bright N, wifi SSID PASS,
+                                         # panel ACROSS DOWN [SERP] [INVCLK] [MODH]
+```
+
+`flash_serial.py` erases the OTA data partition before it writes. An earlier
+over-the-air update leaves the bootloader pointed at the other app slot, and it
+would keep booting the old image. Serial commands need no key, since they
+assume physical access. All three tools take `--port`.
+
 ## Known limits
 
 - One TLS session at a time while starting up: the ESP32 needs a contiguous
   block for the RSA handshake, and two sessions do not fit.
 - The panel reports its state in an `X-Pxt-State` header on the stream request,
   so telemetry costs no second TLS session. A relay that never sees the panel
-  reconnect will show a stale `device_age`.
+  reconnect will show a stale `device_age`. The `_sent` field in `/device` does
+  stay current: it counts frames streamed to the panel since that connect.
 - The relay keeps no history: a client that reconnects gets the newest frame.
+- Posting frames straight to the panel's HTTP API at 15 a second wedged its web
+  server: it still answered ping, HTTP stopped, and only a power cycle brought
+  it back. Keep direct pushes at 8 frames a second or fewer.
 
 `src/relay_ca.h` pins ISRG Root X1, the Let's Encrypt anchor. A relay on any
 other certificate needs its own root pasted there, or the panel falls back to
