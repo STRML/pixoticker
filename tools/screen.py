@@ -73,7 +73,7 @@ class Screen:
         color = UP if change >= 0 else DOWN
         font.draw(self.d, (1, 0), symbol, FG)
         font.draw(self.d, (1 + font.width(symbol + " "), 0), pct, color)
-        num = f"{value:,.0f}"
+        num = f"${value:,.2f}"
         font.draw(self.d, (W - 1 - font.width(num), 0), num, FG)
 
     def series(self, values, color=None, glow=True, top=2):
