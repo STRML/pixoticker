@@ -273,7 +273,8 @@ assume physical access. All three tools take `--port`.
 - The relay keeps no history: a client that reconnects gets the newest frame.
 - Posting frames straight to the panel's HTTP API at 15 a second wedged its web
   server: it still answered ping, HTTP stopped, and only a power cycle brought
-  it back. Keep direct pushes at 8 frames a second or fewer.
+  it back. The tools here stay at or below about 11 (`mirror.js` about 11,
+  `orderbook.js` 8 by default), which has held.
 
 `src/relay_ca.h` pins ISRG Root X1, the Let's Encrypt anchor. A relay on any
 other certificate needs its own root pasted there, or the panel falls back to
