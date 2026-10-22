@@ -252,6 +252,7 @@ static String stateHeader() {
              ",\"maxblock\":" + String(ESP.getMaxAllocHeap()) +
              ",\"frames\":" + String((uint32_t)s_pull_frames) +
              ",\"errors\":" + String((uint32_t)s_pull_errors) +
+             ",\"phase\":\"" + String(s_pull_phase) + "\"" +
              ",\"rssi\":" + String(WiFi.RSSI()) +
              ",\"tls\":\"" + String(s_tls_insecure ? "insecure" : "verified") + "\"}";
   return j;
@@ -953,6 +954,10 @@ struct FrameSink {
   }
 };
 
+// Off the task stack: mbedtls needs most of the 12 KB, and a 4 KB local here
+// is what overflowed the old 8 KB pull task and killed the display.
+static uint8_t s_rx[4096];
+
 static void pullTask(void *) {
   if (!strlen(PXT_RELAY_KEY) || !strlen(PXT_RELAY_HOST)) {
     Serial.println("[pull] disabled, no relay configured");
@@ -1032,14 +1037,13 @@ static void pullTask(void *) {
     // One bulk read per socket wake-up. Reading the chunk headers a byte at a
     // time on a TLS client left the receive window closed and the panel a
     // backlog behind the renderer.
-    uint8_t rx[4096];
     char hex[16];
     int hexn = 0;
     long left = 0;          // payload bytes still owed by the current chunk
     bool in_payload = false;
     uint32_t idle = millis();
     for (;;) {
-      int r = c.read(rx, sizeof(rx));
+      int r = c.read(s_rx, sizeof(s_rx));
       if (r <= 0) {
         if (!c.connected()) break;
         if (millis() - idle > 90000) break;
@@ -1049,7 +1053,7 @@ static void pullTask(void *) {
       idle = millis();
       panel_lock();
       for (int i = 0; i < r; i++) {
-        uint8_t b = rx[i];
+        uint8_t b = s_rx[i];
         if (!in_payload) {
           if (b == '\n') {
             if (hexn == 0) continue;  // CRLF closing the previous chunk
@@ -1137,7 +1141,7 @@ void setup() {
     esp_ota_mark_app_valid_cancel_rollback();
   }
   if (strlen(PXT_RELAY_KEY) && strlen(PXT_RELAY_HOST)) {
-    xTaskCreatePinnedToCore(pullTask, "pull", 8192, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(pullTask, "pull", 12288, nullptr, 1, nullptr, 0);
   }
 
   s_http.on("/", HTTP_GET, handleRoot);

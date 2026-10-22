@@ -73,9 +73,10 @@ for _ in $(seq 1 18); do
   if [ -n "$now_build" ] && [ "$now_build" != "$before_build" ]; then restarted=1; fi
   if [ -n "$now_up" ] && [ -n "$before_up" ] && [ "$now_up" -lt "$before_up" ]; then restarted=1; fi
   if [ "$restarted" = 1 ]; then
-    frames="$(device_field pull_frames)"
     # A new build that never draws rolls back on the next reset: only call this
-    # a success once the panel reports at least one frame.
+    # a success once the relay has streamed it a frame. The panel's own frame
+    # count only refreshes when it reconnects, so it reads zero here.
+    frames="$(device_field _sent)"
     if [ -n "$frames" ] && [ "$frames" -gt 0 ]; then
       echo "panel running ${now_build} (uptime ${now_up}s, ${frames} frames)"
       exit 0

@@ -174,14 +174,25 @@ class Handler(BaseHTTPRequestHandler):
     def _stream(self, last, op_since=0, enc="raw"):
         # The panel reports itself on the request rather than opening a second
         # TLS session it cannot afford: the handshake needs a contiguous block
-        # the stream already holds.
+        # the stream already holds. Display only, so it is capped and only
+        # known short scalar fields are kept.
         state = self.headers.get("X-Pxt-State")
-        if state:
+        mine = None
+        if state and len(state) <= 600:
             try:
-                dev = json.loads(state)
+                raw = json.loads(state)
+                dev = {k: v for k, v in raw.items()
+                       if k in ("build", "uptime", "heap", "maxblock", "frames",
+                                "errors", "phase", "rssi", "tls")
+                       and isinstance(v, (int, str)) and len(str(v)) < 48}
                 dev["_seen"] = int(time.time())
+                # The header is frozen at connect, so its frame count stays at
+                # zero after a reboot. _sent counts frames written to this
+                # stream, which is how publish_fw.sh sees a new build draw.
+                dev["_sent"] = 0
                 with STATE.lock:
                     STATE.device = dev
+                mine = dev
             except Exception:
                 pass
         self.send_response(200)
@@ -228,6 +239,10 @@ class Handler(BaseHTTPRequestHandler):
                         payload = b"PXTF" + seq.to_bytes(4, "big") + frame
                     self.wfile.write(("%X\r\n" % len(payload)).encode() + payload + b"\r\n")
                     last = seq
+                    with STATE.lock:
+                        # A stale stream from before a reboot must not count.
+                        if mine is not None and STATE.device is mine:
+                            mine["_sent"] += 1
                     if STREAM_FPS > 0:
                         time.sleep(1.0 / STREAM_FPS)
                 else:
