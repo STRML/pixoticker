@@ -18,8 +18,10 @@ from layouts import ABSENT, IDLE, LIVE, STALE, Node, W, H
 
 
 def history(peak, phase=0.0, n=layouts.HIST, gpu=60):
+    """(decode, gpu, prefill) samples: decode in bursts, a prefill in the gaps between them."""
     return [(max(0.0, peak * (0.55 + 0.45 * math.sin(i / 5 + phase)) * (0 if (i // 17) % 3 == 2 else 1)),
-             min(100, max(0, gpu + 25 * math.sin(i / 7 + phase)))) for i in range(n)]
+             min(100, max(0, gpu + 25 * math.sin(i / 7 + phase))),
+             2400.0 if peak and (i // 17) % 3 == 2 and i % 17 < 3 else 0.0) for i in range(n)]
 
 
 def busy():

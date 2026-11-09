@@ -134,6 +134,27 @@ class LayoutsFit(unittest.TestCase):
         self.assertEqual(a.tobytes(), b.tobytes())
 
 
+class Totals(unittest.TestCase):
+    def test_totals_sum_only_reporting_nodes(self):
+        nodes = [layouts.Node("studio1", layouts.LIVE, dec=100.0, pre=0.0),
+                 layouts.Node("studio2", layouts.LIVE, dec=50.5, pre=3000.0),
+                 layouts.Node("studio3", layouts.STALE, dec=999.0, pre=999.0),
+                 layouts.Node("studio4")]
+        self.assertEqual(layouts.totals(nodes), (150.5, 3000.0))
+
+    def test_total_history_adds_samples_newest_aligned_and_skips_silent_nodes(self):
+        a = layouts.Node("studio1", layouts.LIVE, hist=[(10, 0, 0), (20, 0, 0), (30, 0, 0)])
+        b = layouts.Node("studio2", layouts.IDLE, hist=[(1, 0, 0), (2, 0, 0)])
+        gone = layouts.Node("studio3", layouts.STALE, hist=[(500, 0, 0)] * 3)
+        self.assertEqual(layouts.total_history([a, b, gone]), [10, 21, 32])
+
+    def test_spark_and_focus_draw_the_total_row(self):
+        for name in ("spark", "focus"):
+            img = layouts.render(name, preview.busy())
+            top = img.crop((0, 0, 128, 7))
+            self.assertIn(layouts.DEC_C, [c for _, c in top.getcolors()], name)
+
+
 class EndToEnd(unittest.TestCase):
     """agent report → board → relay → the frame a panel would stream."""
 

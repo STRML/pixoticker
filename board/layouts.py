@@ -224,32 +224,72 @@ def quad(nodes):
     return c.img
 
 
+def totals(nodes):
+    """Cluster-wide live decode and prefill tok/s, summed over the nodes that are reporting."""
+    live = [n for n in nodes[:4] if n.fresh]
+    return sum(n.dec or 0 for n in live), sum(n.pre or 0 for n in live)
+
+
+def total_history(nodes):
+    """Decode tok/s of all reporting nodes added up, newest sample last."""
+    series = [n.hist for n in nodes[:4] if n.fresh]
+    width = max((len(h) for h in series), default=0)
+    out = [0.0] * width
+    for h in series:
+        for k, sample in enumerate(reversed(h)):
+            out[width - 1 - k] += sample[0] or 0
+    return out
+
+
+def total_text(value, color):
+    return ("D" if color == DEC_C else "P") + (rate(value) if value else "0"), color if value else DIM
+
+
+def area(c, x, y, w, h, samples, peak, color):
+    """Decode history as filled columns, newest at the right edge."""
+    c.rect(x, y, w, h, (10, 10, 14))
+    for k, value in enumerate(samples[-w:]):
+        bar = round((h - 1) * min(1.0, (value or 0) / peak))
+        if bar:
+            c.rect(x + w - len(samples[-w:]) + k, y + h - bar, 1, bar, dim(color, 0.6))
+
+
 def spark(nodes):
-    """Four bands: numbers on the left, a decode-rate history with the GPU trace over it."""
+    """A cluster row on top (total decode and prefill, total decode history), then one
+    14 px band per node: GPU and memory, a decode history on a scale shared by all
+    nodes, the GPU trace over it, amber ticks where a prefill ran, and the rates."""
     c = Canvas()
     x0, wid = 43, HIST
+    dec_all, pre_all = totals(nodes)
+    td, tdc = total_text(dec_all, DEC_C)
+    tp, tpc = total_text(pre_all, PRE_C)
+    c.text(1, 1, "ALL", FG)
+    c.text(14, 1, td, tdc)
+    c.text_right(126, 1, tp, tpc)
+    history = total_history(nodes)
+    area(c, x0, 0, wid, 7, history, max([DEC_FULL] + history), DEC_C)
+    c.rect(0, 7, W, 1, RULE)
+    shared = max([DEC_FULL / 2] + [s[0] or 0 for n in nodes[:4] for s in n.hist])
     for i, n in enumerate(nodes[:4]):
-        y = i * 16
+        y = 8 + i * 14
         gc, mc = bar_colors(n)
-        c.text(1, y + 1, n.tag, FG if n.fresh else DIM)
+        c.text(1, y + 4, n.tag, FG if n.fresh else DIM)
         if not n.fresh:
-            c.text(14, y + 1, status_text(n), BAD if n.state == STALE else DIM)
+            c.text(14, y + 4, status_text(n), BAD if n.state == STALE else DIM)
             continue
         c.text(14, y + 1, f"G{pct(n.gpu)}", gc)
-        c.text(14, y + 8, f"M{pct(n.mem)}", mc)
+        c.text(14, y + 7, f"M{pct(n.mem)}", mc)
         pt, pc = shown(n, "pre", PRE_C)
         dt, dc = shown(n, "dec", DEC_C)
         samples = n.hist[-wid:]
-        peak = max([DEC_FULL / 2] + [s[0] or 0 for s in samples])
-        c.rect(x0, y + 1, wid, 14, (10, 10, 14))
-        for k, (dec, gpu) in enumerate(samples):
-            h = round(13 * min(1.0, (dec or 0) / peak))
-            if h:
-                c.rect(x0 + wid - len(samples) + k, y + 14 - h, 1, h, dim(DEC_C, 0.6))
-            gy = y + 14 - round(13 * frac(gpu))
-            c.d.point((x0 + wid - len(samples) + k, gy), fill=gc)
+        area(c, x0, y + 1, wid, 12, [s[0] for s in samples], shared, DEC_C)
+        for k, (_, gpu, pre) in enumerate(samples):
+            col = x0 + wid - len(samples) + k
+            c.d.point((col, y + 12 - round(11 * frac(gpu))), fill=gc)
+            if pre:
+                c.rect(col, y + 11, 1, 2, PRE_C)
         c.text_right(126, y + 1, "D" + dt, dc)
-        c.text_right(126, y + 8, "P" + pt, pc)
+        c.text_right(126, y + 7, "P" + pt, pc)
     return c.img
 
 
@@ -260,6 +300,12 @@ def focus(nodes):
     top = max(live, key=lambda n: n.activity) if live else nodes[0]
     gc, mc = bar_colors(top)
     c.text(1, 1, top.tag, FG if top.fresh else DIM)
+    dec_all, pre_all = totals(nodes)
+    td, tdc = total_text(dec_all, DEC_C)
+    tp, tpc = total_text(pre_all, PRE_C)
+    c.text(14, 1, "ALL", DIM)
+    x = c.text(30, 1, td, tdc)
+    c.text(x + 4, 1, tp, tpc)
     if top.fresh:
         dt, dc = shown(top, "dec", DEC_C)
         pt, pc = shown(top, "pre", PRE_C)
