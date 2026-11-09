@@ -15,3 +15,6 @@ dumps/
 .scratch/
 *.log
 .DS_Store
+
+# python
+__pycache__/

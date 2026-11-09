@@ -43,6 +43,13 @@ tools/
   font46.py         4x6 pixel font (X11 Misc-Fixed, public domain)
   bdf2font.py       turn a BDF font into a table like font46.py
   test_publish_fw.py  loopback checks for publish_fw.sh (no hardware needed)
+board/              cluster status board: node agents post GPU, memory and token rates
+  agent.py          per-Mac agent (stdlib, Python 3.9): ioreg GPU %, vm_stat memory %, mlx-serve rates
+  board.py          ingest, layout rotation, LED-style preview gallery, pushes frames to the relay
+  layouts.py        six 128x64 layouts for four nodes: rows cols quad spark focus matrix
+  preview.py        contact sheet of every layout against fixture clusters
+  Dockerfile        one image for the relay and the board
+  test_board.py     loopback checks (python3 board/test_board.py)
 ```
 
 The examples push straight to the panel and send `PXT_RELAY_KEY` as
@@ -54,6 +61,33 @@ bun tools/orderbook.js 192.168.4.1          # 8 fps by default
 tools/ccusage.py 192.168.4.1 --watch 300    # needs ccusage on PATH
 tools/screen.py --out preview.png           # needs pillow
 ```
+
+## Cluster board
+
+`board/` shows up to four Macs running [mlx-serve](https://github.com/ddalcu/mlx-serve): GPU %,
+memory %, and decode and prefill tokens per second.
+
+```
+agent.py (each Mac) ──POST /ingest──▶ board.py ──POST /frame──▶ relay ──▶ panel
+                                         └── GET /  every layout, live, as LED dots
+```
+
+Each agent reads the local `/metrics.json` once a second and posts one small JSON document with
+`X-Api-Key`. Live rates are the counter growth over 8 s, because the server's counters move in lumps
+(a prefill chunk, a round of drafted tokens). A busy node shows its live rate; an idle one shows the
+last request's average, dimmed. A node that stops reporting for 10 s turns grey with `STALE`, so a dead
+agent never leaves old numbers on the panel. A node that never reported shows `--`.
+
+```sh
+python3 board/preview.py --out sheet.png                       # every layout x busy, prefill, degraded
+python3 board/board.py --port 18101 --ingest-key-file ~/.pxt_ingest_key   # gallery on :18101
+python3 board/agent.py --name studio1 --board http://board-host:18101      # on each Mac
+curl -H "X-Api-Key: $KEY" -d '{"layout":"rows"}' http://board-host:18101/layout   # or "auto"
+```
+
+`BOARD_NODES` names the slots (default `studio1,studio2,studio3,studio4`), `BOARD_RELAY_URL` and
+`BOARD_RELAY_KEY_FILE` send frames to the relay, and `BOARD_LAYOUT` pins a layout (default `auto`,
+15 s each). The same image runs the relay: `python server/pxtrelay.py --bind 0.0.0.0`.
 
 ## Quick start
 
