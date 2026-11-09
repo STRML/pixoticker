@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import http.client
 import io
 import json
 import os
@@ -50,6 +51,8 @@ def number(v, lo=0.0, hi=1e9):
 class Board:
     def __init__(self, names, pinned="auto", rotation=None, clock=time.time):
         self.names = list(names)
+        if not self.names:
+            raise ValueError("a board needs at least one node")
         self.clock = clock
         self.lock = threading.Lock()
         self.reports = {}
@@ -133,7 +136,7 @@ class Relay:
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 r.read()
-        except (OSError, urllib.error.URLError) as err:
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as err:
             if not self.failing:
                 print(f"relay push failed: {err}", flush=True)
             self.failing = True
@@ -142,6 +145,14 @@ class Relay:
             print("relay reachable again", flush=True)
         self.failing, self.last = False, body
         return True
+
+
+def scale_param(text, default=5):
+    """The preview scale from a query value, 1 to 8; anything that is not a number gets the default."""
+    try:
+        return min(8, max(1, int(text)))
+    except ValueError:
+        return default
 
 
 def png(img, scale):
@@ -172,6 +183,7 @@ tick();setInterval(tick,2000);
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 30  # a client that stalls mid-request frees its thread instead of holding it forever
     board = None
     key = ""
 
@@ -212,7 +224,7 @@ class Handler(BaseHTTPRequestHandler):
             name = u.path[len("/preview/"):-4]
             if name not in layouts.LAYOUTS:
                 return self._json(404, {"error": "no such layout"})
-            scale = min(8, max(1, int(q.get("scale", ["5"])[0] or 5)))
+            scale = scale_param(q.get("scale", [""])[0])
             return self._send(200, png(layouts.render(name, self.board.nodes()), scale), "image/png")
         return self._json(404, {"error": "not found"})
 
@@ -244,12 +256,25 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
 
+def step(board, relay):
+    board.tick()
+    if relay:
+        relay.push(board.frame()[1])
+
+
 def render_loop(board, relay):
+    """One step a second for the life of the process. A step that raises is logged once and the
+    loop carries on, because a dead thread would leave the panel showing its last numbers."""
+    failing = False
     while True:
         started = time.time()
-        board.tick()
-        if relay:
-            relay.push(board.frame()[1])
+        try:
+            step(board, relay)
+            failing = False
+        except Exception as err:
+            if not failing:
+                print(f"render step failed: {err!r}", flush=True)
+            failing = True
         time.sleep(max(0.0, TICK_S - (time.time() - started)))
 
 
@@ -272,7 +297,10 @@ def main():
     ap.add_argument("--relay-key-file", default=os.environ.get("BOARD_RELAY_KEY_FILE", "~/.pxt_relay_key"))
     args = ap.parse_args()
 
-    board = Board([n.strip() for n in args.nodes.split(",") if n.strip()])
+    names = [n.strip() for n in args.nodes.split(",") if n.strip()]
+    if not names:
+        raise SystemExit("--nodes names no node")
+    board = Board(names)
     if not board.pin(args.layout):
         raise SystemExit(f"unknown layout {args.layout!r}")
     Handler.board, Handler.key = board, read_key(args.ingest_key_file)

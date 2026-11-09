@@ -52,7 +52,10 @@ def memory():
         out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
     except (OSError, ValueError, subprocess.SubprocessError):
         return None, None
-    page = int(re.search(r"page size of (\d+)", out).group(1))
+    size = re.search(r"page size of (\d+)", out)
+    if not size:
+        return None, None
+    page = int(size.group(1))
     pages = {k: int(v) for k, v in re.findall(r"Pages ([a-z ]+):\s+(\d+)\.", out)}
     spare = sum(pages.get(k, 0) for k in ("free", "inactive", "speculative", "purgeable"))
     return (total - spare * page) / 2 ** 30, total / 2 ** 30
@@ -154,17 +157,17 @@ def main():
     failing = False
     while True:
         started = time.time()
-        used, total = memory()
-        body = report(args.name, rates.update(fetch_metrics(args.metrics), started), used, total,
-                      gpu_percent())
         try:
+            used, total = memory()
+            body = report(args.name, rates.update(fetch_metrics(args.metrics), started), used, total,
+                          gpu_percent())
             post(args.board, key, body)
             if failing:
                 print("board reachable again", flush=True)
             failing = False
-        except (OSError, urllib.error.URLError) as err:
+        except Exception as err:
             if not failing:
-                print(f"board unreachable: {err}", file=sys.stderr, flush=True)
+                print(f"report failed: {err!r}", file=sys.stderr, flush=True)
             failing = True
         time.sleep(max(0.0, LOOP_S - (time.time() - started)))
 

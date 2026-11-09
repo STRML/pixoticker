@@ -134,6 +134,81 @@ class LayoutsFit(unittest.TestCase):
         self.assertEqual(a.tobytes(), b.tobytes())
 
 
+class Hardening(unittest.TestCase):
+    """The classes the first review found: unguarded loops, unchecked parses, unbounded waits."""
+
+    def test_render_loop_survives_a_step_that_raises(self):
+        calls = []
+
+        def flaky(board, relay):
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("boom")
+
+        real_step, real_tick = boardmod.step, boardmod.TICK_S
+        boardmod.step, boardmod.TICK_S = flaky, 0.01
+        try:
+            threading.Thread(target=boardmod.render_loop, args=(None, None), daemon=True).start()
+            deadline = time.time() + 3
+            while len(calls) < 5 and time.time() < deadline:
+                time.sleep(0.01)
+        finally:
+            boardmod.step, boardmod.TICK_S = real_step, real_tick
+        self.assertGreaterEqual(len(calls), 5)
+
+    def test_a_truncated_relay_reply_is_a_failed_push_not_a_crash(self):
+        import http.client
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+
+        def serve():
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort")
+            conn.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        relay = boardmod.Relay(f"http://127.0.0.1:{srv.getsockname()[1]}", RELAY_KEY)
+        img = layouts.render("rows", preview.busy())
+        try:
+            self.assertFalse(relay.push(img))
+        except http.client.HTTPException:
+            self.fail("IncompleteRead escaped Relay.push")
+        finally:
+            srv.close()
+        self.assertTrue(relay.failing)
+
+    def test_a_board_with_no_nodes_is_refused(self):
+        with self.assertRaises(ValueError):
+            boardmod.Board([])
+
+    def test_scale_query_takes_numbers_and_ignores_junk(self):
+        self.assertEqual(boardmod.scale_param("3"), 3)
+        self.assertEqual(boardmod.scale_param("99"), 8)
+        self.assertEqual(boardmod.scale_param("0"), 1)
+        self.assertEqual(boardmod.scale_param("abc"), 5)
+        self.assertEqual(boardmod.scale_param(""), 5)
+
+    def test_handler_has_a_socket_timeout(self):
+        self.assertGreater(boardmod.Handler.timeout, 0)
+
+    def test_memory_with_unreadable_vm_stat_reports_nothing_instead_of_raising(self):
+        import subprocess
+        real = agent.subprocess.run
+
+        def fake(cmd, **kw):
+            out = "17179869184\n" if cmd[0] == "sysctl" else "vm_stat: command output changed shape\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout=out)
+
+        agent.subprocess.run = fake
+        try:
+            self.assertEqual(agent.memory(), (None, None))
+        finally:
+            agent.subprocess.run = real
+
+
 class Totals(unittest.TestCase):
     def test_totals_sum_only_reporting_nodes(self):
         nodes = [layouts.Node("studio1", layouts.LIVE, dec=100.0, pre=0.0),
