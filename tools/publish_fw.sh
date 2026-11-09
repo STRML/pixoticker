@@ -15,6 +15,7 @@ URL="${PXT_RELAY_URL:-}"
 KEYVAL="${PXT_RELAY_KEY:-}"
 RELAY_HOST="${PXT_RELAY_HOST:-}"
 SETTLE="${PXT_SETTLE:-60}"  # seconds the new build must hold before success
+FW_REMOTE="${PXT_RELAY_FW:-firmware/pxt.bin}"  # where the relay reads the image, relative to the ssh home or absolute
 BIN=".pio/build/esp32dev/firmware.bin"
 cd "$(dirname "$0")/.."
 
@@ -31,8 +32,8 @@ grep -a -q -F -- "$KEYVAL" "$BIN" || { echo "refusing: relay key is not embedded
 SIZE=$(wc -c < "$BIN" | tr -d " ")
 SHA=$(shasum -a 256 "$BIN" | awk '{print $1}')
 
-ssh "$SSH_HOST" 'mkdir -p ~/firmware'
-scp -q "$BIN" "$SSH_HOST:firmware/pxt.bin"
+ssh "$SSH_HOST" "mkdir -p \"\$(dirname \"$FW_REMOTE\")\""
+scp -q "$BIN" "$SSH_HOST:$FW_REMOTE"
 
 served=$(curl -sSf -m 30 -D - -o /dev/null -H "X-Api-Key: ${KEYVAL}" \
   "$URL/fw" | tr -d '\r' | awk 'tolower($1)=="x-firmware-sha256:"{print $2}')

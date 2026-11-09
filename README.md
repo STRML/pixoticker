@@ -151,9 +151,11 @@ without the key.
 
 ## Shipping firmware
 
-> **Broken for now:** the panel stops the download after 64 KB, so nothing
-> installs ([issue 2](https://github.com/STRML/pixoticker/issues/2)). Flash over
-> USB or the access point until that's fixed.
+> **Unconfirmed on a panel:** the first version of this download stopped after 64 KB
+> ([issue 2](https://github.com/STRML/pixoticker/issues/2)). The panel now resumes a download that
+> ends early with an HTTP `Range` request and leaves the reason in `/device` (`ota`, for example
+> `closed 65536/1153312`), but no one has run it on hardware yet. Until a run passes, keep a USB
+> cable within reach and flash with `tools/flash_serial.py` if it fails.
 
 The panel has no inbound port, so firmware reaches it the same way frames do.
 Set four variables and run `tools/publish_fw.sh`:
@@ -163,6 +165,7 @@ export PXT_RELAY_URL=https://relay.example.com/pxt   # relay base URL
 export PXT_RELAY_SSH=relay-host                      # ssh name of the relay host
 export PXT_RELAY_HOST=relay.example.com              # built into the image
 export PXT_RELAY_KEY=...                             # built into the image
+export PXT_RELAY_FW=firmware/pxt.bin                 # optional: where the relay reads the image on that host
 tools/publish_fw.sh
 ```
 
@@ -170,8 +173,9 @@ The script:
 
 1. Rebuilds the image with the relay host and key, and refuses an image that
    doesn't contain the key.
-2. Copies it to `~/firmware/pxt.bin` on the relay host and checks the SHA-256
-   the relay serves from `/fw`.
+2. Copies it to `~/firmware/pxt.bin` on the relay host (`PXT_RELAY_FW` changes the path, and
+   the relay's `--firmware` flag must name the same file) and checks the SHA-256 the relay serves
+   from `/fw`.
 3. Queues `{"type":"ota","path":"/pxt/fw","size":N,"sha256":"..."}`.
 4. Re-queues the op every 10 s for up to three minutes, until the panel
    reports a restart (a new build, or uptime going backwards) and the relay has
