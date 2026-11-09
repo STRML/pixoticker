@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Loopback checks for the board and the node agent: python3 board/test_board.py
+
+Runs the real relay and the real board on ephemeral ports. No hardware, no network.
+"""
+import base64
+import json
+import os
+import sys
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "server"))
+
+import agent  # noqa: E402
+import board as boardmod  # noqa: E402
+import layouts  # noqa: E402
+import preview  # noqa: E402
+import pxtrelay  # noqa: E402
+
+KEY = "k" * 24
+RELAY_KEY = "r" * 24
+
+
+def call(url, key=None, body=None, raw=None):
+    data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+    req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
+    if key:
+        req.add_header("X-Api-Key", key)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+
+
+def report(node, **kw):
+    body = {"node": node, "gpu": 80, "mem_gb": 128, "mem_total_gb": 256, "dec": 50.0, "pre": 0.0,
+            "dec_last": 50.0, "pre_last": 2000.0}
+    body.update(kw)
+    return body
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class BoardLogic(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.board = boardmod.Board(["studio1", "studio2", "studio3", "studio4"], clock=self.clock)
+
+    def states(self):
+        return [n.state for n in self.board.nodes()]
+
+    def test_absent_until_first_report(self):
+        self.assertEqual(self.states(), [layouts.ABSENT] * 4)
+
+    def test_live_idle_and_memory_percent(self):
+        self.board.ingest(report("studio1"))
+        self.board.ingest(report("studio2", dec=0.0, pre=0.0))
+        nodes = self.board.nodes()
+        self.assertEqual([n.state for n in nodes[:2]], [layouts.LIVE, layouts.IDLE])
+        self.assertAlmostEqual(nodes[0].mem, 50.0)
+
+    def test_silent_node_goes_stale_and_drops_its_numbers(self):
+        self.board.ingest(report("studio1"))
+        self.clock.t += boardmod.TTL_S + 5
+        n = self.board.nodes()[0]
+        self.assertEqual(n.state, layouts.STALE)
+        self.assertIsNone(n.dec)
+        self.assertEqual(n.age, boardmod.TTL_S + 5)
+
+    def test_reporting_again_revives_a_stale_node(self):
+        self.board.ingest(report("studio1"))
+        self.clock.t += 60
+        self.board.ingest(report("studio1"))
+        self.assertEqual(self.states()[0], layouts.LIVE)
+
+    def test_unknown_node_and_junk_numbers_are_rejected_or_cleaned(self):
+        self.assertEqual(self.board.ingest(report("intruder")), "unknown node")
+        self.board.ingest(report("studio1", gpu="lots", dec=float("nan"), mem_gb=True, pre=-5))
+        n = self.board.nodes()[0]
+        self.assertIsNone(n.gpu)
+        self.assertIsNone(n.dec)
+        self.assertEqual(n.pre, 0.0)
+        self.assertIsNone(n.mem)
+
+    def test_no_rates_means_idle_with_dashes_not_a_crash(self):
+        self.board.ingest(report("studio1", dec=None, pre=None, dec_last=None, pre_last=None))
+        self.assertEqual(self.states()[0], layouts.IDLE)
+        for name in layouts.LAYOUTS:
+            self.assertEqual(layouts.render(name, self.board.nodes()).size, (128, 64))
+
+    def test_history_only_grows_while_fresh(self):
+        self.board.ingest(report("studio1"))
+        self.board.tick()
+        self.board.tick()
+        self.clock.t += 60
+        self.board.tick()
+        self.assertEqual(len(self.board.hist["studio1"]), 2)
+
+    def test_rotation_and_pin(self):
+        seen = {self.board.layout(1000.0 + i * boardmod.ROTATE_S) for i in range(len(layouts.LAYOUTS))}
+        self.assertEqual(seen, set(layouts.LAYOUTS))
+        self.assertTrue(self.board.pin("quad"))
+        self.assertEqual(self.board.layout(), "quad")
+        self.assertFalse(self.board.pin("nope"))
+        self.assertEqual(self.board.layout(), "quad")
+
+
+class LayoutsFit(unittest.TestCase):
+    def test_every_layout_draws_every_scenario_inside_the_panel(self):
+        for name in layouts.LAYOUTS:
+            for scen, make in preview.SCENARIOS.items():
+                img = layouts.render(name, make())
+                self.assertEqual(img.size, (128, 64), (name, scen))
+                self.assertIsNotNone(img.getbbox(), f"{name}/{scen} drew nothing")
+
+    def test_degraded_never_shows_numbers_for_the_silent_nodes(self):
+        a = layouts.render("rows", preview.degraded())
+        b = layouts.render("rows", preview.degraded()[:1] + [layouts.Node("studio2", layouts.STALE, age=47)] +
+                           [layouts.Node("studio3"), layouts.Node("studio4")])
+        self.assertEqual(a.tobytes(), b.tobytes())
+
+
+class EndToEnd(unittest.TestCase):
+    """agent report → board → relay → the frame a panel would stream."""
+
+    @classmethod
+    def setUpClass(cls):
+        pxtrelay.Handler.key = RELAY_KEY
+        cls.relay = ThreadingHTTPServer(("127.0.0.1", 0), pxtrelay.Handler)
+        threading.Thread(target=cls.relay.serve_forever, daemon=True).start()
+        cls.relay_url = f"http://127.0.0.1:{cls.relay.server_address[1]}"
+        cls.board = boardmod.Board(["studio1", "studio2", "studio3", "studio4"], pinned="rows")
+        boardmod.Handler.board, boardmod.Handler.key = cls.board, KEY
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), boardmod.Handler)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        cls.sender = boardmod.Relay(cls.relay_url, RELAY_KEY)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.relay.shutdown()
+        cls.srv.shutdown()
+
+    def test_ingest_needs_the_key_and_a_known_node(self):
+        self.assertEqual(call(self.url + "/ingest", body=report("studio1"))[0], 401)
+        self.assertEqual(call(self.url + "/ingest", "wrong" * 5, body=report("studio1"))[0], 401)
+        self.assertEqual(call(self.url + "/ingest", KEY, body=report("rogue"))[0], 400)
+        self.assertEqual(call(self.url + "/ingest", KEY, raw=b"[1]")[0], 400)
+        self.assertEqual(call(self.url + "/ingest", KEY, raw=b"x" * 5000)[0], 413)
+        self.assertEqual(call(self.url + "/ingest", KEY, body=report("studio1"))[0], 200)
+
+    def test_frame_reaches_the_relay_once_and_only_when_it_changes(self):
+        call(self.url + "/ingest", KEY, body=report("studio1", gpu=91))
+        self.board.tick()
+        self.assertTrue(self.sender.push(self.board.frame()[1]))
+        self.assertFalse(self.sender.push(self.board.frame()[1]))
+        status, raw = call(self.relay_url + "/latest", RELAY_KEY)
+        frame = base64.b64decode(json.loads(raw)["frame"])
+        self.assertEqual(len(frame), 128 * 64 * 2)
+        self.assertTrue(any(frame))
+
+    def test_relay_down_is_survived_and_retried(self):
+        down = boardmod.Relay("http://127.0.0.1:9", RELAY_KEY)
+        self.assertFalse(down.push(self.board.frame()[1]))
+        self.assertTrue(down.failing)
+        self.assertIsNone(down.last)
+
+    def test_layout_pin_preview_and_state(self):
+        self.assertEqual(call(self.url + "/layout", KEY, body={"layout": "cols"})[0], 200)
+        self.assertEqual(call(self.url + "/layout", KEY, body={"layout": "bogus"})[0], 400)
+        self.assertEqual(call(self.url + "/layout", body={"layout": "rows"})[0], 401)
+        status, raw = call(self.url + "/state")
+        self.assertEqual(json.loads(raw)["layout"], "cols")
+        status, body = call(self.url + "/preview/cols.png?scale=2")
+        self.assertEqual((status, body[:4]), (200, b"\x89PNG"))
+        self.assertEqual(call(self.url + "/preview/none.png")[0], 404)
+        self.assertEqual(call(self.url + "/")[0], 200)
+        self.board.pin("rows")
+
+
+class AgentRates(unittest.TestCase):
+    def metrics(self, gen, pl, gen_total, pre_total, dec_s, pre_s, start=1, running=1):
+        return {"gauges": {"process_start_time_seconds": start, "generation_tokens_live": gen,
+                           "prefill_tokens_live": pl, "requests_running": running},
+                "counters": {"generation_tokens_total": gen_total, "prefill_tokens_total": pre_total},
+                "histograms": {"decode_time_seconds": {"sum": dec_s}, "prefill_time_seconds": {"sum": pre_s}}}
+
+    def feed(self, rates, *steps):
+        out = None
+        for t, m in steps:
+            out = rates.update(m, t)
+        return out
+
+    def test_decode_rate_is_the_live_counter_growth(self):
+        out = self.feed(agent.Rates(), (10.0, self.metrics(100, 0, 100, 0, 1, 0)),
+                        (11.0, self.metrics(190, 0, 190, 0, 2, 0)))
+        self.assertEqual(out["dec"], 90.0)
+        self.assertTrue(out["serving"])
+
+    def test_lumpy_counters_are_smoothed_not_flickering(self):
+        r = agent.Rates()
+        gen = [0, 0, 300, 300, 600, 600, 900]
+        rates = [r.update(self.metrics(g, 0, g, 0, 1, 0), 10.0 + i)["dec"] for i, g in enumerate(gen)]
+        self.assertTrue(all(v > 0 for v in rates[2:]), rates)
+
+    def test_prefill_progress_reset_counts_only_increases(self):
+        r = agent.Rates()
+        out = self.feed(r, (10.0, self.metrics(0, 0, 0, 0, 0, 0)), (11.0, self.metrics(0, 4000, 0, 0, 0, 0)),
+                        (12.0, self.metrics(0, 0, 0, 6000, 0, 2.0)))
+        self.assertEqual(out["pre"], 2000.0)
+        self.assertEqual(out["pre_last"], 3000.0)
+
+    def test_nothing_running_zeroes_live_rates_at_once(self):
+        r = agent.Rates()
+        out = self.feed(r, (10.0, self.metrics(0, 0, 0, 0, 0, 0)), (11.0, self.metrics(500, 0, 500, 0, 5.0, 0)),
+                        (12.0, self.metrics(500, 0, 500, 0, 5.0, 0, running=0)))
+        self.assertEqual((out["dec"], out["pre"]), (0.0, 0.0))
+        self.assertEqual(out["dec_last"], 100.0)
+
+    def test_a_restarted_server_resets_the_baseline(self):
+        out = self.feed(agent.Rates(), (10.0, self.metrics(9000, 0, 9000, 0, 90, 0, start=1)),
+                        (11.0, self.metrics(30, 0, 30, 0, 0.3, 0, start=2)))
+        self.assertEqual(out["dec"], 0.0)
+        self.assertIsNone(out["dec_last"])
+
+    def test_no_server_reports_null_rates_but_keeps_last(self):
+        r = agent.Rates()
+        self.feed(r, (10.0, self.metrics(0, 0, 0, 0, 0, 0)), (11.0, self.metrics(200, 0, 200, 0, 2.0, 0)))
+        out = r.update(None, 12.0)
+        self.assertEqual((out["dec"], out["pre"], out["serving"], out["dec_last"]), (None, None, False, 100.0))
+
+    def test_running_request_is_live_even_between_counter_lumps(self):
+        board = boardmod.Board(["studio1"])
+        board.ingest(report("studio1", dec=0.0, pre=0.0, running=1))
+        self.assertEqual(board.nodes()[0].state, layouts.LIVE)
+
+    def test_report_shape_matches_what_the_board_ingests(self):
+        board = boardmod.Board(["studio1"])
+        body = agent.report("studio1", agent.Rates().update(None, time.time()), 100.0, 256.0, 12)
+        self.assertIsNone(board.ingest(body))
+        self.assertEqual(board.nodes()[0].state, layouts.IDLE)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,6 @@
+.git
+.pio
+firmware
+**/__pycache__
+board/test_board.py
+server/test_relay.py

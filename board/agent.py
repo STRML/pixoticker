@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Node agent: reports one Mac's GPU, memory and mlx-serve token rates to the board.
+
+    board/agent.py --name studio1 --board http://192.168.86.251:18101 --key-file ~/.pxt_ingest_key
+
+Python 3.9, standard library only, so it runs on a stock macOS box. Every second it
+reads the local /metrics.json (when a server answers), turns the token counters
+into rates and POSTs one small JSON document. A box with no server still reports
+GPU and memory, with null rates.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+LOOP_S = 1.0
+NAMES = re.compile(r"^[a-z0-9._-]{1,16}$")
+
+
+def read_key(path):
+    with open(os.path.expanduser(path)) as f:
+        key = f.read().strip()
+    if len(key) < 16:
+        raise SystemExit(f"key in {path} is shorter than 16 characters")
+    return key
+
+
+def gpu_percent():
+    """System-wide GPU busy %, from the accelerator's own counter; no sudo, ~20 ms."""
+    try:
+        out = subprocess.run(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    hit = re.search(r'"Device Utilization %"\s*=\s*(\d+)', out)
+    return int(hit.group(1)) if hit else None
+
+
+def memory():
+    """(used GiB, total GiB). Used is total minus free, inactive, speculative and
+    purgeable pages, which is what Activity Monitor calls Memory Used."""
+    try:
+        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                   text=True, timeout=5).stdout)
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None, None
+    page = int(re.search(r"page size of (\d+)", out).group(1))
+    pages = {k: int(v) for k, v in re.findall(r"Pages ([a-z ]+):\s+(\d+)\.", out)}
+    spare = sum(pages.get(k, 0) for k in ("free", "inactive", "speculative", "purgeable"))
+    return (total - spare * page) / 2 ** 30, total / 2 ** 30
+
+
+WINDOW_S = 8.0
+
+
+class Rates:
+    """Token rates from successive /metrics.json reads.
+
+    live: the server's counters move in lumps (a prefill chunk, a round of drafted
+    tokens), so a one-second delta flickers between 0 and double the true rate. The
+    rate is the growth over the last WINDOW_S seconds. generation_tokens_live is
+    cumulative; prefill_tokens_live is progress inside one request and resets, so
+    only its increases count. With nothing running the live rates are 0 at once.
+    last: when a request finished in the interval, its average (tokens over the
+    phase's own seconds), which stays on the board dim until the next request
+    replaces it.
+    """
+
+    def __init__(self):
+        self.prev = None
+        self.window = []
+        self.last_dec = None
+        self.last_pre = None
+
+    def update(self, m, now):
+        if m is None:
+            self.prev, self.window = None, []
+            return {"dec": None, "pre": None, "dec_last": self.last_dec, "pre_last": self.last_pre,
+                    "running": None, "serving": False}
+        g, c, h = m.get("gauges") or {}, m.get("counters") or {}, m.get("histograms") or {}
+        cur = {"t": now, "start": g.get("process_start_time_seconds"),
+               "gen": g.get("generation_tokens_live") or 0, "pl": g.get("prefill_tokens_live") or 0,
+               "gen_total": c.get("generation_tokens_total") or 0,
+               "pre_total": c.get("prefill_tokens_total") or 0,
+               "dec_s": (h.get("decode_time_seconds") or {}).get("sum") or 0,
+               "pre_s": (h.get("prefill_time_seconds") or {}).get("sum") or 0}
+        prev, self.prev = self.prev, cur
+        if prev and prev["start"] != cur["start"]:
+            prev, self.window = None, []
+        running = (g.get("requests_running") or 0) + (g.get("requests_prefilling") or 0)
+        self.window = [s for s in self.window + [cur] if now - s["t"] <= WINDOW_S] if running else []
+        if prev:
+            self.last_dec = self._average(cur, prev, "gen_total", "dec_s") or self.last_dec
+            self.last_pre = self._average(cur, prev, "pre_total", "pre_s") or self.last_pre
+        return {"dec": self._rate("gen"), "pre": self._rate("pl"), "dec_last": self.last_dec,
+                "pre_last": self.last_pre, "running": g.get("requests_running"), "serving": True}
+
+    def _rate(self, key):
+        w = self.window
+        span = w[-1]["t"] - w[0]["t"] if len(w) > 1 else 0
+        if span <= 0:
+            return 0.0
+        grown = sum(max(0, b[key] - a[key]) for a, b in zip(w, w[1:]))
+        return round(grown / span, 1)
+
+    @staticmethod
+    def _average(cur, prev, tokens, seconds):
+        dt, dn = cur[seconds] - prev[seconds], cur[tokens] - prev[tokens]
+        return round(dn / dt, 1) if dt > 0 and dn > 0 else None
+
+
+def fetch_metrics(url, timeout=2.0):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read())
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+
+
+def report(name, rates, used, total, gpu):
+    body = {"node": name, "gpu": gpu, "mem_gb": None if used is None else round(used, 1),
+            "mem_total_gb": None if total is None else round(total), "t": int(time.time())}
+    body.update(rates)
+    return body
+
+
+def post(board, key, body):
+    req = urllib.request.Request(board.rstrip("/") + "/ingest", data=json.dumps(body).encode(),
+                                 method="POST", headers={"Content-Type": "application/json",
+                                                         "X-Api-Key": key})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        r.read()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", required=True, help="node label on the board, e.g. studio1")
+    ap.add_argument("--board", required=True, help="board base URL")
+    ap.add_argument("--key-file", default="~/.pxt_ingest_key")
+    ap.add_argument("--metrics", default="http://127.0.0.1:11234/metrics.json")
+    args = ap.parse_args()
+    if not NAMES.match(args.name):
+        raise SystemExit("--name must be 1-16 characters of a-z 0-9 . _ -")
+    key = read_key(args.key_file)
+    rates = Rates()
+    failing = False
+    while True:
+        started = time.time()
+        used, total = memory()
+        body = report(args.name, rates.update(fetch_metrics(args.metrics), started), used, total,
+                      gpu_percent())
+        try:
+            post(args.board, key, body)
+            if failing:
+                print("board reachable again", flush=True)
+            failing = False
+        except (OSError, urllib.error.URLError) as err:
+            if not failing:
+                print(f"board unreachable: {err}", file=sys.stderr, flush=True)
+            failing = True
+        time.sleep(max(0.0, LOOP_S - (time.time() - started)))
+
+
+if __name__ == "__main__":
+    main()
