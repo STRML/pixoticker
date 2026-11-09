@@ -505,8 +505,36 @@ static void handleTest() {
 
 // ---------------------------------------------------------------- OTA
 
+// The Updater is one global session, shared by the /u upload (web task) and the relay download
+// (pull task). Whoever holds the token owns the session. The other side refuses to start and makes
+// no Update call, so neither can write into, commit or abort the other's image.
+enum UpdOwner : uint8_t { UPD_NONE = 0, UPD_RELAY = 1, UPD_UPLOAD = 2 };
+static volatile uint8_t s_upd_owner = UPD_NONE;
+static portMUX_TYPE s_upd_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_up_mine = false;  // the /u upload in progress holds the token
+static bool s_up_busy = false;  // the /u upload in progress was refused because a download holds it
+
+static bool updTake(uint8_t who) {
+  bool got;
+  portENTER_CRITICAL(&s_upd_mux);
+  got = (s_upd_owner == UPD_NONE);
+  if (got) s_upd_owner = who;
+  portEXIT_CRITICAL(&s_upd_mux);
+  return got;
+}
+
+static void updRelease(uint8_t who) {
+  portENTER_CRITICAL(&s_upd_mux);
+  if (s_upd_owner == who) s_upd_owner = UPD_NONE;
+  portEXIT_CRITICAL(&s_upd_mux);
+}
+
 static void handleUpdateDone() {
-  Serial.printf("[ota] done ok=%d written=%u error=%d\n", s_ota_ok, s_ota_written, Update.hasError());
+  Serial.printf("[ota] done ok=%d written=%u busy=%d\n", s_ota_ok, s_ota_written, s_up_busy);
+  if (s_up_busy) {
+    s_http.send(409, "text/plain", "busy: a firmware download from the relay is running, try again in a few minutes");
+    return;
+  }
   if (!s_ota_ok || Update.hasError()) {
     s_http.send(500, "text/plain", String("update failed: ") + (s_ota_written ? Update.errorString() : "no upload received"));
     return;
@@ -521,15 +549,33 @@ static void otaChunk(HTTPUpload &up) {
   if (up.status == UPLOAD_FILE_START) {
     s_ota_ok = false;
     s_ota_written = 0;
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+    s_up_mine = false;
+    s_up_busy = false;
+    if (!updTake(UPD_UPLOAD)) {
+      s_up_busy = true;
+      Serial.println("[ota] /u refused: a download owns the updater");
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+      updRelease(UPD_UPLOAD);
+      return;
+    }
+    s_up_mine = true;
+  } else if (!s_up_mine) {
+    return;  // refused or failed to begin: touch nothing in a session that is not ours
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_END) {
     s_ota_written = up.totalSize + up.currentSize;
     s_ota_ok = Update.end(true);
     if (!s_ota_ok) Update.printError(Serial);
+    s_up_mine = false;
+    updRelease(UPD_UPLOAD);
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     Update.end();
+    s_up_mine = false;
+    updRelease(UPD_UPLOAD);
   }
 }
 
@@ -739,10 +785,16 @@ static OtaStop otaPull(const String &path, size_t want, const String &shaHex, si
   }
   // The flash buffer is taken after the first handshake, as it always was: the handshake needs the
   // contiguous block it would otherwise share.
-  // `mine` says this download owns the Updater. The web server's /u upload shares it, so a begin
-  // that fails (an upload is running) ends the download and leaves that upload alone.
+  // `mine` says this download holds the Updater token. A /u upload in progress holds it instead,
+  // and then the download ends and leaves that upload alone; the op is queued again in a few seconds.
   if (!mine) {
+    if (!updTake(UPD_RELAY)) {
+      why = "busy";
+      http.end();
+      return OTA_FATAL;
+    }
     if (!Update.begin(want)) {
+      updRelease(UPD_RELAY);
       why = "begin failed";
       http.end();
       return OTA_FATAL;
@@ -816,10 +868,15 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
     // A short download keeps the reason its last attempt left in the note; only a whole file
     // that fails its hash needs a word of its own.
     if (total == want) otaNote("hash", total, want);
-    if (mine) Update.abort();
+    if (mine) {
+      Update.abort();
+      updRelease(UPD_RELAY);
+    }
     return false;
   }
-  if (!Update.end(true)) {
+  bool ended = Update.end(true);
+  updRelease(UPD_RELAY);
+  if (!ended) {
     otaNote("end failed", total, want);
     return false;
   }
