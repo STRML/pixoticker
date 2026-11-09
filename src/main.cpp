@@ -700,8 +700,8 @@ static char s_ota_why[24];
 // One connection: fetch from byte `total` to the end, feeding the hash and the flash as the
 // bytes arrive. The first download died after 64 KB with no sign of why, so a connection that
 // ends early is not the end of the file: the caller reconnects and asks for the rest.
-static OtaStop otaPull(const String &path, size_t want, size_t &total, mbedtls_sha256_context &ctx,
-                       const char *&why) {
+static OtaStop otaPull(const String &path, size_t want, const String &shaHex, size_t &total,
+                       mbedtls_sha256_context &ctx, const char *&why) {
   WiFiClientSecure c;
   c.setCACert(RELAY_CA);
   HTTPClient http;
@@ -713,6 +713,8 @@ static OtaStop otaPull(const String &path, size_t want, size_t &total, mbedtls_s
   }
   http.addHeader("X-Api-Key", PXT_RELAY_KEY);
   if (total) http.addHeader("Range", String("bytes=") + String((unsigned)total) + "-");
+  const char *served[] = {"X-Firmware-Sha256"};
+  http.collectHeaders(served, 1);
   int code = http.GET();
   if (code != (total ? 206 : 200)) {
     snprintf(s_ota_why, sizeof(s_ota_why), "http %d", code);
@@ -727,7 +729,28 @@ static OtaStop otaPull(const String &path, size_t want, size_t &total, mbedtls_s
     http.end();
     return total ? OTA_RETRY : OTA_FATAL;
   }
+  // An image republished mid-download would pass every size check and fail only at the final
+  // hash, after the whole file came down. The relay names the image it serves on every reply.
+  String served_sha = http.header("X-Firmware-Sha256");
+  if (served_sha.length() && !served_sha.equalsIgnoreCase(shaHex)) {
+    why = "image changed";
+    http.end();
+    return OTA_FATAL;
+  }
+  // The flash buffer is taken after the first handshake, as it always was: the handshake needs the
+  // contiguous block it would otherwise share.
+  if (!total && !Update.isRunning() && !Update.begin(want)) {
+    why = "begin failed";
+    http.end();
+    return OTA_FATAL;
+  }
+  // The peer can close right after the headers; the client then has no stream to hand out.
   WiFiClient *st = http.getStreamPtr();
+  if (!st) {
+    why = "closed";
+    http.end();
+    return OTA_RETRY;
+  }
   uint32_t last = millis();
   while (total < want) {
     size_t ask = want - total;
@@ -761,10 +784,6 @@ static OtaStop otaPull(const String &path, size_t want, size_t &total, mbedtls_s
 }
 
 static bool otaFrom(const String &path, size_t want, const String &shaHex) {
-  if (!Update.begin(want)) {
-    otaNote("begin failed", 0, want);
-    return false;
-  }
   mbedtls_sha256_context ctx;
   mbedtls_sha256_init(&ctx);
   mbedtls_sha256_starts(&ctx, 0);
@@ -774,7 +793,7 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
   while (total < want && stalls < OTA_MAX_STALLS && stop != OTA_FATAL) {
     size_t before = total;
     const char *why = "";
-    stop = otaPull(path, want, total, ctx, why);
+    stop = otaPull(path, want, shaHex, total, ctx, why);
     stalls = total > before ? 0 : stalls + 1;
     if (total < want) {
       otaNote(why, total, want);
@@ -788,7 +807,9 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
   for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", dig[i]);
   bool match = shaHex.equalsIgnoreCase(hex);
   if (total != want || !match) {
-    otaNote(total != want ? "short" : "hash", total, want);
+    // A short download keeps the reason its last attempt left in the note; only a whole file
+    // that fails its hash needs a word of its own.
+    if (total == want) otaNote("hash", total, want);
     Update.abort();
     return false;
   }
