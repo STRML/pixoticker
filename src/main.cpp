@@ -701,7 +701,7 @@ static char s_ota_why[24];
 // bytes arrive. The first download died after 64 KB with no sign of why, so a connection that
 // ends early is not the end of the file: the caller reconnects and asks for the rest.
 static OtaStop otaPull(const String &path, size_t want, const String &shaHex, size_t &total,
-                       mbedtls_sha256_context &ctx, const char *&why) {
+                       mbedtls_sha256_context &ctx, bool &mine, const char *&why) {
   WiFiClientSecure c;
   c.setCACert(RELAY_CA);
   HTTPClient http;
@@ -739,10 +739,15 @@ static OtaStop otaPull(const String &path, size_t want, const String &shaHex, si
   }
   // The flash buffer is taken after the first handshake, as it always was: the handshake needs the
   // contiguous block it would otherwise share.
-  if (!total && !Update.isRunning() && !Update.begin(want)) {
-    why = "begin failed";
-    http.end();
-    return OTA_FATAL;
+  // `mine` says this download owns the Updater. The web server's /u upload shares it, so a begin
+  // that fails (an upload is running) ends the download and leaves that upload alone.
+  if (!mine) {
+    if (!Update.begin(want)) {
+      why = "begin failed";
+      http.end();
+      return OTA_FATAL;
+    }
+    mine = true;
   }
   // The peer can close right after the headers; the client then has no stream to hand out.
   WiFiClient *st = http.getStreamPtr();
@@ -789,11 +794,12 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
   mbedtls_sha256_starts(&ctx, 0);
   size_t total = 0;
   int stalls = 0;
+  bool mine = false;
   OtaStop stop = OTA_RETRY;
   while (total < want && stalls < OTA_MAX_STALLS && stop != OTA_FATAL) {
     size_t before = total;
     const char *why = "";
-    stop = otaPull(path, want, shaHex, total, ctx, why);
+    stop = otaPull(path, want, shaHex, total, ctx, mine, why);
     stalls = total > before ? 0 : stalls + 1;
     if (total < want) {
       otaNote(why, total, want);
@@ -810,7 +816,7 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
     // A short download keeps the reason its last attempt left in the note; only a whole file
     // that fails its hash needs a word of its own.
     if (total == want) otaNote("hash", total, want);
-    Update.abort();
+    if (mine) Update.abort();
     return false;
   }
   if (!Update.end(true)) {
