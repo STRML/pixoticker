@@ -6,7 +6,7 @@ COPY board/requirements.txt board/requirements.txt
 RUN pip install --no-cache-dir -r board/requirements.txt
 COPY server/pxtrelay.py server/
 COPY tools/font46.py tools/
-COPY board/agent.py board/board.py board/layouts.py board/preview.py board/
+COPY board/agent.py board/board.py board/layouts.py board/peaks.py board/preview.py board/
 ENV PYTHONUNBUFFERED=1
 USER nobody
 CMD ["python", "board/board.py"]
