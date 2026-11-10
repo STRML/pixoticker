@@ -11,12 +11,14 @@ file, so a restart does not start the learning over.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from collections import deque
 
 HALF_LIFE_S = 3 * 86400
 HOLD = 3
+GAP_S = 2.5      # samples further apart than this are not consecutive, whichever ticks the caller skipped
 LEARN_N = 60
 SAVE_EVERY_S = 60
 
@@ -25,7 +27,7 @@ class Peaks:
     def __init__(self, path="", clock=time.time):
         self.path, self.clock = path, clock
         self.peak = {}      # (key, metric) -> [value, when it was set, samples seen]
-        self.recent = {}    # (key, metric) -> the last HOLD live values
+        self.recent = {}    # (key, metric) -> the last HOLD live values with the time each was seen
         self.dirty, self.saved_at, self.failing = False, 0.0, False
         if path:
             self.load()
@@ -35,15 +37,17 @@ class Peaks:
 
     def observe(self, key, metric, value):
         """One live sample a second. Zero or nothing ends the run that has to hold."""
-        slot = (key, metric)
+        slot, now = (key, metric), self.clock()
         if not value or value <= 0:
             self.recent.pop(slot, None)
             return
-        run = self.recent.setdefault(slot, deque(maxlen=HOLD))
-        run.append(value)
+        run = self.recent.get(slot)
+        if run is None or now - run[-1][1] > GAP_S:
+            run = self.recent[slot] = deque(maxlen=HOLD)
+        run.append((value, now))
         if len(run) < HOLD:
             return
-        held, now = min(run), self.clock()
+        held = min(v for v, _ in run)
         entry = self.peak.get(slot)
         self.peak[slot] = [held, now, 1] if entry is None else [max(self._decayed(entry, now), held), now, entry[2] + 1]
         self.dirty = True
@@ -85,7 +89,7 @@ class Peaks:
         for name, entry in raw.items() if isinstance(raw, dict) else []:
             key, _, metric = name.rpartition("|")
             ok = (key and metric and isinstance(entry, list) and len(entry) == 3
-                  and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in entry)
+                  and all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in entry)
                   and entry[0] > 0)
             if ok:
                 self.peak[(key, metric)] = [float(entry[0]), float(entry[1]), int(entry[2])]

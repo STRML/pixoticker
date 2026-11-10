@@ -677,6 +677,22 @@ class PeakLearning(unittest.TestCase):
         self.feed("a/1", "dec", [50.0] * 70 + [400.0, 400.0, 0.0, 400.0, 400.0, 0.0, 400.0])
         self.assertPeak("a/1", "dec", 150.0, 50.0)
 
+    def test_a_gap_in_the_samples_breaks_the_hold_whatever_the_caller_skipped(self):
+        self.feed("a/1", "dec", [50.0] * 70)
+        for _ in range(2):
+            self.p.observe("a/1", "dec", 400.0)
+            self.clock.t += 1
+        self.clock.t += 30          # the node went idle or stale: the caller made no observe calls
+        self.p.observe("a/1", "dec", 400.0)
+        self.assertPeak("a/1", "dec", 150.0, 50.0)
+
+    def test_samples_a_second_or_two_apart_still_hold(self):
+        self.feed("a/1", "dec", [50.0] * 70)
+        for _ in range(3):
+            self.p.observe("a/1", "dec", 90.0)
+            self.clock.t += peaks.GAP_S
+        self.assertPeak("a/1", "dec", 150.0, 90.0)
+
     def test_the_peak_halves_every_half_life(self):
         self.feed("a/1", "dec", [100.0] * 70)
         self.clock.t += peaks.HALF_LIFE_S
@@ -723,17 +739,21 @@ class PeakPersistence(unittest.TestCase):
         self.clock.t += peaks.SAVE_EVERY_S
         self.assertTrue(p.save_if_due())
         self.assertFalse(p.save_if_due())
-        p.observe("studio1/4", "dec", 77.0)
-        self.assertFalse(p.save_if_due())
+        for _ in range(peaks.HOLD):           # a held run changes the peak
+            p.observe("studio1/4", "dec", 77.0)
+            self.clock.t += 1
+        self.assertFalse(p.save_if_due())     # changed, but saved only a moment ago
         self.clock.t += peaks.SAVE_EVERY_S
-        self.assertTrue(p.save_if_due())      # the observation above changed it
+        self.assertTrue(p.save_if_due())
         self.clock.t += peaks.SAVE_EVERY_S
         self.assertFalse(p.save_if_due())     # nothing since: no write
 
     def test_a_corrupt_or_foreign_file_is_ignored_not_fatal(self):
         bodies = ("not json", "[]", '{"peaks": {"a|dec": "x", "b": [1,2,3]}}',
                   '{"peaks": {"a|dec": [-5, 0, 99]}}', '{"peaks": {"a|dec": [true, 0, 99]}}',
-                  '{"peaks": {"a|dec": [0, 0, 99]}}')
+                  '{"peaks": {"a|dec": [0, 0, 99]}}', '{"peaks": {"a|dec": [1, 0, Infinity]}}',
+                  '{"peaks": {"a|dec": [NaN, 0, 99]}}', '{"peaks": {"a|dec": [Infinity, 0, 99]}}',
+                  '{"peaks": {"a|dec": [1, NaN, 99]}}')
         for body in bodies:
             with open(self.path, "w") as f:
                 f.write(body)
