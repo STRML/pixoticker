@@ -11,9 +11,12 @@ GPU and memory, with null rates.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import math
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -96,6 +99,142 @@ def gpu_percent():
         return None
     hit = re.search(r'"Device Utilization %"\s*=\s*(\d+)', out)
     return int(hit.group(1)) if hit else None
+
+
+WATTS_KEY = "PD0R"       # the SMC's whole-board power; PSTR reads 0 on a Studio
+WATTS_MAX = 1000.0       # no Mac draws more; anything above is not a reading
+
+
+class SmcVers(ctypes.Structure):
+    _fields_ = [("major", ctypes.c_char), ("minor", ctypes.c_char), ("build", ctypes.c_char),
+                ("reserved", ctypes.c_char), ("release", ctypes.c_ushort)]
+
+
+class SmcPLimit(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_ushort), ("length", ctypes.c_ushort), ("cpu", ctypes.c_uint),
+                ("gpu", ctypes.c_uint), ("mem", ctypes.c_uint)]
+
+
+class SmcKeyInfo(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint), ("type", ctypes.c_uint), ("attr", ctypes.c_char)]
+
+
+class SmcKeyData(ctypes.Structure):
+    """AppleSMC's call structure, 80 bytes; the layout is the kernel's (see tools/apple-power/smc.h in local-llm)."""
+    _fields_ = [("key", ctypes.c_uint), ("vers", SmcVers), ("plimit", SmcPLimit), ("info", SmcKeyInfo),
+                ("result", ctypes.c_ubyte), ("status", ctypes.c_ubyte), ("data8", ctypes.c_ubyte),
+                ("data32", ctypes.c_uint), ("bytes", ctypes.c_ubyte * 32)]
+
+
+def smc_float(type_code, size, raw):
+    """A little-endian float from an SMC key; nothing else is decoded, and NaN or infinity is no reading."""
+    if type_code != "flt " or size != 4 or len(raw) < 4:
+        return None
+    value = struct.unpack("<f", bytes(raw[:4]))[0]
+    return value if math.isfinite(value) else None
+
+
+class Smc:
+    """AppleSMC through IOKit, as a normal user (no sudo). Opened on first use and again after a failure."""
+
+    READ_KEYINFO, READ_BYTES, KERNEL_INDEX = 9, 5, 2
+
+    def __init__(self):
+        self.iokit = self.conn = None
+
+    def _open(self):
+        iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+        libc = ctypes.CDLL(None)
+        iokit.IOServiceMatching.restype = ctypes.c_void_p
+        iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+        iokit.IOServiceGetMatchingServices.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        iokit.IOIteratorNext.argtypes = [ctypes.c_uint]
+        iokit.IOIteratorNext.restype = ctypes.c_uint
+        iokit.IOServiceOpen.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
+        iokit.IOConnectCallStructMethod.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t,
+                                                   ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        it = ctypes.c_uint()
+        if iokit.IOServiceGetMatchingServices(0, iokit.IOServiceMatching(b"AppleSMC"), ctypes.byref(it)):
+            return None
+        device = iokit.IOIteratorNext(it.value)
+        conn = ctypes.c_uint()
+        if not device or iokit.IOServiceOpen(device, ctypes.c_uint.in_dll(libc, "mach_task_self_").value, 0,
+                                             ctypes.byref(conn)):
+            return None
+        self.iokit, self.conn = iokit, conn.value
+
+    def _call(self, request):
+        out, size = SmcKeyData(), ctypes.c_size_t(ctypes.sizeof(SmcKeyData))
+        rc = self.iokit.IOConnectCallStructMethod(self.conn, self.KERNEL_INDEX, ctypes.byref(request),
+                                                  ctypes.sizeof(SmcKeyData), ctypes.byref(out), ctypes.byref(size))
+        return out if rc == 0 and out.result == 0 else None
+
+    def read(self, key):
+        """(type, size, bytes) of one key, or None."""
+        if self.conn is None:
+            self._open()
+        if self.conn is None:
+            return None
+        code = int.from_bytes(key.encode(), "big")
+        ask = SmcKeyData(key=code, data8=self.READ_KEYINFO)
+        info = self._call(ask)
+        if info is None:
+            self.conn = None            # the next read opens it again
+            return None
+        ask = SmcKeyData(key=code, data8=self.READ_BYTES)
+        ask.info.size = info.info.size
+        data = self._call(ask)
+        if data is None:
+            self.conn = None
+            return None
+        return info.info.type.to_bytes(4, "big").decode("latin-1"), info.info.size, bytes(data.bytes)
+
+
+_SMC = Smc()
+
+
+def smc_read_float(key):
+    try:
+        found = _SMC.read(key)
+    except (OSError, AttributeError, ValueError, ctypes.ArgumentError):
+        return None
+    return smc_float(*found) if found else None
+
+
+def read_watts(read=None):
+    """The whole machine's watts, or None when the SMC is unreadable or the figure is not credible."""
+    value = (read or smc_read_float)(WATTS_KEY)
+    return float(value) if value is not None and 0 < value <= WATTS_MAX else None
+
+
+def cpu_ticks():
+    """(user, system, idle, nice) tick counters from the kernel; None when it cannot be read."""
+    try:
+        libc = ctypes.CDLL(None)
+        libc.mach_host_self.restype = ctypes.c_uint
+        buf, count = (ctypes.c_uint * 4)(), ctypes.c_uint(4)
+        if libc.host_statistics(libc.mach_host_self(), 3, buf, ctypes.byref(count)):   # HOST_CPU_LOAD_INFO
+            return None
+        return tuple(buf)
+    except (OSError, AttributeError):
+        return None
+
+
+class CpuLoad:
+    """CPU busy percent between two successive calls; the first call, or the first after a failed read, has none."""
+
+    def __init__(self, reader=None):
+        self.reader, self.prev = reader or cpu_ticks, None
+
+    def percent(self):
+        cur = self.reader()
+        prev, self.prev = self.prev, cur
+        if cur is None or prev is None:
+            return None
+        user, system, idle, nice = ((c - p) % 2 ** 32 for c, p in zip(cur, prev))
+        busy = user + system + nice
+        total = busy + idle
+        return round(100.0 * busy / total, 1) if total else None
 
 
 GPU_TEMP = re.compile(r"GPU\s+(\d+(?:\.\d+)?)\s*\u00b0C")
@@ -260,7 +399,7 @@ def main():
     key = read_key(args.key_file)
     rates = Rates()
     watch = TpWatch(args.name)
-    temps = TempWatch()
+    temps, cpu = TempWatch(), CpuLoad()
     failing = False
     while True:
         started = time.time()
@@ -270,6 +409,8 @@ def main():
             body = report(args.name, measured, used, total, gpu_percent())
             body.update(watch.check(started, measured["serving"]))
             body["temp"] = temps.check(started)
+            body["watts"] = read_watts()
+            body["cpu"] = cpu.percent()
             post(args.board, key, body)
             if failing:
                 print("board reachable again", flush=True)

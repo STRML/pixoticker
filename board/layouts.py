@@ -26,6 +26,8 @@ GPU_C = (0, 200, 255)
 MEM_C = (190, 100, 255)
 MEM_HOT = (255, 90, 70)
 TEMP_WARM = (255, 160, 0)
+WATT_C = (255, 225, 120)    # system watts
+CPU_C = (150, 170, 255)     # CPU percent
 TEMP_WARN_C, TEMP_HOT_C = 70.0, 85.0   # white below, amber from 70, red from 85
 DEC_C = (0, 225, 120)
 PRE_C = (255, 190, 40)
@@ -34,7 +36,9 @@ BAD = (255, 80, 80)
 DEC_FULL = 150.0    # tok/s floor of the decode history scale, and the focus bar's scale until a peak is learned
 PRE_FULL = 3000.0   # the focus bar's prefill scale until a peak is learned
 RATE_BAR_W = 60     # the focus view's decode and prefill bars
-HIST = 62           # samples a sparkline shows
+ROWS_BAR_W = 88     # rows: GPU and memory bars, leaving the right edge for watts and CPU
+FOCUS_BAR_W = 66    # focus: the same, leaving room for temperature, watts and CPU
+HIST = 36           # samples a sparkline shows
 MEM_WARN = 85.0
 BAR_X, BAR_W = 32, 10   # spark: the GPU and memory bars beside their numbers
 
@@ -158,6 +162,27 @@ def temp_text(temp):
     return f"{temp:.0f}C", MEM_HOT if temp >= TEMP_HOT_C else TEMP_WARM if temp >= TEMP_WARN_C else FG
 
 
+def watts_text(watts):
+    """("182W", colour), capped at 999W so it is never wider than four characters; None without a reading."""
+    return None if watts is None else (f"{min(watts, 999):.0f}W", WATT_C)
+
+
+def cpu_text(cpu):
+    return None if cpu is None else (f"{cpu:.0f}%", CPU_C)
+
+
+def stats_width(parts):
+    parts = [p for p in parts if p]
+    return sum(font.width(text) for text, _ in parts) + 4 * max(0, len(parts) - 1)
+
+
+def draw_stats(c, x, y, parts):
+    """The given (text, colour) parts left to right from x, a space apart; absent parts are skipped."""
+    for part in (p for p in parts if p):
+        x = c.text(x, y, *part) + 4
+    return x
+
+
 def mem_color(node):
     return MEM_HOT if (node.mem or 0) >= MEM_WARN else MEM_C
 
@@ -196,8 +221,11 @@ def rows(nodes):
             c.text_right(126, y + 1, "P" + pt, pc)
         else:
             c.text(14, y + 1, status_text(n), BAD if n.state == STALE else DIM)
-        c.hbar(1, y + 8, 126, 3, frac(n.gpu) if n.fresh else 0, gc)
-        c.hbar(1, y + 12, 126, 3, frac(n.mem) if n.fresh else 0, mc)
+        c.hbar(1, y + 8, ROWS_BAR_W, 3, frac(n.gpu) if n.fresh else 0, gc)
+        c.hbar(1, y + 12, ROWS_BAR_W, 3, frac(n.mem) if n.fresh else 0, mc)
+        if n.fresh:
+            parts = [watts_text(n.watts), cpu_text(n.cpu)]
+            draw_stats(c, 126 - stats_width(parts), y + 9, parts)
     return c.img
 
 
@@ -245,7 +273,7 @@ def quad(nodes):
         c.big(x + 2, y + 9, dt, dc, scale=2)
         if t := temp_text(n.temp):
             c.text_right(x + 62, y + 9, *t)
-        c.text(x + 2, y + 22, "TOK/S", DIM)
+        draw_stats(c, x + 2, y + 22, [watts_text(n.watts), cpu_text(n.cpu)])
         c.text_right(x + 62, y + 15, "P", dim(PRE_C, 0.6))
         c.text_right(x + 62, y + 22, pt, pc)
         c.hbar(x + 2, y + 28, 60, 1, frac(n.gpu), gc)
@@ -288,8 +316,8 @@ def area(c, x, y, w, h, samples, peak, color):
 
 def spark(nodes):
     """A cluster row on top (total decode and prefill, total decode history), then one
-    14 px band per node: GPU and memory as numbers with a 10 px bar each, a decode history on a scale shared by all
-    nodes, the GPU trace over it, amber ticks where a prefill ran, and the rates."""
+    14 px band per node: GPU and memory as numbers with a 10 px bar each, a decode history (HIST samples) on a scale
+    shared by all nodes, the GPU trace over it, amber ticks where a prefill ran, watts over CPU percent, and the rates."""
     c = Canvas()
     x0, wid = 43, HIST
     dec_all, pre_all = totals(nodes)
@@ -322,6 +350,8 @@ def spark(nodes):
             c.d.point((col, y + 12 - round(11 * frac(gpu))), fill=gc)
             if pre:
                 c.rect(col, y + 11, 1, 2, PRE_C)
+        draw_stats(c, x0 + wid + 3, y + 1, [watts_text(n.watts)])
+        draw_stats(c, x0 + wid + 3, y + 7, [cpu_text(n.cpu)])
         c.text_right(126, y + 1, "D" + dt, dc)
         c.text_right(126, y + 7, "P" + pt, pc)
     return c.img
@@ -345,17 +375,16 @@ def focus(nodes):
         pt, pc = shown(top, "pre", PRE_C)
         c.big(1, 10, dt, dc, scale=3)
         c.text(1, 30, "DECODE TOK/S", DIM)
-        gm = f"G{pct(top.gpu)} M{pct(top.mem)}"
-        c.text_right(126, 1, gm, FG)
-        if t := temp_text(top.temp):
-            c.text_right(122 - font.width(gm), 1, *t)
+        c.text_right(126, 1, f"G{pct(top.gpu)} M{pct(top.mem)}", FG)
         c.big(66, 10, pt, pc, scale=3)
         c.text(66, 30, "PREFILL TOK/S", DIM)
         live_dec, live_pre = top.dec or 0, top.pre or 0
         c.hbar(1, 37, RATE_BAR_W, 2, live_dec / (top.dec_peak or DEC_FULL), DEC_C)
         c.hbar(66, 37, RATE_BAR_W, 2, live_pre / (top.pre_peak or PRE_FULL), PRE_C)
-        c.hbar(1, 40, 126, 2, frac(top.gpu), gc)
-        c.hbar(1, 43, 126, 2, frac(top.mem), mc)
+        c.hbar(1, 40, FOCUS_BAR_W, 2, frac(top.gpu), gc)
+        c.hbar(1, 43, FOCUS_BAR_W, 2, frac(top.mem), mc)
+        parts = [temp_text(top.temp), watts_text(top.watts), cpu_text(top.cpu)]
+        draw_stats(c, 126 - stats_width(parts), 39, parts)
     else:
         c.text(14, 1, status_text(top), BAD if top.state == STALE else DIM)
     c.rect(0, 45, W, 1, RULE)

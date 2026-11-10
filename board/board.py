@@ -82,6 +82,10 @@ class Board:
         temp = body.get("temp")
         report["temp"] = float(temp) if (isinstance(temp, (int, float)) and not isinstance(temp, bool)
                                          and 0 < temp <= 130) else None   # NaN and inf fail the comparison
+        for field, low, high in (("watts", 0, 1000), ("cpu", -1, 100)):
+            v = body.get(field)
+            report[field] = float(v) if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                                         and low < v <= high) else None
         follows = body.get("follows")
         report["worker"] = body.get("worker") is True
         report["follows"] = follows if follows in self.names else None
@@ -139,6 +143,7 @@ class Board:
             return node
         r = self.reports[name]
         node.gpu, node.dec, node.pre, node.temp = r["gpu"], r["dec"], r["pre"], r["temp"]
+        node.watts, node.cpu = r["watts"], r["cpu"]
         node.dec_last, node.pre_last = r["dec_last"], r["pre_last"]
         if r["mem_gb"] is not None and r["mem_total_gb"]:
             node.mem = 100.0 * r["mem_gb"] / r["mem_total_gb"]
