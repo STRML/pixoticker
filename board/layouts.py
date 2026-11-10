@@ -26,7 +26,7 @@ GPU_C = (0, 200, 255)
 MEM_C = (190, 100, 255)
 MEM_HOT = (255, 90, 70)
 TEMP_WARM = (255, 160, 0)
-WATT_C = (255, 225, 120)    # system watts
+WATT_C = (190, 200, 215)    # system watts: neutral, so it never reads as the amber of prefill
 CPU_C = (150, 170, 255)     # CPU percent
 TEMP_WARN_C, TEMP_HOT_C = 70.0, 85.0   # white below, amber from 70, red from 85
 DEC_C = (0, 225, 120)
@@ -156,22 +156,22 @@ class Canvas:
 
 
 def temp_text(temp):
-    """("46C", colour) for a GPU temperature, or None when there is none."""
+    """("T46", colour) for a GPU temperature, or None when there is none."""
     if temp is None:
         return None
-    return f"{temp:.0f}C", MEM_HOT if temp >= TEMP_HOT_C else TEMP_WARM if temp >= TEMP_WARN_C else FG
+    return f"T{temp:.0f}", MEM_HOT if temp >= TEMP_HOT_C else TEMP_WARM if temp >= TEMP_WARN_C else FG
 
 
 def watts_text(watts):
-    """("182W", colour), capped at 999W so it is never wider than four characters; None without a reading."""
-    return None if watts is None else (f"{min(watts, 999):.0f}W", WATT_C)
+    """("W182", colour), capped at W999 so it is never wider than four characters; None without a reading."""
+    return None if watts is None else (f"W{min(watts, 999):.0f}", WATT_C)
 
 
 def cpu_text(cpu):
-    return None if cpu is None else (f"{cpu:.0f}%", CPU_C)
+    return None if cpu is None else (f"C{cpu:.0f}", CPU_C)
 
 
-STAT_W = 4 * font.ADVANCE   # the widest figure: 999W, 100%, 100C
+STAT_W = 4 * font.ADVANCE   # the widest figure: T130, W999, C100
 STAT_GAP = 4
 
 
@@ -277,11 +277,10 @@ def quad(nodes):
         dt, dc = shown(n, "dec", DEC_C)
         pt, pc = shown(n, "pre", PRE_C)
         c.big(x + 2, y + 9, dt, dc, scale=2)
-        if t := temp_text(n.temp):
-            c.text_right(x + 62, y + 9, *t)
-        draw_stats(c, x + 2, y + 22, [watts_text(n.watts), cpu_text(n.cpu)])
-        c.text_right(x + 62, y + 15, "P", dim(PRE_C, 0.6))
-        c.text_right(x + 62, y + 22, pt, pc)
+        if len(dt) <= 4:
+            c.text(x + 4 + len(dt) * 2 * font.ADVANCE, y + 9, "D", dim(dc, 0.6))
+        c.text_right(x + 62, y + 9, "P" + pt, pc)
+        draw_stats(c, x + 2, y + 22, [temp_text(n.temp), watts_text(n.watts), cpu_text(n.cpu)])
         c.hbar(x + 2, y + 28, 60, 1, frac(n.gpu), gc)
         c.hbar(x + 2, y + 30, 60, 1, frac(n.mem), mc)
     return c.img
@@ -373,15 +372,18 @@ def focus(nodes):
     dec_all, pre_all = totals(nodes)
     td, tdc = total_text(dec_all, DEC_C)
     tp, tpc = total_text(pre_all, PRE_C)
-    c.text(14, 1, "ALL", DIM)
-    x = c.text(30, 1, td, tdc)
-    c.text(x + 4, 1, tp, tpc)
+    x = 126 - font.width(tp)
+    c.text(x, 1, tp, tpc)
+    x -= 4 + font.width(td)
+    c.text(x, 1, td, tdc)
+    c.text(x - 4 - font.width("ALL"), 1, "ALL", DIM)
     if top.fresh:
         dt, dc = shown(top, "dec", DEC_C)
         pt, pc = shown(top, "pre", PRE_C)
         c.big(1, 10, dt, dc, scale=3)
         c.text(1, 30, "DECODE TOK/S", DIM)
-        c.text_right(126, 1, f"G{pct(top.gpu)} M{pct(top.mem)}", FG)
+        c.text(14, 1, f"G{pct(top.gpu)}", gc)
+        c.text(34, 1, f"M{pct(top.mem)}", mc)
         c.big(66, 10, pt, pc, scale=3)
         c.text(66, 30, "PREFILL TOK/S", DIM)
         live_dec, live_pre = top.dec or 0, top.pre or 0
