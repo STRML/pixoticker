@@ -242,6 +242,135 @@ class SmcAndCpu(unittest.TestCase):
         self.assertTrue(cpu is None or 0 <= cpu <= 100)
 
 
+class FakeIokit:
+    """Records every handle the SMC code takes and gives back, so a leak shows as a handle never released."""
+
+    def __init__(self, no_device=False, open_fails=False, calls_fail=False):
+        self.no_device, self.open_fails, self.calls_fail = no_device, open_fails, calls_fail
+        self.next, self.taken, self.released, self.closed, self.opened = 100, set(), set(), set(), []
+
+    def handle(self):
+        self.next += 1
+        self.taken.add(self.next)
+        return self.next
+
+    def IOServiceMatching(self, name):
+        return 1
+
+    def IOServiceGetMatchingServices(self, master, matching, ref):
+        ref._obj.value = self.handle()
+        return 0
+
+    def IOIteratorNext(self, it):
+        return 0 if self.no_device else self.handle()
+
+    def IOObjectRelease(self, handle):
+        self.released.add(handle)
+
+    def IOServiceOpen(self, device, task, kind, ref):
+        if self.open_fails:
+            return 1
+        ref._obj.value = self.handle()
+        self.opened.append(ref._obj.value)
+        return 0
+
+    def IOServiceClose(self, conn):
+        self.closed.add(conn)
+
+    def IOConnectCallStructMethod(self, conn, index, request, size, out, out_size):
+        return 1 if self.calls_fail else 0
+
+    def leaked(self):
+        return (self.taken - self.released) - set(self.opened) | (set(self.opened) - self.closed)
+
+
+class SmcHandles(unittest.TestCase):
+    def smc(self, **kw):
+        fake = FakeIokit(**kw)
+        return fake, agent.Smc(load=lambda: fake)
+
+    def test_a_good_open_releases_the_iterator_and_the_service_and_keeps_only_the_connection(self):
+        fake, smc = self.smc()
+        smc._open()
+        self.assertEqual(smc.conn, fake.opened[0])
+        self.assertEqual(fake.taken - fake.released, {fake.opened[0]})
+        smc.close()
+        self.assertEqual(fake.leaked(), set())
+
+    def test_no_device_releases_the_iterator(self):
+        fake, smc = self.smc(no_device=True)
+        self.assertIsNone(smc.read("PD0R"))
+        self.assertEqual(fake.leaked(), set())
+
+    def test_a_refused_open_releases_the_iterator_and_the_service(self):
+        fake, smc = self.smc(open_fails=True)
+        self.assertIsNone(smc.read("PD0R"))
+        self.assertIsNone(smc.conn)
+        self.assertEqual(fake.leaked(), set())
+
+    def test_a_key_that_always_fails_closes_every_connection_it_opens_once_a_second_for_a_long_time(self):
+        fake, smc = self.smc(calls_fail=True)
+        for _ in range(500):
+            self.assertIsNone(smc.read("PD0R"))
+        self.assertEqual(len(fake.opened), 500)
+        self.assertEqual(fake.leaked(), set())
+
+    def test_a_key_that_works_keeps_one_connection_open_across_reads(self):
+        fake, smc = self.smc()
+        for _ in range(5):
+            smc.read("PD0R")
+        self.assertEqual(len(fake.opened), 1)
+        self.assertEqual(fake.closed, set())
+
+
+class HostPort(unittest.TestCase):
+    class Libc:
+        def __init__(self):
+            self.host_calls, self.taken = [], 0
+
+            def take():
+                self.taken += 1
+                return 7
+
+            self.mach_host_self = take
+
+        def host_statistics(self, host, flavor, buf, count):
+            self.host_calls.append(host)
+            return 0
+
+    def test_the_host_port_is_taken_once_however_often_the_cpu_is_read(self):
+        libc, saved = self.Libc(), list(agent._HOST)
+        agent._HOST[:] = []
+        real = ctypes.CDLL
+        ctypes.CDLL = lambda name, *a, **k: libc
+        try:
+            for _ in range(50):
+                self.assertIsNotNone(agent.cpu_ticks())
+        finally:
+            ctypes.CDLL = real
+            agent._HOST[:] = saved
+        self.assertEqual(libc.taken, 1)
+        self.assertEqual(libc.host_calls, [7] * 50)
+
+
+class BoardRanges(unittest.TestCase):
+    def view(self, **kw):
+        b = boardmod.Board(["studio1"], clock=Clock())
+        b.ingest(report(**kw))
+        return b.nodes()[0]
+
+    def test_the_documented_ranges_are_the_accepted_ones(self):
+        self.assertEqual(self.view(temp=10).temp, 10.0)
+        self.assertEqual(self.view(temp=130).temp, 130.0)
+        for outside in (9.9, 5, 0, -1, 130.1):
+            self.assertIsNone(self.view(temp=outside).temp, outside)
+        self.assertEqual(self.view(cpu=0).cpu, 0.0)
+        for outside in (-0.5, -1, 100.5):
+            self.assertIsNone(self.view(cpu=outside).cpu, outside)
+        for outside in (0, -1, 1000.5):
+            self.assertIsNone(self.view(watts=outside).watts, outside)
+
+
 class BoardCarriesStats(unittest.TestCase):
     def view(self, **kw):
         b = boardmod.Board(["studio1"], clock=Clock())

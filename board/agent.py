@@ -134,34 +134,50 @@ def smc_float(type_code, size, raw):
     return value if math.isfinite(value) else None
 
 
+def load_iokit():
+    iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+    iokit.IOServiceMatching.restype = ctypes.c_void_p
+    iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+    iokit.IOServiceGetMatchingServices.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+    iokit.IOIteratorNext.argtypes = [ctypes.c_uint]
+    iokit.IOIteratorNext.restype = ctypes.c_uint
+    iokit.IOServiceOpen.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
+    iokit.IOServiceClose.argtypes = [ctypes.c_uint]
+    iokit.IOObjectRelease.argtypes = [ctypes.c_uint]
+    iokit.IOConnectCallStructMethod.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t,
+                                               ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+    return iokit
+
+
 class Smc:
-    """AppleSMC through IOKit, as a normal user (no sudo). Opened on first use and again after a failure."""
+    """AppleSMC through IOKit, as a normal user (no sudo). Opened on first use and again after a failure; every
+    handle it takes (the iterator, the service, the connection) is released the moment it is no longer needed."""
 
     READ_KEYINFO, READ_BYTES, KERNEL_INDEX = 9, 5, 2
 
-    def __init__(self):
-        self.iokit = self.conn = None
+    def __init__(self, load=load_iokit):
+        self.load, self.iokit, self.conn = load, None, None
 
     def _open(self):
-        iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
-        libc = ctypes.CDLL(None)
-        iokit.IOServiceMatching.restype = ctypes.c_void_p
-        iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
-        iokit.IOServiceGetMatchingServices.argtypes = [ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
-        iokit.IOIteratorNext.argtypes = [ctypes.c_uint]
-        iokit.IOIteratorNext.restype = ctypes.c_uint
-        iokit.IOServiceOpen.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
-        iokit.IOConnectCallStructMethod.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t,
-                                                   ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        iokit = self.load()
         it = ctypes.c_uint()
         if iokit.IOServiceGetMatchingServices(0, iokit.IOServiceMatching(b"AppleSMC"), ctypes.byref(it)):
-            return None
+            return
         device = iokit.IOIteratorNext(it.value)
+        iokit.IOObjectRelease(it.value)
+        if not device:
+            return
         conn = ctypes.c_uint()
-        if not device or iokit.IOServiceOpen(device, ctypes.c_uint.in_dll(libc, "mach_task_self_").value, 0,
-                                             ctypes.byref(conn)):
-            return None
-        self.iokit, self.conn = iokit, conn.value
+        task = ctypes.c_uint.in_dll(ctypes.CDLL(None), "mach_task_self_").value
+        status = iokit.IOServiceOpen(device, task, 0, ctypes.byref(conn))
+        iokit.IOObjectRelease(device)
+        if not status:
+            self.iokit, self.conn = iokit, conn.value
+
+    def close(self):
+        if self.conn is not None:
+            self.iokit.IOServiceClose(self.conn)
+        self.conn = None
 
     def _call(self, request):
         out, size = SmcKeyData(), ctypes.c_size_t(ctypes.sizeof(SmcKeyData))
@@ -170,22 +186,21 @@ class Smc:
         return out if rc == 0 and out.result == 0 else None
 
     def read(self, key):
-        """(type, size, bytes) of one key, or None."""
+        """(type, size, bytes) of one key, or None. A failed call closes the connection; the next read reopens it."""
         if self.conn is None:
             self._open()
         if self.conn is None:
             return None
         code = int.from_bytes(key.encode(), "big")
-        ask = SmcKeyData(key=code, data8=self.READ_KEYINFO)
-        info = self._call(ask)
+        info = self._call(SmcKeyData(key=code, data8=self.READ_KEYINFO))
         if info is None:
-            self.conn = None            # the next read opens it again
+            self.close()
             return None
         ask = SmcKeyData(key=code, data8=self.READ_BYTES)
         ask.info.size = info.info.size
         data = self._call(ask)
         if data is None:
-            self.conn = None
+            self.close()
             return None
         return info.info.type.to_bytes(4, "big").decode("latin-1"), info.info.size, bytes(data.bytes)
 
@@ -207,13 +222,24 @@ def read_watts(read=None):
     return float(value) if value is not None and 0 < value <= WATTS_MAX else None
 
 
+_HOST = []
+
+
+def host_port():
+    """The kernel's host port, taken once: every mach_host_self() call adds a send right nothing releases."""
+    if not _HOST:
+        libc = ctypes.CDLL(None)
+        libc.mach_host_self.restype = ctypes.c_uint
+        _HOST.append((libc, libc.mach_host_self()))
+    return _HOST[0]
+
+
 def cpu_ticks():
     """(user, system, idle, nice) tick counters from the kernel; None when it cannot be read."""
     try:
-        libc = ctypes.CDLL(None)
-        libc.mach_host_self.restype = ctypes.c_uint
+        libc, host = host_port()
         buf, count = (ctypes.c_uint * 4)(), ctypes.c_uint(4)
-        if libc.host_statistics(libc.mach_host_self(), 3, buf, ctypes.byref(count)):   # HOST_CPU_LOAD_INFO
+        if libc.host_statistics(host, 3, buf, ctypes.byref(count)):   # HOST_CPU_LOAD_INFO
             return None
         return tuple(buf)
     except (OSError, AttributeError):

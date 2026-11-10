@@ -81,11 +81,11 @@ class Board:
         report.update({k: number(body.get(k)) for k in RATE_FIELDS})
         temp = body.get("temp")
         report["temp"] = float(temp) if (isinstance(temp, (int, float)) and not isinstance(temp, bool)
-                                         and 0 < temp <= 130) else None   # NaN and inf fail the comparison
-        for field, low, high in (("watts", 0, 1000), ("cpu", -1, 100)):
+                                         and 10 <= temp <= 130) else None   # NaN and inf fail the comparison
+        for field, in_range in (("watts", lambda v: 0 < v <= 1000), ("cpu", lambda v: 0 <= v <= 100)):
             v = body.get(field)
             report[field] = float(v) if (isinstance(v, (int, float)) and not isinstance(v, bool)
-                                         and low < v <= high) else None
+                                         and in_range(v)) else None
         follows = body.get("follows")
         report["worker"] = body.get("worker") is True
         report["follows"] = follows if follows in self.names else None
