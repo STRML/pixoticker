@@ -420,6 +420,177 @@ class NightDim(unittest.TestCase):
         self.assertNotEqual(spy.sent[0], board.frame()[1].tobytes())
 
 
+class TpMirror(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.board = boardmod.Board(["studio1", "studio2", "studio3", "studio4"], clock=self.clock)
+
+    def leader(self, **kw):
+        self.board.ingest(report("studio1", running=1, **kw))
+
+    def worker(self, name, follows="studio1", **kw):
+        body = report(name, dec=0.0, pre=0.0, dec_last=None, pre_last=None, dec_last_age=None,
+                      pre_last_age=None, worker=True, follows=follows)
+        body.update(kw)
+        self.board.ingest(body)
+
+    def view(self, name):
+        return {n.name: n for n in self.board.nodes()}[name]
+
+    def test_a_worker_shows_its_leaders_live_rates_and_state(self):
+        self.leader(dec=118.4, pre=2400.0)
+        self.worker("studio2")
+        n = self.view("studio2")
+        self.assertEqual((n.dec, n.pre, n.state, n.tp), (118.4, 2400.0, layouts.LIVE, "studio1"))
+        self.assertEqual((n.dec_last, n.pre_last), (50.0, 2000.0))
+
+    def test_the_cluster_total_counts_each_token_once(self):
+        self.leader(dec=100.0, pre=3000.0)
+        self.worker("studio2")
+        self.worker("studio3")
+        self.assertEqual(layouts.totals(self.board.nodes()), (100.0, 3000.0))
+
+    def test_the_total_history_skips_mirrored_nodes(self):
+        self.leader(dec=100.0)
+        self.worker("studio2")
+        self.board.tick()
+        self.board.tick()
+        self.assertEqual(layouts.total_history(self.board.nodes()), [100.0, 100.0])
+
+    def test_without_a_named_leader_the_busiest_serving_node_leads(self):
+        self.leader(dec=90.0)
+        self.board.ingest(report("studio3", dec=0.0, pre=0.0, running=0, dec_last_age=None, pre_last_age=None))
+        self.worker("studio2", follows=None)
+        self.assertEqual((self.view("studio2").dec, self.view("studio2").tp), (90.0, "studio1"))
+
+    def test_a_stale_leader_leaves_the_worker_on_its_own_numbers(self):
+        self.leader(dec=90.0)
+        self.clock.t += 60
+        self.worker("studio2")
+        n = self.view("studio2")
+        self.assertEqual((n.dec, n.tp), (0.0, None))
+
+    def test_a_worker_never_follows_a_worker_or_itself(self):
+        self.worker("studio2", follows="studio3")
+        self.worker("studio3", follows="studio2")
+        self.worker("studio4", follows="studio4")
+        self.assertEqual([self.view(n).tp for n in ("studio2", "studio3", "studio4")], [None, None, None])
+
+    def test_a_node_that_is_not_a_worker_ignores_follows(self):
+        self.leader(dec=90.0)
+        self.board.ingest(report("studio2", dec=7.0, running=1, follows="studio1"))
+        n = self.view("studio2")
+        self.assertEqual((n.dec, n.tp), (7.0, None))
+
+    def test_junk_follows_is_dropped(self):
+        self.leader(dec=90.0)
+        self.worker("studio2", follows="../../etc")
+        self.worker("studio3", follows=7)
+        self.assertEqual((self.view("studio2").tp, self.view("studio3").tp), ("studio1", "studio1"))
+
+
+class TpHistory(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.board = boardmod.Board(["studio1", "studio2", "studio3", "studio4"], clock=self.clock)
+
+    def ingest(self, name, worker=False, dec=100.0, running=1):
+        self.board.ingest(report(name, dec=dec, pre=0.0, running=running, worker=worker, follows="studio1" if worker else None))
+
+    def step(self, leader=True, workers=True):
+        self.ingest("studio1", dec=100.0)
+        self.ingest("studio2", worker=workers, dec=0.0 if workers else 0.0, running=0)
+        self.ingest("studio3", worker=workers, dec=0.0, running=0)
+        self.board.tick()
+        self.clock.t += 1
+
+    def totals(self):
+        return layouts.total_history(self.board.nodes())
+
+    def test_history_taken_while_mirroring_is_not_added_back_when_the_job_ends(self):
+        for _ in range(3):
+            self.step(workers=True)
+        self.assertEqual(self.totals(), [100.0, 100.0, 100.0])
+        self.step(workers=False)
+        self.assertEqual(self.totals(), [100.0, 100.0, 100.0, 100.0])
+
+    def test_history_taken_while_serving_stays_when_the_box_becomes_a_worker(self):
+        for _ in range(2):
+            self.ingest("studio1", dec=100.0)
+            self.ingest("studio2", dec=20.0)
+            self.board.tick()
+            self.clock.t += 1
+        self.assertEqual(self.totals(), [120.0, 120.0])
+        self.ingest("studio1", dec=100.0)
+        self.ingest("studio2", worker=True, dec=0.0, running=0)
+        self.board.tick()
+        self.assertEqual(self.totals(), [120.0, 120.0, 100.0])
+
+    def test_every_layout_draws_history_the_board_recorded(self):
+        for _ in range(3):
+            self.step(workers=True)
+        for name in layouts.LAYOUTS:
+            self.assertEqual(layouts.render(name, self.board.nodes()).size, (128, 64), name)
+
+    def test_a_stale_leader_does_not_inflate_the_total_history(self):
+        for _ in range(3):
+            self.step(workers=True)
+        self.clock.t += 60
+        self.ingest("studio2", worker=True, dec=0.0, running=0)
+        self.ingest("studio3", worker=True, dec=0.0, running=0)
+        self.assertEqual(self.totals(), [0.0, 0.0, 0.0])
+
+
+class TpWatchTests(unittest.TestCase):
+    WORKER = ("/Users/s/opt/mlx-serve-main/zig-out/bin/mlx-serve-main worker --rank 1 --size 2 "
+              "--coordinator 10.254.12.1:7000 --device rdma_en5 --model-dir /Users/s/models-big")
+
+    def test_a_box_that_serves_is_never_a_worker(self):
+        watch = agent.TpWatch("studio2")
+        self.assertEqual(watch.check(10.0, True, lambda: [self.WORKER]), {"worker": False, "follows": None})
+        self.assertEqual(watch.check(20.0, False, lambda: [self.WORKER])["worker"], True)
+
+    def test_a_failed_ps_keeps_the_last_role(self):
+        watch = agent.TpWatch("studio2")
+        self.assertTrue(watch.check(10.0, False, lambda: [self.WORKER])["worker"])
+        self.assertTrue(watch.check(20.0, False, lambda: None)["worker"])
+
+    def test_ps_runs_at_most_once_per_poll_interval(self):
+        calls = []
+        watch = agent.TpWatch("studio2")
+        for t in (10.0, 10.5, 12.0, 15.1):
+            watch.check(t, False, lambda: calls.append(t) or [])
+        self.assertEqual(calls, [10.0, 15.1])
+
+    def test_a_launcher_line_that_carries_a_workers_argv_is_not_a_worker(self):
+        for line in ("ssh studio2 " + self.WORKER, "sh -c '" + self.WORKER + "'", "/usr/bin/env HOME=/x " + self.WORKER):
+            self.assertFalse(agent.tp_role([line])["worker"], line)
+
+    def test_a_box_never_follows_itself(self):
+        self.assertEqual(agent.tp_role([self.WORKER], "studio1"), {"worker": False, "follows": None})
+
+
+class AgentTp(unittest.TestCase):
+    WORKER = ("/Users/s/opt/mlx-serve-main/zig-out/bin/mlx-serve-main worker --rank 1 --size 2 "
+              "--coordinator 10.254.12.1:7000 --device rdma_en5 --model-dir /Users/s/models-big")
+
+    def test_a_worker_process_names_the_leader_by_its_cable_address(self):
+        self.assertEqual(agent.tp_role([self.WORKER]), {"worker": True, "follows": "studio1"})
+
+    def test_the_last_octet_of_the_coordinator_is_the_leaders_studio_number(self):
+        line = self.WORKER.replace("10.254.12.1", "10.254.34.3")
+        self.assertEqual(agent.tp_role([line])["follows"], "studio3")
+
+    def test_a_coordinator_off_the_mesh_still_marks_a_worker(self):
+        line = self.WORKER.replace("10.254.12.1", "192.168.86.151")
+        self.assertEqual(agent.tp_role([line]), {"worker": True, "follows": None})
+
+    def test_a_server_or_unrelated_process_is_not_a_worker(self):
+        serve = "/Users/s/.local/bin/mlx-serve --serve --host 0.0.0.0 --port 11234 --metrics"
+        other = "/usr/bin/python3 worker.py --coordinator 10.254.12.1:7000"
+        self.assertEqual(agent.tp_role([serve, other, ""]), {"worker": False, "follows": None})
+
+
 class AgentRates(unittest.TestCase):
     def metrics(self, gen, pl, gen_total, pre_total, dec_s, pre_s, start=1, running=1):
         return {"gauges": {"process_start_time_seconds": start, "generation_tokens_live": gen,
