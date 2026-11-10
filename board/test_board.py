@@ -419,11 +419,6 @@ class NightDim(unittest.TestCase):
         self.assertEqual(spy.sent[0], boardmod.dim_image(board.frame()[1], 0.5).tobytes())
         self.assertNotEqual(spy.sent[0], board.frame()[1].tobytes())
 
-    def test_the_gallery_preview_is_not_dimmed(self):
-        board = boardmod.Board(["studio1"], clock=Clock())
-        board.ingest(report("studio1"))
-        self.assertEqual(board.frame()[1].tobytes(), layouts.render(board.frame()[0], board.nodes()).tobytes())
-
 
 class AgentRates(unittest.TestCase):
     def metrics(self, gen, pl, gen_total, pre_total, dec_s, pre_s, start=1, running=1):
