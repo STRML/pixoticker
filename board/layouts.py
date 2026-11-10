@@ -48,7 +48,7 @@ class Node:
     dec_last: float | None = None
     pre_last: float | None = None
     age: int = 0
-    hist: list = field(default_factory=list)   # [(dec, gpu), ...] oldest first
+    hist: list = field(default_factory=list)   # [(dec, gpu, pre, share), ...] oldest first; share is its part of the cluster decode total
     tp: str | None = None   # a tensor-parallel worker: the node whose rates it shows
 
     @property
@@ -233,13 +233,15 @@ def totals(nodes):
 
 
 def total_history(nodes):
-    """Decode tok/s of all reporting nodes added up, newest sample last."""
-    series = [n.hist for n in nodes[:4] if n.fresh and n.tp is None]
+    """Decode tok/s of all reporting nodes added up, newest sample last. A sample counts what its node
+    added to the total when it was taken (a worker's mirrored rate adds nothing), so a node changing
+    role later does not rewrite the past."""
+    series = [n.hist for n in nodes[:4] if n.fresh]
     width = max((len(h) for h in series), default=0)
     out = [0.0] * width
     for h in series:
         for k, sample in enumerate(reversed(h)):
-            out[width - 1 - k] += sample[0] or 0
+            out[width - 1 - k] += (sample[3] if len(sample) > 3 else sample[0]) or 0
     return out
 
 
@@ -287,7 +289,7 @@ def spark(nodes):
         dt, dc = shown(n, "dec", DEC_C)
         samples = n.hist[-wid:]
         area(c, x0, y + 1, wid, 12, [s[0] for s in samples], shared, DEC_C)
-        for k, (_, gpu, pre) in enumerate(samples):
+        for k, (_, gpu, pre, *_) in enumerate(samples):
             col = x0 + wid - len(samples) + k
             c.d.point((col, y + 12 - round(11 * frac(gpu))), fill=gc)
             if pre:

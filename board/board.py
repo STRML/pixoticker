@@ -130,7 +130,7 @@ class Board:
         """Append every fresh node's sample to its history; call once a second."""
         for n in self.nodes():
             if n.fresh:
-                self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0))
+                self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0, 0.0 if n.tp else n.dec or 0.0))
 
     def layout(self, now=None):
         if self.pinned != "auto":

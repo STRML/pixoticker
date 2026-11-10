@@ -25,29 +25,54 @@ TP_POLL_S = 5.0   # how often to look for a tensor-parallel worker process
 NAMES = re.compile(r"^[a-z0-9._-]{1,16}$")
 
 
-WORKER = re.compile(r"(?:^|/)mlx-serve\S*\s+worker\b")
+WORKER = re.compile(r"^\S*mlx-serve\S*\s+worker\b")
 COORDINATOR = re.compile(r"--coordinator\s+(\d+)\.(\d+)\.(\d+)\.(\d+):\d+")
+NOT_WORKER = {"worker": False, "follows": None}
 
 
-def tp_role(commands):
-    """Is this box a tensor-parallel worker, and whose? A worker is `mlx-serve worker ... --coordinator
-    10.254.<ab>.<n>:<port>`: it serves no HTTP, so it has no counters. On the Thunderbolt mesh the last
-    octet of rank 0's cable address is rank 0's Studio number, which names the node whose rates it shares."""
+def tp_role(commands, name=None):
+    """Is this box a tensor-parallel worker, and whose? A worker is a process that is `mlx-serve worker ...
+    --coordinator 10.254.<ab>.<n>:<port>`: it serves no HTTP, so it has no counters. Only the command line's
+    first word counts (an ssh or sh line that carries the same words is a launcher, not a worker). On the
+    Thunderbolt mesh the last octet of rank 0's cable address is rank 0's Studio number, which names the node
+    whose rates it shares. A line that names this box as its own leader is not a worker's."""
     for line in commands:
         if not WORKER.search(line):
             continue
         m = COORDINATOR.search(line)
         mesh = m and (m.group(1), m.group(2)) == ("10", "254")
-        return {"worker": True, "follows": f"studio{m.group(4)}" if mesh else None}
-    return {"worker": False, "follows": None}
+        follows = f"studio{m.group(4)}" if mesh else None
+        if follows is not None and follows == name:
+            continue
+        return {"worker": True, "follows": follows}
+    return dict(NOT_WORKER)
 
 
 def process_commands():
+    """Every process's command line, or None when ps could not be read: no answer is not a "no"."""
     try:
-        out = subprocess.run(["ps", "-Ao", "command"], capture_output=True, text=True, timeout=3).stdout
+        out = subprocess.run(["ps", "-Ao", "command"], capture_output=True, text=True, timeout=3)
     except (OSError, subprocess.SubprocessError):
-        return []
-    return out.splitlines()
+        return None
+    return out.stdout.splitlines() if out.returncode == 0 else None
+
+
+class TpWatch:
+    """The box's tensor-parallel role, looked up at most every TP_POLL_S seconds. A box with its own
+    server is never a worker; a ps that fails keeps the last answer."""
+
+    def __init__(self, name):
+        self.name, self.role, self.next = name, dict(NOT_WORKER), 0.0
+
+    def check(self, now, serving, commands=process_commands):
+        if serving:
+            return dict(NOT_WORKER)
+        if now >= self.next:
+            self.next = now + TP_POLL_S
+            lines = commands()
+            if lines is not None:
+                self.role = tp_role(lines, self.name)
+        return self.role
 
 
 def read_key(path):
@@ -191,17 +216,15 @@ def main():
         raise SystemExit("--name must be 1-16 characters of a-z 0-9 . _ -")
     key = read_key(args.key_file)
     rates = Rates()
-    tp, tp_next = tp_role([]), 0.0
+    watch = TpWatch(args.name)
     failing = False
     while True:
         started = time.time()
         try:
             used, total = memory()
-            body = report(args.name, rates.update(fetch_metrics(args.metrics), started), used, total,
-                          gpu_percent())
-            if started >= tp_next:
-                tp, tp_next = tp_role(process_commands()), started + TP_POLL_S
-            body.update(tp)
+            measured = rates.update(fetch_metrics(args.metrics), started)
+            body = report(args.name, measured, used, total, gpu_percent())
+            body.update(watch.check(started, measured["serving"]))
             post(args.board, key, body)
             if failing:
                 print("board reachable again", flush=True)

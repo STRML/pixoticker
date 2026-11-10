@@ -397,6 +397,87 @@ class TpMirror(unittest.TestCase):
         self.assertEqual((self.view("studio2").tp, self.view("studio3").tp), ("studio1", "studio1"))
 
 
+class TpHistory(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.board = boardmod.Board(["studio1", "studio2", "studio3", "studio4"], clock=self.clock)
+
+    def ingest(self, name, worker=False, dec=100.0, running=1):
+        self.board.ingest(report(name, dec=dec, pre=0.0, running=running, worker=worker, follows="studio1" if worker else None))
+
+    def step(self, leader=True, workers=True):
+        self.ingest("studio1", dec=100.0)
+        self.ingest("studio2", worker=workers, dec=0.0 if workers else 0.0, running=0)
+        self.ingest("studio3", worker=workers, dec=0.0, running=0)
+        self.board.tick()
+        self.clock.t += 1
+
+    def totals(self):
+        return layouts.total_history(self.board.nodes())
+
+    def test_history_taken_while_mirroring_is_not_added_back_when_the_job_ends(self):
+        for _ in range(3):
+            self.step(workers=True)
+        self.assertEqual(self.totals(), [100.0, 100.0, 100.0])
+        self.step(workers=False)
+        self.assertEqual(self.totals(), [100.0, 100.0, 100.0, 100.0])
+
+    def test_history_taken_while_serving_stays_when_the_box_becomes_a_worker(self):
+        for _ in range(2):
+            self.ingest("studio1", dec=100.0)
+            self.ingest("studio2", dec=20.0)
+            self.board.tick()
+            self.clock.t += 1
+        self.assertEqual(self.totals(), [120.0, 120.0])
+        self.ingest("studio1", dec=100.0)
+        self.ingest("studio2", worker=True, dec=0.0, running=0)
+        self.board.tick()
+        self.assertEqual(self.totals(), [120.0, 120.0, 100.0])
+
+    def test_every_layout_draws_history_the_board_recorded(self):
+        for _ in range(3):
+            self.step(workers=True)
+        for name in layouts.LAYOUTS:
+            self.assertEqual(layouts.render(name, self.board.nodes()).size, (128, 64), name)
+
+    def test_a_stale_leader_does_not_inflate_the_total_history(self):
+        for _ in range(3):
+            self.step(workers=True)
+        self.clock.t += 60
+        self.ingest("studio2", worker=True, dec=0.0, running=0)
+        self.ingest("studio3", worker=True, dec=0.0, running=0)
+        self.assertEqual(self.totals(), [0.0, 0.0, 0.0])
+
+
+class TpWatchTests(unittest.TestCase):
+    WORKER = ("/Users/s/opt/mlx-serve-main/zig-out/bin/mlx-serve-main worker --rank 1 --size 2 "
+              "--coordinator 10.254.12.1:7000 --device rdma_en5 --model-dir /Users/s/models-big")
+
+    def test_a_box_that_serves_is_never_a_worker(self):
+        watch = agent.TpWatch("studio2")
+        self.assertEqual(watch.check(10.0, True, lambda: [self.WORKER]), {"worker": False, "follows": None})
+        self.assertEqual(watch.check(20.0, False, lambda: [self.WORKER])["worker"], True)
+
+    def test_a_failed_ps_keeps_the_last_role(self):
+        watch = agent.TpWatch("studio2")
+        self.assertTrue(watch.check(10.0, False, lambda: [self.WORKER])["worker"])
+        self.assertTrue(watch.check(20.0, False, lambda: None)["worker"])
+
+    def test_ps_runs_at_most_once_per_poll_interval(self):
+        calls = []
+        watch = agent.TpWatch("studio2")
+        for t in (10.0, 10.5, 12.0, 15.1):
+            watch.check(t, False, lambda: calls.append(t) or [])
+        self.assertEqual(calls, [10.0, 15.1])
+
+    def test_a_launcher_line_that_carries_a_workers_argv_is_not_a_worker(self):
+        for line in ("ssh studio2 " + self.WORKER, "sh -c '" + self.WORKER + "'", "/usr/bin/env HOME=/x " + self.WORKER):
+            self.assertFalse(agent.tp_role([line])["worker"], line)
+
+    def test_a_box_never_follows_itself(self):
+        self.assertEqual(agent.tp_role([self.WORKER], "studio1"), {"worker": False, "follows": None})
+
+
 class AgentTp(unittest.TestCase):
     WORKER = ("/Users/s/opt/mlx-serve-main/zig-out/bin/mlx-serve-main worker --rank 1 --size 2 "
               "--coordinator 10.254.12.1:7000 --device rdma_en5 --model-dir /Users/s/models-big")
