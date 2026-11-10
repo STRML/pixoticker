@@ -73,21 +73,22 @@ class Rates:
     cumulative; prefill_tokens_live is progress inside one request and resets, so
     only its increases count. With nothing running the live rates are 0 at once.
     last: when a request finished in the interval, its average (tokens over the
-    phase's own seconds). The agent keeps reporting it until the next request
-    replaces it; the board shows it dim for LAST_S seconds after it changes.
+    phase's own seconds), and how long ago that was (*_last_age). The agent keeps
+    reporting both until the next request replaces them; the board shows an average
+    dim until its age passes LAST_S. The age is relative, so the agent's and the
+    board's clocks need not agree.
     """
 
     def __init__(self):
         self.prev = None
         self.window = []
-        self.last_dec = None
-        self.last_pre = None
+        self.last_dec = self.last_pre = None
+        self.dec_at = self.pre_at = None
 
     def update(self, m, now):
         if m is None:
             self.prev, self.window = None, []
-            return {"dec": None, "pre": None, "dec_last": self.last_dec, "pre_last": self.last_pre,
-                    "running": None, "serving": False}
+            return {"dec": None, "pre": None, **self._last(now), "running": None, "serving": False}
         g, c, h = m.get("gauges") or {}, m.get("counters") or {}, m.get("histograms") or {}
         cur = {"t": now, "start": g.get("process_start_time_seconds"),
                "gen": g.get("generation_tokens_live") or 0, "pl": g.get("prefill_tokens_live") or 0,
@@ -101,10 +102,20 @@ class Rates:
         running = (g.get("requests_running") or 0) + (g.get("requests_prefilling") or 0)
         self.window = [s for s in self.window + [cur] if now - s["t"] <= WINDOW_S] if running else []
         if prev:
-            self.last_dec = self._average(cur, prev, "gen_total", "dec_s") or self.last_dec
-            self.last_pre = self._average(cur, prev, "pre_total", "pre_s") or self.last_pre
-        return {"dec": self._rate("gen"), "pre": self._rate("pl"), "dec_last": self.last_dec,
-                "pre_last": self.last_pre, "running": g.get("requests_running"), "serving": True}
+            dec = self._average(cur, prev, "gen_total", "dec_s")
+            pre = self._average(cur, prev, "pre_total", "pre_s")
+            if dec:
+                self.last_dec, self.dec_at = dec, now
+            if pre:
+                self.last_pre, self.pre_at = pre, now
+        return {"dec": self._rate("gen"), "pre": self._rate("pl"), **self._last(now),
+                "running": g.get("requests_running"), "serving": True}
+
+    def _last(self, now):
+        def age(at):
+            return None if at is None else round(max(0.0, now - at), 1)
+        return {"dec_last": self.last_dec, "pre_last": self.last_pre,
+                "dec_last_age": age(self.dec_at), "pre_last_age": age(self.pre_at)}
 
     def _rate(self, key):
         w = self.window

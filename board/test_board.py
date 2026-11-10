@@ -42,7 +42,7 @@ def call(url, key=None, body=None, raw=None):
 
 def report(node, **kw):
     body = {"node": node, "gpu": 80, "mem_gb": 128, "mem_total_gb": 256, "dec": 50.0, "pre": 0.0,
-            "dec_last": 50.0, "pre_last": 2000.0}
+            "dec_last": 50.0, "pre_last": 2000.0, "dec_last_age": 0.0, "pre_last_age": 0.0}
     body.update(kw)
     return body
 
@@ -106,50 +106,46 @@ class BoardLogic(unittest.TestCase):
         n = self.board.nodes()[0]
         return n.dec_last, n.pre_last
 
-    def test_last_request_average_shows_for_last_s_after_it_arrives_then_dashes(self):
-        idle = dict(dec=0.0, pre=0.0, running=0)
-        self.board.ingest(report("studio1", running=1))
-        self.clock.t += 5
-        self.board.ingest(report("studio1", **idle))
+    def ingest_last(self, dec=None, pre=None, dec_age=None, pre_age=None, running=0, live_pre=0.0):
+        self.board.ingest(report("studio1", dec=0.0, pre=live_pre, running=running, dec_last=dec, pre_last=pre,
+                                 dec_last_age=dec_age, pre_last_age=pre_age))
+
+    def test_an_average_shows_until_its_age_passes_last_s_then_dashes(self):
+        self.ingest_last(50.0, 2000.0, 5.0, 5.0)
         self.assertEqual(self.last(), (50.0, 2000.0))
-        self.clock.t += boardmod.LAST_S
-        self.board.ingest(report("studio1", **idle))
+        self.ingest_last(50.0, 2000.0, boardmod.LAST_S + 1.0, boardmod.LAST_S + 1.0)
         self.assertEqual(self.last(), (None, None))
         self.assertEqual(layouts.shown(self.board.nodes()[0], "dec", layouts.DEC_C)[0], "--")
 
-    def test_a_request_shorter_than_a_sample_still_shows_its_average(self):
-        idle = dict(dec=0.0, pre=0.0, running=0, dec_last=None, pre_last=None)
-        self.board.ingest(report("studio1", **idle))
-        self.clock.t += 25
-        self.board.ingest(report("studio1", **dict(idle, dec_last=120.0, pre_last=5000.0)))
-        self.assertEqual(self.last(), (120.0, 5000.0))
-        self.clock.t += boardmod.LAST_S + 1
-        self.board.ingest(report("studio1", **dict(idle, dec_last=120.0, pre_last=5000.0)))
+    def test_time_since_the_report_counts_toward_the_age(self):
+        self.ingest_last(50.0, 2000.0, 25.0, 25.0)
+        self.clock.t += 4
+        self.assertEqual(self.last(), (50.0, 2000.0))
+        self.clock.t += 2
+        self.board.ingest(report("studio1", dec=0.0, pre=0.0, running=0, dec_last_age=31.0, pre_last_age=31.0))
         self.assertEqual(self.last(), (None, None))
 
-    def test_an_expired_average_does_not_come_back_when_the_next_request_starts(self):
-        self.board.ingest(report("studio1", dec=0.0, pre=0.0, running=0))
-        self.clock.t += boardmod.LAST_S + 1
-        self.board.ingest(report("studio1", dec=0.0, pre=0.0, running=0))
-        self.assertEqual(self.last(), (None, None))
-        self.clock.t += 60
-        self.board.ingest(report("studio1", dec=0.0, pre=2800.0, running=1))
+    def test_a_request_shorter_than_a_sample_shows_its_average(self):
+        self.ingest_last(120.0, 5000.0, 0.0, 0.0)
+        self.assertEqual(self.last(), (120.0, 5000.0))
+
+    def test_an_expired_average_stays_hidden_while_the_next_request_runs(self):
+        self.ingest_last(120.0, 5000.0, 100.0, 100.0, running=1, live_pre=2800.0)
         n = self.board.nodes()[0]
         self.assertEqual((n.state, n.dec_last, n.pre_last), (layouts.LIVE, None, None))
         self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C)[0], "--")
 
-    def test_each_average_expires_on_its_own_clock(self):
-        idle = dict(dec=0.0, pre=0.0, running=0)
-        self.board.ingest(report("studio1", **dict(idle, dec_last=120.0, pre_last=5000.0)))
-        self.clock.t += boardmod.LAST_S + 1
-        self.board.ingest(report("studio1", **dict(idle, dec_last=120.0, pre_last=6000.0)))
+    def test_each_average_expires_on_its_own_age(self):
+        self.ingest_last(120.0, 6000.0, boardmod.LAST_S + 1.0, 1.0)
         self.assertEqual(self.last(), (None, 6000.0))
 
-    def test_a_new_average_after_expiry_shows_again(self):
-        self.board.ingest(report("studio1", dec=0.0, pre=0.0, running=0))
-        self.clock.t += boardmod.LAST_S + 1
-        self.board.ingest(report("studio1", dec=0.0, pre=0.0, running=0, dec_last=88.0, pre_last=1500.0))
-        self.assertEqual(self.last(), (88.0, 1500.0))
+    def test_a_fresh_average_equal_to_the_expired_one_shows(self):
+        self.ingest_last(120.0, 6000.0, 0.0, 0.0)
+        self.assertEqual(self.last(), (120.0, 6000.0))
+
+    def test_an_average_with_no_age_is_not_shown(self):
+        self.ingest_last(120.0, 6000.0)
+        self.assertEqual(self.last(), (None, None))
 
     def test_history_only_grows_while_fresh(self):
         self.board.ingest(report("studio1"))
@@ -375,6 +371,7 @@ class AgentRates(unittest.TestCase):
                         (12.0, self.metrics(500, 0, 500, 0, 5.0, 0, running=0)))
         self.assertEqual((out["dec"], out["pre"]), (0.0, 0.0))
         self.assertEqual(out["dec_last"], 100.0)
+        self.assertEqual(out["dec_last_age"], 1.0)
 
     def test_a_restarted_server_resets_the_baseline(self):
         out = self.feed(agent.Rates(), (10.0, self.metrics(9000, 0, 9000, 0, 90, 0, start=1)),
@@ -387,6 +384,11 @@ class AgentRates(unittest.TestCase):
         self.feed(r, (10.0, self.metrics(0, 0, 0, 0, 0, 0)), (11.0, self.metrics(200, 0, 200, 0, 2.0, 0)))
         out = r.update(None, 12.0)
         self.assertEqual((out["dec"], out["pre"], out["serving"], out["dec_last"]), (None, None, False, 100.0))
+        self.assertEqual((out["dec_last_age"], out["pre_last_age"]), (1.0, None))
+
+    def test_an_average_never_measured_has_no_age(self):
+        out = agent.Rates().update(self.metrics(0, 0, 0, 0, 0, 0), 10.0)
+        self.assertEqual((out["dec_last"], out["dec_last_age"], out["pre_last_age"]), (None, None, None))
 
     def test_running_request_is_live_even_between_counter_lumps(self):
         board = boardmod.Board(["studio1"])
