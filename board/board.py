@@ -288,6 +288,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 NIGHT_FLOOR = 40    # the dimmest a pixel that carries content may be while dimmed; below it the LEDs read as off
+FLOOR_SLOPE = 0.5   # above the floor, brightness still climbs at this share of the dim level, so two colours never meet
 CONTENT_MIN = 50    # a pixel whose brightest channel is below this is structure (a bar track, a rule) and may fade out
 
 
@@ -328,7 +329,9 @@ class Dimmer:
 def dim_image(img, factor, floor=NIGHT_FLOOR):
     """Dim by the pixel's brightest channel, so its hue survives, and give content a floor. Scaling every
     channel by 0.25 takes a grey label from 95 to 24, which the LEDs barely show: a pixel at CONTENT_MIN or
-    above is never dimmed below `floor`, while the faint structure (tracks, rules) is free to fade."""
+    above is never dimmed below `floor`, while the faint structure (tracks, rules) is free to fade. The floor
+    is a ramp, not a clamp: a brighter source stays brighter, so a live colour and its dimmed idle variant differ
+    at any level. A pixel is never made brighter than it was."""
     if factor >= 1.0:
         return img
     out = img.copy()
@@ -341,8 +344,8 @@ def dim_image(img, factor, floor=NIGHT_FLOOR):
                 continue
             target = factor * top
             if top >= CONTENT_MIN:
-                target = max(target, floor)
-            k = target / top
+                target = max(target, floor + (top - CONTENT_MIN) * factor * FLOOR_SLOPE)
+            k = min(1.0, target / top)
             px[x, y] = (min(255, int(r * k + 0.5)), min(255, int(g * k + 0.5)), min(255, int(b * k + 0.5)))
     return out
 

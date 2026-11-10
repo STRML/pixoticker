@@ -464,7 +464,7 @@ class NightDim(unittest.TestCase):
         img = Image.new("RGB", (2, 1))
         img.putpixel((0, 0), (200, 100, 50))
         dimmed = boardmod.dim_image(img, 0.25)
-        self.assertEqual((dimmed.getpixel((0, 0)), dimmed.getpixel((1, 0))), ((50, 25, 13), (0, 0, 0)))
+        self.assertEqual((dimmed.getpixel((0, 0)), dimmed.getpixel((1, 0))), ((59, 29, 15), (0, 0, 0)))
         self.assertEqual(img.getpixel((0, 0)), (200, 100, 50))
 
     def test_full_brightness_sends_the_frame_untouched(self):

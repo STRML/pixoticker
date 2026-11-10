@@ -33,14 +33,14 @@ def dimmed(colour, factor=0.25, **kw):
 
 class Floor(unittest.TestCase):
     def test_a_grey_label_keeps_a_visible_level(self):
-        self.assertEqual(dimmed(layouts.DIM), (40, 40, 40))
+        self.assertEqual(dimmed(layouts.DIM), (46, 46, 46))
 
     def test_a_dim_colour_is_lifted_to_the_floor_and_keeps_its_hue(self):
-        self.assertEqual(dimmed((153, 114, 24)), (40, 30, 6))
+        self.assertEqual(dimmed((153, 114, 24)), (53, 39, 8))
 
-    def test_a_bright_colour_is_plainly_scaled(self):
-        self.assertEqual(dimmed((255, 190, 40)), (64, 48, 10))
-        self.assertEqual(dimmed((200, 100, 50)), (50, 25, 13))
+    def test_a_bright_colour_lands_near_the_dim_level(self):
+        self.assertEqual(dimmed((255, 190, 40)), (66, 49, 10))
+        self.assertEqual(dimmed((200, 100, 50)), (59, 29, 15))
 
     def test_structure_below_the_content_threshold_still_fades(self):
         self.assertEqual(dimmed((24, 24, 30)), (6, 6, 8))
@@ -64,6 +64,22 @@ class Floor(unittest.TestCase):
     def test_a_gentler_level_keeps_content_at_its_scaled_level_when_that_is_above_the_floor(self):
         self.assertEqual(dimmed((95, 95, 95), 0.6), (57, 57, 57))
 
+    def test_a_floor_above_the_pixel_never_brightens_it(self):
+        self.assertEqual(dimmed((60, 60, 60), floor=255), (60, 60, 60))
+        self.assertEqual(dimmed((200, 100, 50), floor=255), (200, 100, 50))
+
+    def test_a_brighter_source_stays_brighter_at_every_level(self):
+        for factor in (0.05, 0.1, 0.17, 0.25, 0.5, 0.9):
+            levels = [max(dimmed((v, v, v), factor)) for v in range(boardmod.CONTENT_MIN, 256, 5)]
+            self.assertTrue(all(a <= b for a, b in zip(levels, levels[1:])), (factor, levels))
+            self.assertGreater(levels[-1], levels[0], factor)
+
+    def test_a_live_colour_and_its_dimmed_idle_variant_stay_apart_at_a_low_level(self):
+        for factor in (0.1, 0.17, 0.25):
+            live, idle = dimmed(layouts.DEC_C, factor), dimmed(layouts.dim(layouts.DEC_C, 0.6), factor)
+            self.assertGreater(max(live), max(idle), factor)
+            self.assertGreater(max(dimmed(layouts.FG, factor)), max(dimmed(layouts.DIM, factor)), factor)
+
 
 class OnRealFrames(unittest.TestCase):
     """The property that matters, over what the panel is actually sent."""
@@ -86,15 +102,16 @@ class OnRealFrames(unittest.TestCase):
                     elif m >= boardmod.CONTENT_MIN:
                         self.assertGreaterEqual(max(b[x, y]), floor, (name, make.__name__, x, y, a[x, y]))
 
-    def test_no_pixel_gets_brighter_than_the_brighter_of_its_scaled_and_floor_levels(self):
+    def test_no_pixel_gets_brighter_than_the_brighter_of_its_scaled_and_ramp_levels_or_than_its_source(self):
         for name, make, img in self.frames():
             out = boardmod.dim_image(img, 0.25)
             a, b = img.load(), out.load()
             for x in range(layouts.W):
                 for y in range(layouts.H):
                     m = max(a[x, y])
-                    self.assertLessEqual(max(b[x, y]), max(round(m * 0.25), boardmod.NIGHT_FLOOR if m else 0) + 1,
-                                         (name, x, y))
+                    ramp = boardmod.NIGHT_FLOOR + (m - boardmod.CONTENT_MIN) * 0.25 * boardmod.FLOOR_SLOPE
+                    bound = max(m * 0.25, ramp) if m >= boardmod.CONTENT_MIN else m * 0.25
+                    self.assertLessEqual(max(b[x, y]), min(m, bound) + 1, (name, x, y))
 
     def test_the_hue_of_a_pixel_survives(self):
         for name, make, img in self.frames():
@@ -115,7 +132,7 @@ class OnRealFrames(unittest.TestCase):
         a, b = img.load(), out.load()
         labels = [(x, y) for x in range(layouts.W) for y in range(layouts.H) if a[x, y] == layouts.DIM]
         self.assertTrue(labels)
-        self.assertTrue(all(b[x, y] == (40, 40, 40) for x, y in labels))
+        self.assertTrue(all(b[x, y] == (46, 46, 46) for x, y in labels))
 
 
 class SpecFloor(unittest.TestCase):
