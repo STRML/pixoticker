@@ -349,7 +349,9 @@ class LiveNumbers(unittest.TestCase):
         node with the zero's text blanked, so the `P` label keeps its colour in both and cancels out."""
         import board as boardmod
         from unittest import mock
-        want = tuple(int(c * 0.6 * dim_by + 0.5) for c in layouts.PRE_C)
+        from PIL import Image
+        swatch = Image.new("RGB", (1, 1), layouts.dim(layouts.PRE_C, 0.6))
+        want = boardmod.dim_image(swatch, dim_by).getpixel((0, 0))
         real = layouts.shown
 
         def blanked(node, key, color):
@@ -497,6 +499,8 @@ class NightDim(unittest.TestCase):
                 self.sent.append(img.tobytes())
 
         class Half:
+            floor = 0
+
             def factor(self, now):
                 return 0.5
 

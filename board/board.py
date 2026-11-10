@@ -287,19 +287,27 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
 
+NIGHT_FLOOR = 40    # the dimmest a pixel that carries content may be while dimmed; below it the LEDs read as off
+CONTENT_MIN = 50    # a pixel whose brightest channel is below this is structure (a bar track, a rule) and may fade out
+
+
 class Dimmer:
     """Scales what goes to the panel by `level` from `start` until `end` (local time in `tz`, the end
-    itself not dimmed; a window may run past midnight). Spec: HH:MM-HH:MM@LEVEL, e.g. 20:00-07:30@0.25."""
+    itself not dimmed; a window may run past midnight), never below `floor` for anything that carries
+    content. Spec: HH:MM-HH:MM@LEVEL[:FLOOR], e.g. 20:00-07:30@0.25 or 20:00-07:30@0.25:40."""
 
-    SPEC = re.compile(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})@(\d(?:\.\d+)?)$")
+    SPEC = re.compile(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})@(\d(?:\.\d+)?)(?::(\d{1,3}))?$")
 
     def __init__(self, spec, tz):
         m = self.SPEC.match(spec or "")
         if not m:
-            raise ValueError(f"dim spec {spec!r} is not HH:MM-HH:MM@LEVEL, for example 20:00-07:30@0.25")
+            raise ValueError(f"dim spec {spec!r} is not HH:MM-HH:MM@LEVEL[:FLOOR], for example 20:00-07:30@0.25")
         h1, m1, h2, m2 = (int(g) for g in m.groups()[:4])
         if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59:
             raise ValueError(f"dim spec {spec!r} has a time that is not on the clock")
+        self.floor = NIGHT_FLOOR if m.group(6) is None else int(m.group(6))
+        if self.floor > 255:
+            raise ValueError(f"dim floor {self.floor} must be 0 to 255")
         self.start, self.end, self.level = h1 * 60 + m1, h2 * 60 + m2, float(m.group(5))
         if self.start == self.end:
             raise ValueError(f"dim spec {spec!r} starts and ends at the same minute")
@@ -317,8 +325,26 @@ class Dimmer:
         return self.level if inside else 1.0
 
 
-def dim_image(img, factor):
-    return img.point([int(i * factor + 0.5) for i in range(256)] * 3)
+def dim_image(img, factor, floor=NIGHT_FLOOR):
+    """Dim by the pixel's brightest channel, so its hue survives, and give content a floor. Scaling every
+    channel by 0.25 takes a grey label from 95 to 24, which the LEDs barely show: a pixel at CONTENT_MIN or
+    above is never dimmed below `floor`, while the faint structure (tracks, rules) is free to fade."""
+    if factor >= 1.0:
+        return img
+    out = img.copy()
+    px = out.load()
+    for y in range(out.height):
+        for x in range(out.width):
+            r, g, b = px[x, y]
+            top = max(r, g, b)
+            if not top:
+                continue
+            target = factor * top
+            if top >= CONTENT_MIN:
+                target = max(target, floor)
+            k = target / top
+            px[x, y] = (min(255, int(r * k + 0.5)), min(255, int(g * k + 0.5)), min(255, int(b * k + 0.5)))
+    return out
 
 
 def step(board, relay, dimmer=None, now=None):
@@ -326,7 +352,7 @@ def step(board, relay, dimmer=None, now=None):
     if relay:
         frame = board.frame()[1]
         if dimmer:
-            frame = dim_image(frame, dimmer.factor(time.time() if now is None else now))
+            frame = dim_image(frame, dimmer.factor(time.time() if now is None else now), dimmer.floor)
         relay.push(frame)
 
 
@@ -364,7 +390,8 @@ def main():
     ap.add_argument("--relay", default=os.environ.get("BOARD_RELAY_URL", ""), help="relay base URL; empty draws previews only")
     ap.add_argument("--relay-key-file", default=os.environ.get("BOARD_RELAY_KEY_FILE", "~/.pxt_relay_key"))
     ap.add_argument("--dim", default=os.environ.get("BOARD_DIM", ""),
-                    help="HH:MM-HH:MM@LEVEL: scale the panel's frames by LEVEL in that window, e.g. 20:00-07:30@0.25")
+                    help="HH:MM-HH:MM@LEVEL[:FLOOR]: scale the panel's frames by LEVEL in that window, content never "
+                         "below FLOOR (default 40), e.g. 20:00-07:30@0.25")
     ap.add_argument("--tz", default=os.environ.get("BOARD_TZ", "UTC"), help="time zone of --dim, e.g. America/New_York")
     args = ap.parse_args()
 
