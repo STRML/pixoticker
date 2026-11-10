@@ -79,8 +79,8 @@ class Node:
 
 
 def rate(v):
-    """At most five characters, so a focus number at scale 3 stays in its half of the panel: no real
-    server nears a million tok/s, and a corrupt report is capped at 999K."""
+    """At most four characters, so a focus number at scale 3 stays in its half of the panel and a quad figure never
+    reaches its neighbour: no real server nears a million tok/s, and a corrupt report is capped at 999K."""
     if v is None:
         return "--"
     v = min(v, 999_000)
@@ -88,7 +88,7 @@ def rate(v):
         return f"{v:.1f}"
     if v < 1000:
         return f"{v:.0f}"
-    if v < 10000:
+    if round(v / 1000, 1) < 10:
         return f"{v / 1000:.1f}K"
     return f"{v / 1000:.0f}K"
 

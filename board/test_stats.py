@@ -514,6 +514,14 @@ class Drawn(unittest.TestCase):
         base = layouts.render("quad", self.nodes()).load()
         self.assertTrue(all(base[x, y] == layouts.BG for x in range(2, 60) for y in range(22, 28)), "the row is for the stats only")
 
+    def test_quad_decode_mark_and_prefill_never_touch_even_at_the_widest_rates(self):
+        for dec in (118.4, 9949.0, 9999.0):
+            nodes = [layouts.Node("studio1", layouts.LIVE, gpu=50.0, mem=50.0, dec=dec, pre=9999.0)]
+            img = layouts.render("quad", nodes).load()
+            decode = {x for x in range(64) for y in range(9, 21) if img[x, y] in (layouts.DEC_C, layouts.dim(layouts.DEC_C, 0.6))}
+            prefill = {x for x in range(64) for y in range(9, 15) if img[x, y] == layouts.PRE_C}
+            self.assertLess(max(decode), min(prefill), dec)
+
     def test_quad_labels_prefill_beside_the_decode_figure_and_marks_decode_with_a_d(self):
         img = layouts.render("quad", self.nodes(dec=118.4)).load()
         pre = [x for x in range(64) for y in range(9, 15) if img[x, y] == layouts.PRE_C]
