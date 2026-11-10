@@ -78,6 +78,12 @@ Each agent reads the local `/metrics.json` once a second and posts one small JSO
 last request's average, dimmed, until it is 30 s old (`LAST_S`), then `--`. The agent reports each average with its age (`dec_last_age`, `pre_last_age`), so the clocks of the Studios and the board need not agree, and an average with no age is not shown (an agent older than this change shows `--` there until it is updated). A node that stops reporting for 10 s turns grey with `STALE`, so a dead
 agent never leaves old numbers on the panel. A node that never reported shows `--`.
 
+**GPU temperature.** The agent runs `~/.local/bin/latch sensors` (Latch is on every Studio; no sudo) every 10 s,
+about 0.4 s of one core each time, and reports the GPU's degrees C as `temp`; a failed read keeps the last figure for
+a minute, then reports nothing. A figure outside 10 to 130 is dropped. `rows`, `focus` and `quad` draw it as `46C`
+where they have room: white below 70, amber from 70, red from 85. `cols` and `spark` have none to spare. A node
+that is not reporting shows none. Without Latch the agent reports no temperature and nothing else changes.
+
 **Tensor parallel.** Only rank 0 runs an HTTP server, so only it has token counters; the other ranks run
 `mlx-serve worker ... --coordinator 10.254.<ab>.<n>:<port>` and would show idle while their GPUs work. An agent
 that finds such a process (and has no server of its own) reports `worker: true` and `follows: studio<n>` (the last octet of rank 0's cable

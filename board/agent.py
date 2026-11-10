@@ -21,6 +21,10 @@ import urllib.error
 import urllib.request
 
 LOOP_S = 1.0
+TEMP_POLL_S = 10.0       # temperatures move slowly; `latch sensors` costs about 0.4 s of one core
+TEMP_STALE_S = 60.0      # a figure older than this is not reported
+TEMP_TIMEOUT_S = 3.0
+LATCH = "~/.local/bin/latch"
 TP_POLL_S = 5.0   # how often to look for a tensor-parallel worker process
 NAMES = re.compile(r"^[a-z0-9._-]{1,16}$")
 
@@ -92,6 +96,43 @@ def gpu_percent():
         return None
     hit = re.search(r'"Device Utilization %"\s*=\s*(\d+)', out)
     return int(hit.group(1)) if hit else None
+
+
+GPU_TEMP = re.compile(r"GPU\s+(\d+(?:\.\d+)?)\s*\u00b0C")
+
+
+def parse_gpu_temp(text):
+    """The GPU's degrees C from `latch sensors` ("CPU 47.3\u00b0C \u00b7 GPU 45.9\u00b0C"), or None when the line is
+    missing or outside 10 to 130, which no working GPU reads."""
+    hit = GPU_TEMP.search(text or "")
+    value = float(hit.group(1)) if hit else None
+    return value if value is not None and 10.0 <= value <= 130.0 else None
+
+
+def read_gpu_temp(latch=LATCH):
+    """Run `latch sensors` (no sudo; Latch is installed on every Studio); None when it is missing, slow or fails."""
+    try:
+        out = subprocess.run([os.path.expanduser(latch), "sensors"], capture_output=True, text=True,
+                             timeout=TEMP_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_gpu_temp(out.stdout) if out.returncode == 0 else None
+
+
+class TempWatch:
+    """The GPU temperature, read at most every TEMP_POLL_S seconds. A failed read keeps the last figure
+    until it is TEMP_STALE_S old, so one slow `latch sensors` does not blank the panel."""
+
+    def __init__(self, reader=None):
+        self.reader, self.value, self.at, self.next = reader or read_gpu_temp, None, None, 0.0
+
+    def check(self, now):
+        if now >= self.next:
+            self.next = now + TEMP_POLL_S
+            value = self.reader()
+            if value is not None:
+                self.value, self.at = value, now
+        return self.value if self.at is not None and now - self.at <= TEMP_STALE_S else None
 
 
 def memory():
@@ -219,6 +260,7 @@ def main():
     key = read_key(args.key_file)
     rates = Rates()
     watch = TpWatch(args.name)
+    temps = TempWatch()
     failing = False
     while True:
         started = time.time()
@@ -227,6 +269,7 @@ def main():
             measured = rates.update(fetch_metrics(args.metrics), started)
             body = report(args.name, measured, used, total, gpu_percent())
             body.update(watch.check(started, measured["serving"]))
+            body["temp"] = temps.check(started)
             post(args.board, key, body)
             if failing:
                 print("board reachable again", flush=True)

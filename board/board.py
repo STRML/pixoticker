@@ -76,6 +76,9 @@ class Board:
                   "mem_total_gb": number(body.get("mem_total_gb")),
                   "running": number(body.get("running"))}
         report.update({k: number(body.get(k)) for k in RATE_FIELDS})
+        temp = body.get("temp")
+        report["temp"] = float(temp) if (isinstance(temp, (int, float)) and not isinstance(temp, bool)
+                                         and 0 < temp <= 130) else None   # NaN and inf fail the comparison
         follows = body.get("follows")
         report["worker"] = body.get("worker") is True
         report["follows"] = follows if follows in self.names else None
@@ -117,7 +120,7 @@ class Board:
             node.state = STALE
             return node
         r = self.reports[name]
-        node.gpu, node.dec, node.pre = r["gpu"], r["dec"], r["pre"]
+        node.gpu, node.dec, node.pre, node.temp = r["gpu"], r["dec"], r["pre"], r["temp"]
         node.dec_last, node.pre_last = r["dec_last"], r["pre_last"]
         if r["mem_gb"] is not None and r["mem_total_gb"]:
             node.mem = 100.0 * r["mem_gb"] / r["mem_total_gb"]

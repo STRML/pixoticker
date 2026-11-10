@@ -25,6 +25,8 @@ TRACK = (24, 24, 30)
 GPU_C = (0, 200, 255)
 MEM_C = (190, 100, 255)
 MEM_HOT = (255, 90, 70)
+TEMP_WARM = (255, 160, 0)
+TEMP_WARN_C, TEMP_HOT_C = 70.0, 85.0   # white below, amber from 70, red from 85
 DEC_C = (0, 225, 120)
 PRE_C = (255, 190, 40)
 BAD = (255, 80, 80)
@@ -50,6 +52,7 @@ class Node:
     age: int = 0
     hist: list = field(default_factory=list)   # [(dec, gpu, pre, share), ...] oldest first; share is its part of the cluster decode total
     tp: str | None = None   # a tensor-parallel worker: the node whose rates it shows
+    temp: float | None = None   # GPU degrees C, from the node's agent
 
     @property
     def tag(self):
@@ -140,6 +143,13 @@ class Canvas:
         self.rect(x, y + h - fill, w, fill, color)
 
 
+def temp_text(temp):
+    """("46C", colour) for a GPU temperature, or None when there is none."""
+    if temp is None:
+        return None
+    return f"{temp:.0f}C", MEM_HOT if temp >= TEMP_HOT_C else TEMP_WARM if temp >= TEMP_WARN_C else FG
+
+
 def mem_color(node):
     return MEM_HOT if (node.mem or 0) >= MEM_WARN else MEM_C
 
@@ -170,6 +180,8 @@ def rows(nodes):
         if n.fresh:
             c.text(14, y + 1, f"G{pct(n.gpu)}", gc)
             c.text(34, y + 1, f"M{pct(n.mem)}", mc)
+            if t := temp_text(n.temp):
+                c.text(54, y + 1, *t)
             dt, dc = shown(n, "dec", DEC_C)
             pt, pc = shown(n, "pre", PRE_C)
             c.text_right(94, y + 1, "D" + dt, dc)
@@ -223,6 +235,8 @@ def quad(nodes):
         dt, dc = shown(n, "dec", DEC_C)
         pt, pc = shown(n, "pre", PRE_C)
         c.big(x + 2, y + 9, dt, dc, scale=2)
+        if t := temp_text(n.temp):
+            c.text_right(x + 62, y + 9, *t)
         c.text(x + 2, y + 22, "TOK/S", DIM)
         c.text_right(x + 62, y + 15, "P", dim(PRE_C, 0.6))
         c.text_right(x + 62, y + 22, pt, pc)
@@ -323,7 +337,10 @@ def focus(nodes):
         pt, pc = shown(top, "pre", PRE_C)
         c.big(1, 10, dt, dc, scale=3)
         c.text(1, 30, "DECODE TOK/S", DIM)
-        c.text_right(126, 1, f"G{pct(top.gpu)} M{pct(top.mem)}", FG)
+        gm = f"G{pct(top.gpu)} M{pct(top.mem)}"
+        c.text_right(126, 1, gm, FG)
+        if t := temp_text(top.temp):
+            c.text_right(122 - font.width(gm), 1, *t)
         c.big(66, 10, pt, pc, scale=3)
         c.text(66, 30, "PREFILL TOK/S", DIM)
         c.hbar(1, 38, 126, 2, frac(top.gpu), gc)
