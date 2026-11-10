@@ -95,6 +95,20 @@ number of nodes sharing the job, because four Studios in tensor parallel decode 
 alone, and per metric. Until 60 such samples have been seen the bars use a default scale (150 tok/s decode,
 3000 tok/s prefill). `--state-file` (env `BOARD_STATE_FILE`) saves the peaks every minute, so a restart keeps them.
 
+**Machine stats.** The agent also reports the machine's GPU temperature, power and CPU load, and the layouts draw them
+where there is room:
+
+| Figure | Source (no sudo) | Shown |
+|---|---|---|
+| `temp`, GPU degrees C | `~/.local/bin/latch sensors` every 10 s (about 0.4 s of one core; a failed read keeps the last figure for a minute) | `rows` in the gap after memory, `quad` top right, `focus` right of the bars. White below 70, amber from 70, red from 85 |
+| `watts`, whole machine | the SMC key `PD0R` through IOKit and `ctypes`, every second (`PSTR` reads 0 on a Studio) | `rows` right of the bars, `spark` in the column after the history, `quad` bottom left, `focus` right of the bars. Capped at `999W` for width |
+| `cpu`, busy percent | the kernel's `host_statistics` tick counters between two reads | with the watts, as `9%` |
+
+To make room the `rows` and `focus` GPU and memory bars are shorter, the `spark` history is 36 samples (it was 62),
+and `quad` no longer prints `TOK/S` (the figure is already coloured). `cols` has no room. A figure outside its
+range (temperature 10 to 130, watts above 1000, CPU outside 0 to 100) is dropped, a node that is not reporting shows
+none, and without Latch or readable SMC the agent just reports less.
+
 **Tensor parallel.** Only rank 0 runs an HTTP server, so only it has token counters; the other ranks run
 `mlx-serve worker ... --coordinator 10.254.<ab>.<n>:<port>` and would show idle while their GPUs work. An agent
 that finds such a process (and has no server of its own) reports `worker: true` and `follows: studio<n>` (the last octet of rank 0's cable

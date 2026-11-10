@@ -132,8 +132,8 @@ class OnRealFrames(unittest.TestCase):
                     for s, d in zip(src, dst):
                         self.assertLessEqual(abs(d - s * k), 1.0, (name, x, y, src, dst))
 
-    def test_the_grey_labels_of_the_quad_layout_are_still_drawn(self):
-        img = layouts.render("quad", preview.busy())
+    def test_the_grey_labels_of_the_focus_layout_are_still_drawn(self):
+        img = layouts.render("focus", preview.busy())
         out = boardmod.dim_image(img, 0.25)
         a, b = img.load(), out.load()
         labels = [(x, y) for x in range(layouts.W) for y in range(layouts.H) if a[x, y] == layouts.DIM]
