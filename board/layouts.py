@@ -338,8 +338,7 @@ def summary_parts(nodes):
 
 def draw_summary(c, nodes):
     """The top bar of focus, spark, cols and quad: the whole cluster at a glance, no label needed. It starts at x 1 and
-    ends at right edge 126, with an even gap between figures. That matches the node tags and rates below it in spark
-    and focus; cols and quad inset their content a few pixels."""
+    ends at right edge 126 (the edges of spark's tags and rates), with an even gap between figures."""
     *left, prefill = summary_parts(nodes)
     for x, part in zip(SUMMARY_X, left):
         if part:
