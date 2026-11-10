@@ -478,32 +478,24 @@ class Drawn(unittest.TestCase):
         b = layouts.render(name, self.nodes(state, dec)).load()
         return [(x, y) for x in range(layouts.W) for y in range(layouts.H) if a[x, y] != b[x, y]]
 
-    def test_rows_draw_temperature_in_the_gap_between_memory_and_decode(self):
-        diff = self.changed("rows", temp=100.0)
-        self.assertTrue(diff)
-        self.assertTrue(all(52 <= x <= 73 and y % 16 in range(1, 7) for x, y in diff), diff[:6])
-
-    def test_rows_draw_watts_and_cpu_right_aligned_beside_the_bars(self):
-        diff = self.changed("rows", watts=9999.0, cpu=100.0)
+    def test_rows_draw_temperature_and_watts_right_aligned_beside_the_bars(self):
+        diff = self.changed("rows", temp=100.0, watts=9999.0)
         self.assertTrue(diff)
         self.assertTrue(all(x >= 90 and y % 16 in range(9, 15) for x, y in diff), diff[:6])
 
-    def test_rows_stat_columns_hold_still_whatever_the_digit_counts(self):
-        def columns(watts, cpu):
-            img = layouts.render("rows", self.nodes(watts=watts, cpu=cpu))
-            return {colour: [x for x in range(layouts.W) for y in range(9, 15) if img.getpixel((x, y)) == colour]
-                    for colour in (layouts.WATT_C, layouts.CPU_C)}
-        base = columns(182.0, 100.0)
-        for watts, cpu in ((7.0, 9.0), (99.0, 9.0), (7.0, 42.0), (999.0, 100.0)):
-            shown = columns(watts, cpu)
-            self.assertEqual(max(shown[layouts.CPU_C]), max(base[layouts.CPU_C]), (watts, cpu))
-            self.assertEqual(max(shown[layouts.WATT_C]), max(base[layouts.WATT_C]), (watts, cpu))
+    def test_rows_draw_cpu_between_gpu_and_memory_in_the_number_row(self):
+        diff = self.changed("rows", cpu=100.0)
+        self.assertTrue(diff)
+        self.assertTrue(all(30 <= x <= 50 and y % 16 in range(1, 7) for x, y in diff), diff[:6])
 
-    def test_rows_temperature_keeps_its_right_edge_whatever_the_digit_count(self):
-        def right_edge(temp):
-            img = layouts.render("rows", self.nodes(temp=temp))
-            return max(x for x in range(50, 76) for y in range(1, 7) if img.getpixel((x, y)) == layouts.MEM_HOT)
-        self.assertEqual(right_edge(90.0), right_edge(100.0))
+    def test_rows_stat_columns_hold_still_whatever_the_digit_counts(self):
+        def right_edges(temp, watts, cpu):
+            img = layouts.render("rows", self.nodes(temp=temp, watts=watts, cpu=cpu))
+            edge = lambda colour, rows: max(x for x in range(layouts.W) for y in rows if img.getpixel((x, y)) == colour)
+            return (edge(layouts.MEM_HOT, range(9, 15)), edge(layouts.WATT_C, range(9, 15)), edge(layouts.CPU_C, range(1, 7)))
+        base = right_edges(90.0, 182.0, 100.0)
+        for temp, watts, cpu in ((85.0, 7.0, 9.0), (99.0, 99.0, 9.0), (100.0, 7.0, 42.0), (88.0, 999.0, 100.0)):
+            self.assertEqual(right_edges(temp, watts, cpu), base, (temp, watts, cpu))
 
     def test_rows_bars_stop_short_of_the_stats(self):
         img = layouts.render("rows", self.nodes()).load()
@@ -520,28 +512,42 @@ class Drawn(unittest.TestCase):
         ys = {(y - 8) % 14 for _, y in diff}
         self.assertTrue(any(v <= 6 for v in ys) and any(v >= 7 for v in ys))
 
-    def test_quad_draws_temperature_watts_and_cpu_in_one_row_under_the_figures(self):
-        diff = self.changed("quad", **self.WIDEST)
-        self.assertTrue(diff)
-        self.assertTrue(all(2 <= x % 64 <= 60 and y % 32 in range(22, 28) for x, y in diff), diff[:6])
-        self.assertEqual({(x // 64, y // 32) for x, y in diff}, {(0, 0), (1, 0), (0, 1), (1, 1)})
-        base = layouts.render("quad", self.nodes()).load()
-        self.assertTrue(all(base[x, y] == layouts.BG for x in range(2, 62) for y in range(22, 28)), "the row is for the stats only")
+    def test_quad_draws_temperature_and_watts_beside_the_tag_and_cpu_in_the_row_above_the_bars(self):
+        hardware = self.changed("quad", temp=100.0, watts=9999.0)
+        self.assertTrue(hardware)
+        self.assertTrue(all(12 <= x % 64 < 52 and y % 32 in range(1, 7) for x, y in hardware), hardware[:6])
+        self.assertEqual({(x // 64, y // 32) for x, y in hardware}, {(0, 0), (1, 0), (0, 1), (1, 1)})
+        cpu = self.changed("quad", cpu=100.0)
+        self.assertTrue(all(22 <= x % 64 <= 40 and y % 32 in range(22, 28) for x, y in cpu), cpu[:6])
+        self.assertEqual({(x // 64, y // 32) for x, y in cpu}, {(0, 0), (1, 0), (0, 1), (1, 1)})
+
+    def test_gpu_and_cpu_percentages_sit_side_by_side_with_memory_after_them(self):
+        bands = {"rows": (1, 7, 0, 128), "quad": (22, 28, 0, 62), "focus": (39, 45, 68, 128)}
+        for name, (y0, y1, x0, x1) in bands.items():
+            img = layouts.render(name, self.nodes(cpu=12.0))
+            ink = lambda colour: [x for x in range(x0, x1) for y in range(y0, y1) if img.getpixel((x, y)) == colour]
+            gpu, cpu, mem = ink(layouts.GPU_C), ink(layouts.CPU_C), ink(layouts.MEM_C)
+            self.assertTrue(gpu and cpu and mem, name)
+            self.assertLess(max(gpu), min(cpu), name)
+            self.assertLess(max(cpu), min(mem), name)
+            self.assertLessEqual(min(cpu) - max(gpu), 6, name)
 
     def test_gpu_and_memory_labels_are_drawn_whole_at_every_width_in_every_layout(self):
         """The label's own pixels, and nothing else, fill its box: a bar, a rate or a neighbour reaching into it fails."""
-        places = {"rows": ((14, 1), (35, 1)), "cols": ((3, 37), (3, 44)), "quad": ((16, 1), (38, 1)),
-                  "spark": ((14, 9), (14, 15)), "focus": ((14, 1), (35, 1))}
+        places = {"rows": (("r", 30, 1), ("r", 70, 1)), "cols": (("l", 3, 37), ("l", 3, 44)),
+                  "quad": (("r", 22, 22), ("r", 62, 22)), "spark": (("l", 14, 9), ("l", 14, 15)),
+                  "focus": (("r", 86, 39), ("r", 126, 39))}
         for gpu, mem, text in ((88.0, 71.0, ("G88%", "M71%")), (5.0, 5.0, ("G05%", "M05%")), (100.0, 100.0, ("G100%", "M100%"))):
             nodes = [layouts.Node("studio1", layouts.LIVE, gpu=gpu, mem=mem, dec=118.4, pre=2400.0, **self.WIDEST)]
             nodes += [layouts.Node(f"studio{i}", layouts.LIVE, gpu=gpu, mem=mem, dec=90.0, pre=0.0, **self.WIDEST) for i in (2, 3, 4)]
             gc, mc = layouts.bar_colors(nodes[0])
             for name, spots in places.items():
                 img = layouts.render(name, nodes)
-                for (x, y), label, colour in zip(spots, text, (gc, mc)):
+                for (edge, x, y), label, colour in zip(spots, text, (gc, mc)):
+                    left = x if edge == "l" else x - layouts.font.width(label)
                     alone = layouts.Canvas()
-                    alone.text(x, y, label, colour)
-                    box = [(px, py) for px in range(x, x + layouts.font.width(label) - 1) for py in range(y, y + 6)]
+                    alone.text(left, y, label, colour)
+                    box = [(px, py) for px in range(left, left + layouts.font.width(label) - 1) for py in range(y, y + 6)]
                     self.assertEqual([img.getpixel(p) for p in box], [alone.img.getpixel(p) for p in box], (name, label))
 
     def test_quad_decode_mark_and_prefill_never_touch_even_at_the_widest_rates(self):
@@ -559,21 +565,22 @@ class Drawn(unittest.TestCase):
         d = [x for x in range(64) for y in range(9, 15) if img[x, y] == layouts.dim(layouts.DEC_C, 0.6)]
         self.assertTrue(d and min(d) >= 2 + 3 * 8 + 2 and max(d) < 42, d)
 
-    def test_focus_header_puts_the_nodes_gpu_and_memory_beside_its_tag_and_the_totals_on_the_right(self):
-        img = layouts.render("focus", self.nodes()).load()
-        gpu = [x for x in range(layouts.W) for y in range(1, 7) if img[x, y] == layouts.GPU_C]
-        mem = [x for x in range(layouts.W) for y in range(1, 7) if img[x, y] == layouts.MEM_C]
-        self.assertTrue(gpu and mem and max(gpu) < 30 and max(mem) < 52, (gpu, mem))
+    def test_focus_header_puts_the_nodes_temperature_and_watts_beside_its_tag_and_the_totals_on_the_right(self):
+        diff = self.changed("focus", temp=100.0, watts=9999.0)
+        self.assertTrue(diff)
+        self.assertTrue(all(12 <= x < 52 and 1 <= y < 7 for x, y in diff), diff[:6])
+        img = layouts.render("focus", self.nodes(temp=100.0, watts=9999.0)).load()
         right = [x for x in range(52, layouts.W) for y in range(1, 7) if img[x, y] != layouts.BG]
         self.assertTrue(right and max(right) == 124, max(right))
 
-    def test_focus_draws_all_three_right_of_shorter_gpu_and_memory_bars_not_in_the_header(self):
-        diff = self.changed("focus", **self.WIDEST)
+    def test_focus_draws_gpu_cpu_and_memory_right_of_the_shorter_bars_not_in_the_header(self):
+        diff = self.changed("focus", cpu=100.0)
         self.assertTrue(diff)
         self.assertTrue(all(x >= 68 and 39 <= y <= 44 for x, y in diff), diff[:6])
         img = layouts.render("focus", self.nodes()).load()
-        bars = [(x, y) for x in range(layouts.W) for y in (40, 41, 43, 44) if img[x, y] in (layouts.GPU_C, layouts.MEM_C)]
-        self.assertLess(max(x for x, _ in bars), 68)
+        track_end = next(x for x in range(1, layouts.W) if img[x, 41] == layouts.BG)
+        self.assertEqual(track_end - 1, layouts.FOCUS_BAR_W)
+        self.assertLess(track_end, 66)
 
     def test_each_stat_alone_is_drawn_where_it_has_room(self):
         for name in ("rows", "focus", "quad", "spark"):
