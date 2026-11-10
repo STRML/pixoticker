@@ -693,14 +693,29 @@ class PeakLearning(unittest.TestCase):
             self.clock.t += 1.0
         self.assertPeak("a/1", "dec", 150.0, 90.0)
 
-    def test_one_skipped_tick_breaks_the_hold(self):
+    def test_a_long_pause_breaks_the_hold(self):
         self.feed("a/1", "dec", [50.0] * 70)
-        self.p.observe("a/1", "dec", 400.0)
-        self.clock.t += 1
-        self.p.observe("a/1", "dec", 400.0)
-        self.clock.t += 2           # a tick was skipped
+        for _ in range(2):
+            self.p.observe("a/1", "dec", 400.0)
+            self.clock.t += 1
+        self.clock.t += 2 * peaks.GAP_S
         self.p.observe("a/1", "dec", 400.0)
         self.assertPeak("a/1", "dec", 150.0, 50.0)
+
+    def test_slow_ticks_still_hold(self):
+        self.feed("a/1", "dec", [50.0] * 70)
+        for _ in range(3):
+            self.p.observe("a/1", "dec", 90.0)
+            self.clock.t += 1.6          # a relay push that took 0.6 s
+        self.assertPeak("a/1", "dec", 150.0, 90.0)
+
+    def test_breaking_the_runs_of_a_node_clears_every_group_size_and_metric(self):
+        for key in ("a/1", "a/4", "b/1"):
+            for metric in ("dec", "pre"):
+                self.p.observe(key, metric, 400.0)
+                self.p.observe(key, metric, 400.0)
+        self.p.break_runs("a/")
+        self.assertEqual(sorted(self.p.recent), [("b/1", "dec"), ("b/1", "pre")])
 
     def test_the_peak_halves_every_half_life(self):
         self.feed("a/1", "dec", [100.0] * 70)
@@ -820,6 +835,26 @@ class BoardPeaks(unittest.TestCase):
             self.board.tick()
             self.clock.t += 1
         self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
+
+    def test_a_delayed_observe_does_not_join_the_runs_either_side_of_an_idle_tick(self):
+        self.run_job(50.0, peaks.LEARN_N + 10)
+        live = dict(pre=0.0, running=1, dec_last=None, pre_last=None, dec_last_age=None, pre_last_age=None)
+        idle = dict(live, running=0)
+        for dt, dec, body in ((0.0, 400.0, live), (0.8, 400.0, live), (0.2, 0.0, idle), (1.0, 400.0, live)):
+            self.clock.t += dt
+            self.board.ingest(report("studio1", dec=dec, **body))
+            self.board.tick()
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
+
+    def test_a_slow_relay_push_between_ticks_does_not_stop_a_peak_being_learned(self):
+        for _ in range(peaks.LEARN_N + 10):
+            self.board.ingest(report("studio1", dec=60.0, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            self.board.tick()
+            self.clock.t += 1.7
+            self.board.ingest(report("studio1", dec=60.0, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 60.0, delta=0.5)
 
     def test_a_node_that_turns_into_a_worker_for_a_tick_does_not_join_its_runs(self):
         self.run_job(50.0, peaks.LEARN_N + 10)

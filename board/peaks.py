@@ -18,7 +18,7 @@ from collections import deque
 
 HALF_LIFE_S = 3 * 86400
 HOLD = 3
-GAP_S = 1.5      # ticks are at least a second apart, so a skipped tick (idle, stale, a worker) leaves a gap of 2 s or more
+GAP_S = 30.0     # a backstop for a paused process; the board ends a node's runs explicitly on every tick it is not live
 LEARN_N = 60
 SAVE_EVERY_S = 60
 
@@ -58,6 +58,13 @@ class Peaks:
         entry = self.peak.get(slot)
         self.peak[slot] = [held, now, 1] if entry is None else [max(self._decayed(entry, now), held), now, entry[2] + 1]
         self.dirty = True
+
+    def break_runs(self, prefix):
+        """A node stopped serving (idle, stale, a worker): the runs of every key that starts with `prefix`
+        end here, so what comes after is not held together with what came before. A wall-clock gap cannot do
+        this: one loose enough for a slow relay push is too loose for a skipped tick."""
+        for slot in [s for s in self.recent if s[0].startswith(prefix)]:
+            del self.recent[slot]
 
     def get(self, key, metric, seed):
         """The learned peak, or `seed` until enough has been watched."""

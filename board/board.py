@@ -156,6 +156,8 @@ class Board:
                 key = self.peak_key(n, views)
                 self.peaks.observe(key, "dec", n.dec)
                 self.peaks.observe(key, "pre", n.pre)
+            else:
+                self.peaks.break_runs(f"{n.name}/")   # idle, stale, absent or a worker: no run goes through this tick
 
     def layout(self, now=None):
         if self.pinned != "auto":
