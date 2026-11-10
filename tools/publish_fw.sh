@@ -32,8 +32,8 @@ grep -a -q -F -- "$KEYVAL" "$BIN" || { echo "refusing: relay key is not embedded
 SIZE=$(wc -c < "$BIN" | tr -d " ")
 SHA=$(shasum -a 256 "$BIN" | awk '{print $1}')
 
-ssh "$SSH_HOST" "mkdir -p \"\$(dirname \"$FW_REMOTE\")\""
-scp -q "$BIN" "$SSH_HOST:$FW_REMOTE"
+# One ssh with the image on stdin: a Synology has no sftp, so scp fails there.
+ssh "$SSH_HOST" "mkdir -p \"\$(dirname \"$FW_REMOTE\")\" && cat > \"$FW_REMOTE\"" < "$BIN"
 
 served=$(curl -sSf -m 30 -D - -o /dev/null -H "X-Api-Key: ${KEYVAL}" \
   "$URL/fw" | tr -d '\r' | awk 'tolower($1)=="x-firmware-sha256:"{print $2}')
