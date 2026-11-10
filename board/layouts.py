@@ -40,7 +40,7 @@ ROWS_BAR_W = 88     # rows: GPU and memory bars, leaving the right edge for watt
 FOCUS_BAR_W = 66    # focus: the same, leaving room for temperature, watts and CPU
 HIST = 36           # samples a sparkline shows
 MEM_WARN = 85.0
-BAR_X, BAR_W = 32, 10   # spark: the GPU and memory bars beside their numbers
+BAR_X, BAR_W = 34, 8    # spark: the GPU and memory bars beside their numbers, clear of G100%
 
 LIVE, IDLE, STALE, ABSENT = "live", "idle", "stale", "absent"
 
@@ -94,7 +94,7 @@ def rate(v):
 
 
 def pct(v):
-    return "--" if v is None else f"{v:.0f}"
+    return "--" if v is None else f"{v:02.0f}%"
 
 
 def dim(color, k=0.35):
@@ -156,27 +156,26 @@ class Canvas:
 
 
 def temp_text(temp):
-    """("T46", colour) for a GPU temperature, or None when there is none."""
+    """("46C", colour) for a GPU temperature, or None when there is none."""
     if temp is None:
         return None
-    return f"T{temp:.0f}", MEM_HOT if temp >= TEMP_HOT_C else TEMP_WARM if temp >= TEMP_WARN_C else FG
+    return f"{temp:.0f}C", MEM_HOT if temp >= TEMP_HOT_C else TEMP_WARM if temp >= TEMP_WARN_C else FG
 
 
 def watts_text(watts):
-    """("W182", colour), capped at W999 so it is never wider than four characters; None without a reading."""
-    return None if watts is None else (f"W{min(watts, 999):.0f}", WATT_C)
+    """("182W", colour), capped at 999W so it is never wider than four characters; None without a reading."""
+    return None if watts is None else (f"{min(watts, 999):.0f}W", WATT_C)
 
 
 def cpu_text(cpu):
-    return None if cpu is None else (f"C{cpu:.0f}", CPU_C)
+    return None if cpu is None else ("C" + pct(cpu), CPU_C)
 
 
-STAT_W = 4 * font.ADVANCE   # the widest figure: T130, W999, C100
-STAT_GAP = 4
+STAT_W = 5 * font.ADVANCE   # the widest figure, C100%; every other is four characters, so its slot keeps a blank cell to the left
 
 
 def stats_width(parts):
-    return len(parts) * STAT_W + STAT_GAP * max(0, len(parts) - 1)
+    return len(parts) * STAT_W
 
 
 def draw_stats(c, x, y, parts):
@@ -185,7 +184,7 @@ def draw_stats(c, x, y, parts):
     for part in parts:
         if part:
             c.text_right(x + STAT_W, y, *part)
-        x += STAT_W + STAT_GAP
+        x += STAT_W
     return x
 
 
@@ -218,9 +217,8 @@ def rows(nodes):
         c.text(1, y + 1, n.tag, FG if n.fresh else DIM)
         if n.fresh:
             c.text(14, y + 1, f"G{pct(n.gpu)}", gc)
-            c.text(34, y + 1, f"M{pct(n.mem)}", mc)
-            if t := temp_text(n.temp):
-                c.text_right(54 + STAT_W, y + 1, *t)
+            c.text(35, y + 1, f"M{pct(n.mem)}", mc)
+            draw_stats(c, 50, y + 1, [temp_text(n.temp)])
             dt, dc = shown(n, "dec", DEC_C)
             pt, pc = shown(n, "pre", PRE_C)
             c.text_right(94, y + 1, "D" + dt, dc)
@@ -383,7 +381,7 @@ def focus(nodes):
         c.big(1, 10, dt, dc, scale=3)
         c.text(1, 30, "DECODE TOK/S", DIM)
         c.text(14, 1, f"G{pct(top.gpu)}", gc)
-        c.text(34, 1, f"M{pct(top.mem)}", mc)
+        c.text(35, 1, f"M{pct(top.mem)}", mc)
         c.big(66, 10, pt, pc, scale=3)
         c.text(66, 30, "PREFILL TOK/S", DIM)
         live_dec, live_pre = top.dec or 0, top.pre or 0
