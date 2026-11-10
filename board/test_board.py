@@ -410,14 +410,14 @@ class LiveNumbers(unittest.TestCase):
         pre = self.box(img, layouts.PRE_C, 64, 128, 8, 29)
         self.assertEqual((dec[2], dec[3]), (pre[2], pre[3]))
 
-    def test_a_rate_never_prints_more_than_five_characters(self):
-        for v in (0, 0.04, 9.95, 999.5, 9999.5, 9999.99, 99999.5, 999_000, 9_999_500, 1e6, 1e9):
-            self.assertLessEqual(len(layouts.rate(float(v))), 5, v)
+    def test_a_rate_never_prints_more_than_four_characters(self):
+        for v in (0, 0.04, 9.95, 999.5, 9949.9, 9950.0, 9999.5, 9999.99, 99999.5, 999_000, 9_999_500, 1e6, 1e9):
+            self.assertLessEqual(len(layouts.rate(float(v))), 4, v)
         self.assertEqual(layouts.rate(1e9), "999K")
 
     def test_the_widest_focus_numbers_stay_in_their_own_half(self):
         nodes = [self.node(layouts.LIVE, dec=9999.0, pre=9999.0)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
-        self.assertEqual(layouts.rate(9999.0), "10.0K")
+        self.assertEqual(layouts.rate(9999.0), "10K")
         img = layouts.render("focus", nodes)
         dec = self.box(img, layouts.DEC_C, 0, 128, 8, 29)
         pre = self.box(img, layouts.PRE_C, 0, 128, 8, 29)
