@@ -344,19 +344,27 @@ class LiveNumbers(unittest.TestCase):
         self.assertEqual(layouts.total_text(0.0, layouts.PRE_C), ("P0", layouts.dim(layouts.PRE_C, 0.6)))
         self.assertEqual(layouts.total_text(0.0, layouts.DEC_C), ("D0", layouts.dim(layouts.DEC_C, 0.6)))
 
+    def zero_pixels(self, name, dim_by=1.0):
+        """Pixels of the zero's colour that a rendered zero adds over a rendered dash. The `P` label can be
+        that colour too, so only the difference between the two renders is the zero itself."""
+        import board as boardmod
+        want = tuple(int(c * 0.6 * dim_by + 0.5) for c in layouts.PRE_C)
+        counts = []
+        for pre in (0.0, None):
+            nodes = [self.node(layouts.LIVE, dec=44.4, pre=pre)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
+            img = boardmod.dim_image(layouts.render(name, nodes), dim_by)
+            counts.append(sum(n for n, c in img.getcolors() if c == want))
+        return counts[0] - counts[1], want
+
     def test_every_layout_draws_a_zero_prefill_in_a_colour_the_panel_can_show(self):
-        want = layouts.dim(layouts.PRE_C, 0.6)
         for name in layouts.LAYOUTS:
-            nodes = [self.node(layouts.LIVE, dec=44.4, pre=0.0)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
-            img = layouts.render(name, nodes)
-            self.assertIn(want, [c for _, c in img.getcolors()], name)
+            added, _ = self.zero_pixels(name)
+            self.assertGreater(added, 0, name)
 
     def test_a_zero_survives_the_night_dimming_as_something_the_panel_can_show(self):
-        import board as boardmod
-        nodes = [self.node(layouts.LIVE, dec=44.4, pre=0.0)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
-        dimmed = boardmod.dim_image(layouts.render("rows", nodes), 0.25)
-        want = tuple(int(c * 0.6 * 0.25 + 0.5) for c in layouts.PRE_C)
-        self.assertIn(want, [c for _, c in dimmed.getcolors()])
+        for name in layouts.LAYOUTS:
+            added, want = self.zero_pixels(name, 0.25)
+            self.assertGreater(added, 0, name)
         self.assertGreaterEqual(max(want), 30)
 
     def test_a_busy_node_with_no_live_figure_shows_dashes(self):
