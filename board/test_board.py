@@ -345,14 +345,22 @@ class LiveNumbers(unittest.TestCase):
         self.assertEqual(layouts.total_text(0.0, layouts.DEC_C), ("D0", layouts.dim(layouts.DEC_C, 0.6)))
 
     def zero_pixels(self, name, dim_by=1.0):
-        """Pixels of the zero's colour that a rendered zero adds over a rendered dash. The `P` label can be
-        that colour too, so only the difference between the two renders is the zero itself."""
+        """Pixels of the zero's colour that the rendered zero glyph adds. The baseline render is the same
+        node with the zero's text blanked, so the `P` label keeps its colour in both and cancels out."""
         import board as boardmod
+        from unittest import mock
         want = tuple(int(c * 0.6 * dim_by + 0.5) for c in layouts.PRE_C)
+        real = layouts.shown
+
+        def blanked(node, key, color):
+            text, col = real(node, key, color)
+            return ("" if key == "pre" and text == "0" else text), col
+
         counts = []
-        for pre in (0.0, None):
-            nodes = [self.node(layouts.LIVE, dec=44.4, pre=pre)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
-            img = boardmod.dim_image(layouts.render(name, nodes), dim_by)
+        for patch in (None, blanked):
+            nodes = [self.node(layouts.LIVE, dec=44.4, pre=0.0)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
+            with mock.patch.object(layouts, "shown", patch or real):
+                img = boardmod.dim_image(layouts.render(name, nodes), dim_by)
             counts.append(sum(n for n, c in img.getcolors() if c == want))
         return counts[0] - counts[1], want
 
