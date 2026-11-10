@@ -418,27 +418,31 @@ class TextAndGeometry(unittest.TestCase):
         px = canvas.img.load()
         return sorted({x for x in range(layouts.W) for y in range(layouts.H) if px[x, y] == colour})
 
-    def test_stats_are_drawn_a_space_apart_and_the_width_helper_agrees(self):
+    def test_stats_sit_in_fixed_slots_a_space_apart_and_the_width_helper_agrees(self):
         parts = [layouts.watts_text(182.0), layouts.cpu_text(9.0)]
-        self.assertEqual(layouts.stats_width(parts), 4 * 4 + 4 + 2 * 4)
-        alone = layouts.Canvas()
-        layouts.draw_stats(alone, 0, 0, [parts[1]])
-        offset = self.lit_columns(alone, layouts.CPU_C)[0]
+        self.assertEqual(layouts.stats_width(parts), 4 * 4 + 4 + 4 * 4)
         c = layouts.Canvas()
         end = layouts.draw_stats(c, 10, 0, parts)
-        self.assertEqual(self.lit_columns(c, layouts.CPU_C)[0], 10 + 4 * 4 + 4 + offset)
         self.assertEqual(end, 10 + layouts.stats_width(parts) + 4)
+        self.assertEqual(max(self.lit_columns(c, layouts.CPU_C)), 10 + 16 + 4 + 16 - 1 - 1)
 
-    def test_absent_stats_are_skipped_without_a_gap(self):
-        c = layouts.Canvas()
-        layouts.draw_stats(c, 10, 0, [None, layouts.cpu_text(9.0), None])
-        self.assertEqual(layouts.stats_width([None, layouts.cpu_text(9.0), None]), 2 * 4)
-        self.assertEqual(self.lit_columns(c, layouts.CPU_C)[0] - 10, self.lit_columns_offset())
+    def test_a_figure_gaining_a_digit_does_not_move_its_neighbours(self):
+        def drawn(watts, cpu):
+            c = layouts.Canvas()
+            layouts.draw_stats(c, 10, 0, [layouts.watts_text(watts), layouts.cpu_text(cpu)])
+            return self.lit_columns(c, layouts.WATT_C), self.lit_columns(c, layouts.CPU_C)
+        self.assertEqual(max(drawn(7, 9)[0]), max(drawn(182, 100)[0]))
+        self.assertEqual(max(drawn(7, 9)[1]), max(drawn(182, 100)[1]))
+        self.assertEqual(drawn(7, 9)[1], drawn(182, 9)[1])
+        self.assertEqual(drawn(7, 9)[0], drawn(7, 100)[0])
 
-    def lit_columns_offset(self):
-        c = layouts.Canvas()
-        layouts.draw_stats(c, 0, 0, [layouts.cpu_text(9.0)])
-        return self.lit_columns(c, layouts.CPU_C)[0]
+    def test_an_absent_stat_leaves_its_slot_empty_so_the_others_stay_put(self):
+        both = layouts.Canvas()
+        layouts.draw_stats(both, 10, 0, [layouts.watts_text(182.0), layouts.cpu_text(9.0)])
+        alone = layouts.Canvas()
+        layouts.draw_stats(alone, 10, 0, [None, layouts.cpu_text(9.0)])
+        self.assertEqual(self.lit_columns(alone, layouts.CPU_C), self.lit_columns(both, layouts.CPU_C))
+        self.assertEqual(self.lit_columns(alone, layouts.WATT_C), [])
 
     def test_the_stat_colours_are_distinct_from_each_other_and_from_the_metric_colours(self):
         colours = {layouts.WATT_C, layouts.CPU_C, layouts.GPU_C, layouts.MEM_C, layouts.DEC_C, layouts.PRE_C,
@@ -469,6 +473,17 @@ class Drawn(unittest.TestCase):
         diff = self.changed("rows", watts=9999.0, cpu=100.0)
         self.assertTrue(diff)
         self.assertTrue(all(x >= 90 and y % 16 in range(9, 15) for x, y in diff), diff[:6])
+
+    def test_rows_stat_columns_hold_still_whatever_the_digit_counts(self):
+        def columns(watts, cpu):
+            img = layouts.render("rows", self.nodes(watts=watts, cpu=cpu))
+            return {colour: [x for x in range(layouts.W) for y in range(9, 15) if img.getpixel((x, y)) == colour]
+                    for colour in (layouts.WATT_C, layouts.CPU_C)}
+        base = columns(182.0, 100.0)
+        for watts, cpu in ((7.0, 9.0), (99.0, 9.0), (7.0, 42.0), (999.0, 100.0)):
+            shown = columns(watts, cpu)
+            self.assertEqual(max(shown[layouts.CPU_C]), max(base[layouts.CPU_C]), (watts, cpu))
+            self.assertEqual(max(shown[layouts.WATT_C]), max(base[layouts.WATT_C]), (watts, cpu))
 
     def test_rows_bars_stop_short_of_the_stats(self):
         img = layouts.render("rows", self.nodes()).load()

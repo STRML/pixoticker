@@ -102,7 +102,7 @@ where there is room:
 |---|---|---|
 | `temp`, GPU degrees C | `~/.local/bin/latch sensors` every 10 s (about 0.4 s of one core; a failed read keeps the last figure for a minute) | `rows` in the gap after memory, `quad` top right, `focus` right of the bars. White below 70, amber from 70, red from 85 |
 | `watts`, whole machine | the SMC key `PD0R` through IOKit and `ctypes`, every second (`PSTR` reads 0 on a Studio) | `rows` right of the bars, `spark` in the column after the history, `quad` bottom left, `focus` right of the bars. Capped at `999W` for width |
-| `cpu`, busy percent | the kernel's `host_statistics` tick counters between two reads | with the watts, as `9%` |
+| `cpu`, busy percent | the kernel's `host_statistics` tick counters between two reads | with the watts, as `9%`. Temperature, watts and CPU each sit right-aligned in a fixed four-character slot, so a figure gaining a digit moves nothing beside it |
 
 To make room the `rows` and `focus` GPU and memory bars are shorter, the `spark` history is 36 samples (it was 62),
 and `quad` no longer prints `TOK/S` (the figure is already coloured). `cols` has no room. A figure outside its
