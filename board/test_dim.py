@@ -64,6 +64,12 @@ class Floor(unittest.TestCase):
     def test_a_gentler_level_keeps_content_at_its_scaled_level_when_that_is_above_the_floor(self):
         self.assertEqual(dimmed((95, 95, 95), 0.6), (57, 57, 57))
 
+    def test_sources_forty_levels_apart_stay_a_level_apart_at_any_dim_level(self):
+        for factor in (0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 0.9):
+            for lo in range(boardmod.CONTENT_MIN, 216, 7):
+                a, b = max(dimmed((lo, lo, lo), factor)), max(dimmed((lo + 40, lo + 40, lo + 40), factor))
+                self.assertGreaterEqual(b - a, 1, (factor, lo))
+
     def test_a_floor_above_the_pixel_never_brightens_it(self):
         self.assertEqual(dimmed((60, 60, 60), floor=255), (60, 60, 60))
         self.assertEqual(dimmed((200, 100, 50), floor=255), (200, 100, 50))
@@ -75,7 +81,7 @@ class Floor(unittest.TestCase):
             self.assertGreater(levels[-1], levels[0], factor)
 
     def test_a_live_colour_and_its_dimmed_idle_variant_stay_apart_at_a_low_level(self):
-        for factor in (0.1, 0.17, 0.25):
+        for factor in (0.001, 0.01, 0.02, 0.05, 0.1, 0.17, 0.25):
             live, idle = dimmed(layouts.DEC_C, factor), dimmed(layouts.dim(layouts.DEC_C, 0.6), factor)
             self.assertGreater(max(live), max(idle), factor)
             self.assertGreater(max(dimmed(layouts.FG, factor)), max(dimmed(layouts.DIM, factor)), factor)

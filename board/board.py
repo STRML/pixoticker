@@ -289,6 +289,7 @@ class Handler(BaseHTTPRequestHandler):
 
 NIGHT_FLOOR = 40    # the dimmest a pixel that carries content may be while dimmed; below it the LEDs read as off
 FLOOR_SLOPE = 0.5   # above the floor, brightness still climbs at this share of the dim level, so two colours never meet
+MIN_SLOPE = 0.025   # but never slower than this, so 40 levels of source brightness are still a whole level apart at any dim level
 CONTENT_MIN = 50    # a pixel whose brightest channel is below this is structure (a bar track, a rule) and may fade out
 
 
@@ -344,7 +345,7 @@ def dim_image(img, factor, floor=NIGHT_FLOOR):
                 continue
             target = factor * top
             if top >= CONTENT_MIN:
-                target = max(target, floor + (top - CONTENT_MIN) * factor * FLOOR_SLOPE)
+                target = max(target, floor + (top - CONTENT_MIN) * max(factor * FLOOR_SLOPE, MIN_SLOPE))
             k = min(1.0, target / top)
             px[x, y] = (min(255, int(r * k + 0.5)), min(255, int(g * k + 0.5)), min(255, int(b * k + 0.5)))
     return out

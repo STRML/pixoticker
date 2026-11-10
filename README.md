@@ -82,8 +82,9 @@ agent never leaves old numbers on the panel. A node that never reported shows `-
 frame it sends inside that window. The board does this because firmware brightness ops are not replayed after a
 reconnect. Each pixel scales by its brightest channel, so its hue survives. Plain scaling takes a grey label from
 95 to 24, which the LEDs barely show, so a content pixel (brightest channel 50 or more) never goes below a floor of
-40; `@0.25:55` sets another floor. Above the floor, brightness still climbs at half the dim level, so a live colour
-stays brighter than its idle variant. A pixel never gets brighter than it was, and anything under 50 (bar tracks,
+40; `@0.25:55` sets another floor. Above the floor, brightness still climbs at half the dim level (at least 0.025
+a level, so two colours 40 apart stay a whole step apart at any setting), so a live colour stays brighter than its
+idle variant. A pixel never gets brighter than it was, and anything under 50 (bar tracks,
 rules) fades as usual.
 
 **Tensor parallel.** Only rank 0 runs an HTTP server, so only it has token counters; the other ranks run
