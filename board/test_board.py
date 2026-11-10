@@ -366,13 +366,16 @@ class LiveNumbers(unittest.TestCase):
         pre = self.box(img, layouts.PRE_C, 64, 128, 8, 29)
         self.assertEqual((dec[2], dec[3]), (pre[2], pre[3]))
 
-    def test_the_widest_focus_numbers_fit_beside_each_other(self):
+    def test_the_widest_focus_numbers_stay_in_their_own_half(self):
         nodes = [self.node(layouts.LIVE, dec=9999.0, pre=9999.0)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
+        self.assertEqual(layouts.rate(9999.0), "10.0K")
         img = layouts.render("focus", nodes)
-        dec = self.box(img, layouts.DEC_C, 0, 64, 8, 29)
-        pre = self.box(img, layouts.PRE_C, 64, 128, 8, 29)
-        self.assertLess(dec[1], 64)
+        dec = self.box(img, layouts.DEC_C, 0, 128, 8, 29)
+        pre = self.box(img, layouts.PRE_C, 0, 128, 8, 29)
+        self.assertLess(dec[1], 66)
+        self.assertGreaterEqual(pre[0], 66)
         self.assertLess(pre[1], 128)
+        self.assertEqual(dec[1] - dec[0], pre[1] - pre[0])    # the same text at the same size: neither is clipped
 
 
 class AgentRates(unittest.TestCase):
