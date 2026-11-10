@@ -31,7 +31,7 @@ printf 'FIRMWARE %s %s' "$PXT_RELAY_KEY" "$$" > .pio/build/esp32dev/firmware.bin
 STUB_SSH = """#!/bin/sh
 # ssh HOST 'mkdir -p DIR && cat > PATH' < image -> the relay's FW_PATH under the fake HOME
 mkdir -p "$FAKE_HOME/firmware"
-cat > "$FAKE_HOME/firmware/pxt.bin"
+cat > "$FAKE_HOME/firmware/pxt.bin.new" && mv "$FAKE_HOME/firmware/pxt.bin.new" "$FAKE_HOME/firmware/pxt.bin"
 """
 
 
