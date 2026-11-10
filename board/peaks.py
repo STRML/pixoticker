@@ -18,9 +18,16 @@ from collections import deque
 
 HALF_LIFE_S = 3 * 86400
 HOLD = 3
-GAP_S = 2.5      # samples further apart than this are not consecutive, whichever ticks the caller skipped
+GAP_S = 1.5      # ticks are at least a second apart, so a skipped tick (idle, stale, a worker) leaves a gap of 2 s or more
 LEARN_N = 60
 SAVE_EVERY_S = 60
+
+
+def _finite(x):
+    try:
+        return math.isfinite(x)
+    except OverflowError:       # an integer too large for a float is not a rate either
+        return False
 
 
 class Peaks:
@@ -89,7 +96,7 @@ class Peaks:
         for name, entry in raw.items() if isinstance(raw, dict) else []:
             key, _, metric = name.rpartition("|")
             ok = (key and metric and isinstance(entry, list) and len(entry) == 3
-                  and all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in entry)
+                  and all(isinstance(x, (int, float)) and not isinstance(x, bool) and _finite(x) for x in entry)
                   and entry[0] > 0)
             if ok:
                 self.peak[(key, metric)] = [float(entry[0]), float(entry[1]), int(entry[2])]

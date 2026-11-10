@@ -686,12 +686,21 @@ class PeakLearning(unittest.TestCase):
         self.p.observe("a/1", "dec", 400.0)
         self.assertPeak("a/1", "dec", 150.0, 50.0)
 
-    def test_samples_a_second_or_two_apart_still_hold(self):
+    def test_samples_one_tick_apart_still_hold(self):
         self.feed("a/1", "dec", [50.0] * 70)
         for _ in range(3):
             self.p.observe("a/1", "dec", 90.0)
-            self.clock.t += peaks.GAP_S
+            self.clock.t += 1.0
         self.assertPeak("a/1", "dec", 150.0, 90.0)
+
+    def test_one_skipped_tick_breaks_the_hold(self):
+        self.feed("a/1", "dec", [50.0] * 70)
+        self.p.observe("a/1", "dec", 400.0)
+        self.clock.t += 1
+        self.p.observe("a/1", "dec", 400.0)
+        self.clock.t += 2           # a tick was skipped
+        self.p.observe("a/1", "dec", 400.0)
+        self.assertPeak("a/1", "dec", 150.0, 50.0)
 
     def test_the_peak_halves_every_half_life(self):
         self.feed("a/1", "dec", [100.0] * 70)
@@ -753,7 +762,8 @@ class PeakPersistence(unittest.TestCase):
                   '{"peaks": {"a|dec": [-5, 0, 99]}}', '{"peaks": {"a|dec": [true, 0, 99]}}',
                   '{"peaks": {"a|dec": [0, 0, 99]}}', '{"peaks": {"a|dec": [1, 0, Infinity]}}',
                   '{"peaks": {"a|dec": [NaN, 0, 99]}}', '{"peaks": {"a|dec": [Infinity, 0, 99]}}',
-                  '{"peaks": {"a|dec": [1, NaN, 99]}}')
+                  '{"peaks": {"a|dec": [1, NaN, 99]}}', '{"peaks": {"a|dec": [1, 0, ' + "9" * 400 + ']}}',
+                  '{"peaks": {"a|dec": [' + "9" * 400 + ', 0, 99]}}')
         for body in bodies:
             with open(self.path, "w") as f:
                 f.write(body)
@@ -801,6 +811,27 @@ class BoardPeaks(unittest.TestCase):
     def test_the_peak_is_unknown_until_learned(self):
         self.run_job(60.0, 5)
         self.assertIsNone(self.view("studio1").dec_peak)
+
+    def test_an_idle_tick_between_two_busy_stretches_does_not_join_them(self):
+        self.run_job(50.0, peaks.LEARN_N + 10)
+        for dec, running in ((400.0, 1), (400.0, 1), (0.0, 0), (400.0, 1)):
+            self.board.ingest(report("studio1", dec=dec, pre=0.0, running=running, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            self.board.tick()
+            self.clock.t += 1
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
+
+    def test_a_node_that_turns_into_a_worker_for_a_tick_does_not_join_its_runs(self):
+        self.run_job(50.0, peaks.LEARN_N + 10)
+        steps = [("studio1", 400.0, False), ("studio1", 400.0, False), ("studio1", 400.0, True), ("studio1", 400.0, False)]
+        for _, dec, worker in steps:
+            self.board.ingest(report("studio3", dec=400.0, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            self.board.ingest(report("studio1", dec=dec, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None, worker=worker, follows="studio3" if worker else None))
+            self.board.tick()
+            self.clock.t += 1
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
 
     def test_workers_add_no_observations_of_their_own(self):
         self.run_job(44.0, peaks.LEARN_N // 2 + peaks.HOLD, workers=("studio2", "studio3", "studio4"))
