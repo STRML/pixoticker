@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Loopback checks for tools/publish_fw.sh: a real relay, a fake panel, stub
-pio/ssh/scp, and one run of the script per scenario (about 40 s, in parallel).
+pio/ssh, and one run of the script per scenario (about 40 s, in parallel).
 
     python3 tools/test_publish_fw.py [scenario ...]   # good rollback crashloop blip
 
-Copies the script into a temp tree, stubs pio/ssh/scp, runs the real relay with
+Copies the script into a temp tree, stubs pio/ssh, runs the real relay with
 HOME pointed at the temp tree, and plays a panel that takes the ota op and then
 behaves per scenario. Prints the script's exit code and last line per scenario.
 """
@@ -28,10 +28,10 @@ STUB_PIO = """#!/bin/sh
 mkdir -p .pio/build/esp32dev
 printf 'FIRMWARE %s %s' "$PXT_RELAY_KEY" "$$" > .pio/build/esp32dev/firmware.bin
 """
-STUB_SCP = """#!/bin/sh
-# scp -q SRC HOST:firmware/pxt.bin -> the relay's FW_PATH under the fake HOME
+STUB_SSH = """#!/bin/sh
+# ssh HOST 'mkdir -p DIR && cat > PATH' < image -> the relay's FW_PATH under the fake HOME
 mkdir -p "$FAKE_HOME/firmware"
-cp "$2" "$FAKE_HOME/firmware/pxt.bin"
+cat > "$FAKE_HOME/firmware/pxt.bin.new" && mv "$FAKE_HOME/firmware/pxt.bin.new" "$FAKE_HOME/firmware/pxt.bin"
 """
 
 
@@ -94,7 +94,7 @@ def run(scenario, port):
         os.makedirs(f"{t}/tools")
         os.makedirs(f"{t}/bin")
         shutil.copy(f"{ROOT}/tools/publish_fw.sh", f"{t}/tools/publish_fw.sh")
-        for name, body in (("pio", STUB_PIO), ("scp", STUB_SCP), ("ssh", "#!/bin/sh\n")):
+        for name, body in (("pio", STUB_PIO), ("ssh", STUB_SSH)):
             with open(f"{t}/bin/{name}", "w") as f:
                 f.write(body)
             os.chmod(f"{t}/bin/{name}", 0o755)
