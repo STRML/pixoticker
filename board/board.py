@@ -38,8 +38,10 @@ TTL_S = 10
 TICK_S = 1.0
 ROTATE_S = 15
 BUSY_TPS = 0.5
+LAST_S = 30   # how long a request average shows, counted from when the agent measured it
 MAX_BODY = 4096
-RATE_FIELDS = ("dec", "pre", "dec_last", "pre_last")
+RATE_FIELDS = ("dec", "pre", "dec_last", "pre_last", "dec_last_age", "pre_last_age")
+LAST_FIELDS = ("dec_last", "pre_last")
 
 
 def number(v, lo=0.0, hi=1e9):
@@ -96,6 +98,10 @@ class Board:
             node.mem = 100.0 * r["mem_gb"] / r["mem_total_gb"]
         busy = (r["running"] or 0) > 0 or (node.dec or 0) > BUSY_TPS or (node.pre or 0) > BUSY_TPS
         node.state = LIVE if busy else IDLE
+        for k in LAST_FIELDS:
+            measured_ago = r[k + "_age"]
+            if measured_ago is None or measured_ago + (now - self.seen[name]) > LAST_S:
+                setattr(node, k, None)
         return node
 
     def tick(self):
