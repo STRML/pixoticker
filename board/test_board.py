@@ -111,12 +111,12 @@ class BoardLogic(unittest.TestCase):
         self.board.ingest(report("studio1", dec=0.0, pre=live_pre, running=running, dec_last=dec, pre_last=pre,
                                  dec_last_age=dec_age, pre_last_age=pre_age))
 
-    def test_an_average_shows_until_its_age_passes_last_s_then_dashes(self):
+    def test_an_average_shows_until_its_age_passes_last_s_then_zero(self):
         self.ingest_last(50.0, 2000.0, 5.0, 5.0)
         self.assertEqual(self.last(), (50.0, 2000.0))
         self.ingest_last(50.0, 2000.0, boardmod.LAST_S + 1.0, boardmod.LAST_S + 1.0)
         self.assertEqual(self.last(), (None, None))
-        self.assertEqual(layouts.shown(self.board.nodes()[0], "dec", layouts.DEC_C)[0], "--")
+        self.assertEqual(layouts.shown(self.board.nodes()[0], "dec", layouts.DEC_C)[0], "0")
 
     def test_time_since_the_report_counts_toward_the_age(self):
         self.ingest_last(50.0, 2000.0, 25.0, 25.0)
@@ -337,9 +337,44 @@ class LiveNumbers(unittest.TestCase):
 
     def test_a_busy_node_with_a_stopped_phase_shows_zero_not_the_last_average(self):
         n = self.node(layouts.LIVE, dec=44.4, pre=0.0)
-        self.assertEqual(layouts.shown(n, "pre", layouts.PRE_C), ("0", layouts.DIM))
+        self.assertEqual(layouts.shown(n, "pre", layouts.PRE_C), ("0", layouts.dim(layouts.PRE_C, 0.6)))
         n = self.node(layouts.LIVE, dec=0.0, pre=1289.5)
-        self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C), ("0", layouts.DIM))
+        self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C), ("0", layouts.dim(layouts.DEC_C, 0.6)))
+
+    def test_the_cluster_total_zero_keeps_its_metric_colour(self):
+        self.assertEqual(layouts.total_text(0.0, layouts.PRE_C), ("P0", layouts.dim(layouts.PRE_C, 0.6)))
+        self.assertEqual(layouts.total_text(0.0, layouts.DEC_C), ("D0", layouts.dim(layouts.DEC_C, 0.6)))
+
+    def zero_pixels(self, name, dim_by=1.0):
+        """Pixels of the zero's colour that the rendered zero glyph adds. The baseline render is the same
+        node with the zero's text blanked, so the `P` label keeps its colour in both and cancels out."""
+        import board as boardmod
+        from unittest import mock
+        want = tuple(int(c * 0.6 * dim_by + 0.5) for c in layouts.PRE_C)
+        real = layouts.shown
+
+        def blanked(node, key, color):
+            text, col = real(node, key, color)
+            return ("" if key == "pre" and text == "0" else text), col
+
+        counts = []
+        for patch in (None, blanked):
+            nodes = [self.node(layouts.LIVE, dec=44.4, pre=0.0)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
+            with mock.patch.object(layouts, "shown", patch or real):
+                img = boardmod.dim_image(layouts.render(name, nodes), dim_by)
+            counts.append(sum(n for n, c in img.getcolors() if c == want))
+        return counts[0] - counts[1], want
+
+    def test_every_layout_draws_a_zero_prefill_in_a_colour_the_panel_can_show(self):
+        for name in layouts.LAYOUTS:
+            added, _ = self.zero_pixels(name)
+            self.assertGreater(added, 0, name)
+
+    def test_a_zero_survives_the_night_dimming_as_something_the_panel_can_show(self):
+        for name in layouts.LAYOUTS:
+            added, want = self.zero_pixels(name, 0.25)
+            self.assertGreater(added, 0, name)
+        self.assertGreaterEqual(max(want), 30)
 
     def test_a_busy_node_with_no_live_figure_shows_dashes(self):
         n = self.node(layouts.LIVE, dec=None, pre=None)
@@ -349,6 +384,12 @@ class LiveNumbers(unittest.TestCase):
         n = self.node(layouts.IDLE)
         text, colour = layouts.shown(n, "dec", layouts.DEC_C)
         self.assertEqual((text, colour), ("120", layouts.dim(layouts.DEC_C, 0.6)))
+
+    def test_an_idle_node_with_no_fresh_average_reads_zero_and_with_no_figure_dashes(self):
+        zero = self.node(layouts.IDLE, dec_last=None, pre_last=None)
+        self.assertEqual(layouts.shown(zero, "pre", layouts.PRE_C), ("0", layouts.dim(layouts.PRE_C, 0.6)))
+        nofig = self.node(layouts.IDLE, dec=None, pre=None, dec_last=None, pre_last=None)
+        self.assertEqual(layouts.shown(nofig, "pre", layouts.PRE_C), ("--", layouts.DIM))
 
     def test_a_live_figure_shows_in_the_metric_colour(self):
         n = self.node(layouts.LIVE, dec=44.4, pre=1289.5)
