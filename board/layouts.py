@@ -336,8 +336,9 @@ def summary_parts(nodes):
 
 def draw_summary(c, nodes):
     """The top bar of focus, spark, cols and quad: the whole cluster at a glance, no label needed."""
-    *left, prefill = summary_parts(nodes)
-    draw_stats(c, 0, 1, left)
+    gpu, *middle, prefill = summary_parts(nodes)
+    c.text(4, 1, *gpu)
+    draw_stats(c, 20, 1, middle)
     c.text_right(125, 1, *prefill)
     c.rect(0, 7, W, 1, RULE)
 
