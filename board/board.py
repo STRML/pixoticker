@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import layouts
+import peaks as _peaks
 import preview
 from layouts import ABSENT, IDLE, LIVE, STALE, Node
 
@@ -54,7 +55,7 @@ def number(v, lo=0.0, hi=1e9):
 
 
 class Board:
-    def __init__(self, names, pinned="auto", rotation=None, clock=time.time):
+    def __init__(self, names, pinned="auto", rotation=None, clock=time.time, peaks=None):
         self.names = list(names)
         if not self.names:
             raise ValueError("a board needs at least one node")
@@ -66,6 +67,8 @@ class Board:
         self.pinned = pinned
         self.rotation = rotation or list(layouts.LAYOUTS)
         self.started = clock()
+        self.peaks = peaks if peaks is not None else _peaks.Peaks(clock=clock)
+        self.ticks = 0      # numbers tick() calls, so the peaks can tell consecutive ticks from skipped ones
 
     def ingest(self, body):
         """Store one agent report; returns an error string or None."""
@@ -89,7 +92,22 @@ class Board:
         with self.lock:
             views = [self._view(n, now) for n in self.names]
             self._mirror(views)
+            self._attach_peaks(views)
             return views
+
+    @staticmethod
+    def peak_key(view, views):
+        """Whom a rate belongs to: the node that serves and how many nodes share the job, because four
+        Studios in tensor parallel decode at a different rate from one alone."""
+        leader = view.tp or view.name
+        return f"{leader}/{1 + sum(1 for v in views if v.tp == leader)}"
+
+    def _attach_peaks(self, views):
+        for v in views:
+            if v.fresh:
+                key = self.peak_key(v, views)
+                v.dec_peak = self.peaks.get(key, "dec", None)
+                v.pre_peak = self.peaks.get(key, "pre", None)
 
     def _mirror(self, views):
         """A tensor-parallel worker has no server of its own, so it reports no tokens, yet every rank
@@ -131,9 +149,15 @@ class Board:
 
     def tick(self):
         """Append every fresh node's sample to its history; call once a second."""
-        for n in self.nodes():
+        self.ticks += 1
+        views = self.nodes()
+        for n in views:
             if n.fresh:
                 self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0, 0.0 if n.tp else n.dec or 0.0))
+            if n.state == LIVE and n.tp is None:
+                key = self.peak_key(n, views)
+                self.peaks.observe(key, "dec", n.dec, self.ticks)
+                self.peaks.observe(key, "pre", n.pre, self.ticks)
 
     def layout(self, now=None):
         if self.pinned != "auto":
@@ -353,6 +377,7 @@ def dim_image(img, factor, floor=NIGHT_FLOOR):
 
 def step(board, relay, dimmer=None, now=None):
     board.tick()
+    board.peaks.save_if_due()
     if relay:
         frame = board.frame()[1]
         if dimmer:
@@ -393,6 +418,8 @@ def main():
     ap.add_argument("--ingest-key-file", default=os.environ.get("BOARD_INGEST_KEY_FILE", "~/.pxt_ingest_key"))
     ap.add_argument("--relay", default=os.environ.get("BOARD_RELAY_URL", ""), help="relay base URL; empty draws previews only")
     ap.add_argument("--relay-key-file", default=os.environ.get("BOARD_RELAY_KEY_FILE", "~/.pxt_relay_key"))
+    ap.add_argument("--state-file", default=os.environ.get("BOARD_STATE_FILE", ""),
+                    help="where the learned peaks are saved, so a restart keeps them; empty keeps them in memory")
     ap.add_argument("--dim", default=os.environ.get("BOARD_DIM", ""),
                     help="HH:MM-HH:MM@LEVEL[:FLOOR]: scale the panel's frames by LEVEL in that window, content never "
                          "below FLOOR (default 40), e.g. 20:00-07:30@0.25")
@@ -402,7 +429,7 @@ def main():
     names = [n.strip() for n in args.nodes.split(",") if n.strip()]
     if not names:
         raise SystemExit("--nodes names no node")
-    board = Board(names)
+    board = Board(names, peaks=_peaks.Peaks(args.state_file))
     if not board.pin(args.layout):
         raise SystemExit(f"unknown layout {args.layout!r}")
     Handler.board, Handler.key = board, read_key(args.ingest_key_file)

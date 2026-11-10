@@ -87,6 +87,14 @@ a level, so two colours 40 apart stay a whole step apart at any setting), so a l
 idle variant. A pixel never gets brighter than it was, and anything under 50 (bar tracks,
 rules) fades as usual.
 
+**Range bars.** The focus view draws a bar under the decode and prefill numbers: the live rate as a fraction of
+that node's usual peak, so 40 tok/s against a 200 tok/s peak reads as 20%. The board learns the peak by watching
+(`board/peaks.py`): the highest value that held for three samples in a row (a one-sample spike cannot set the
+scale), decaying with a three-day half-life so it follows a node that got slower. It is kept per node and per
+number of nodes sharing the job, because four Studios in tensor parallel decode at a different rate from one
+alone, and per metric. Until 60 such samples have been seen the bars use a default scale (150 tok/s decode,
+3000 tok/s prefill). `--state-file` (env `BOARD_STATE_FILE`) saves the peaks every minute, so a restart keeps them.
+
 **Tensor parallel.** Only rank 0 runs an HTTP server, so only it has token counters; the other ranks run
 `mlx-serve worker ... --coordinator 10.254.<ab>.<n>:<port>` and would show idle while their GPUs work. An agent
 that finds such a process (and has no server of its own) reports `worker: true` and `follows: studio<n>` (the last octet of rank 0's cable
