@@ -753,7 +753,7 @@ static OtaStop otaPull(const String &path, size_t want, const String &shaHex, si
   HTTPClient http;
   http.setTimeout(20000);
   http.setConnectTimeout(10000);
-  if (!http.begin(c, String("https://") + PXT_RELAY_HOST + path)) {
+  if (!http.begin(c, PXT_RELAY_HOST, PXT_RELAY_PORT, path, true)) {
     why = "begin";
     return OTA_RETRY;
   }
