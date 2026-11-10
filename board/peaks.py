@@ -18,7 +18,6 @@ from collections import deque
 
 HALF_LIFE_S = 3 * 86400
 HOLD = 3
-GAP_S = 30.0     # a backstop for a paused process; the board ends a node's runs explicitly on every tick it is not live
 LEARN_N = 60
 SAVE_EVERY_S = 60
 
@@ -34,7 +33,7 @@ class Peaks:
     def __init__(self, path="", clock=time.time):
         self.path, self.clock = path, clock
         self.peak = {}      # (key, metric) -> [value, when it was set, samples seen]
-        self.recent = {}    # (key, metric) -> the last HOLD live values with the time each was seen
+        self.runs = {}      # (key, metric) -> [last tick, the last HOLD values]
         self.dirty, self.saved_at, self.failing = False, 0.0, False
         if path:
             self.load()
@@ -42,29 +41,25 @@ class Peaks:
     def _decayed(self, entry, now):
         return entry[0] * 0.5 ** (max(0.0, now - entry[1]) / HALF_LIFE_S)
 
-    def observe(self, key, metric, value):
-        """One live sample a second. Zero or nothing ends the run that has to hold."""
-        slot, now = (key, metric), self.clock()
+    def observe(self, key, metric, value, tick):
+        """One live sample on tick number `tick`. A run holds only samples on consecutive ticks, so whatever
+        interrupts it (an idle or stale tick, a worker joining or leaving and with it the key changing, a
+        slow relay push, a zero) starts a new run without anyone having to say so. Time plays no part in
+        that, only the tick numbers."""
         if not value or value <= 0:
-            self.recent.pop(slot, None)
             return
-        run = self.recent.get(slot)
-        if run is None or now - run[-1][1] > GAP_S:
-            run = self.recent[slot] = deque(maxlen=HOLD)
-        run.append((value, now))
-        if len(run) < HOLD:
+        slot = (key, metric)
+        run = self.runs.get(slot)
+        if run is None or run[0] != tick - 1:
+            run = self.runs[slot] = [tick, deque(maxlen=HOLD)]
+        run[0] = tick
+        run[1].append(value)
+        if len(run[1]) < HOLD:
             return
-        held = min(v for v, _ in run)
+        held, now = min(run[1]), self.clock()
         entry = self.peak.get(slot)
         self.peak[slot] = [held, now, 1] if entry is None else [max(self._decayed(entry, now), held), now, entry[2] + 1]
         self.dirty = True
-
-    def break_runs(self, prefix):
-        """A node stopped serving (idle, stale, a worker): the runs of every key that starts with `prefix`
-        end here, so what comes after is not held together with what came before. A wall-clock gap cannot do
-        this: one loose enough for a slow relay push is too loose for a skipped tick."""
-        for slot in [s for s in self.recent if s[0].startswith(prefix)]:
-            del self.recent[slot]
 
     def get(self, key, metric, seed):
         """The learned peak, or `seed` until enough has been watched."""

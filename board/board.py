@@ -68,6 +68,7 @@ class Board:
         self.rotation = rotation or list(layouts.LAYOUTS)
         self.started = clock()
         self.peaks = peaks if peaks is not None else _peaks.Peaks(clock=clock)
+        self.ticks = 0      # numbers tick() calls, so the peaks can tell consecutive ticks from skipped ones
 
     def ingest(self, body):
         """Store one agent report; returns an error string or None."""
@@ -148,16 +149,15 @@ class Board:
 
     def tick(self):
         """Append every fresh node's sample to its history; call once a second."""
+        self.ticks += 1
         views = self.nodes()
         for n in views:
             if n.fresh:
                 self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0, 0.0 if n.tp else n.dec or 0.0))
             if n.state == LIVE and n.tp is None:
                 key = self.peak_key(n, views)
-                self.peaks.observe(key, "dec", n.dec)
-                self.peaks.observe(key, "pre", n.pre)
-            else:
-                self.peaks.break_runs(f"{n.name}/")   # idle, stale, absent or a worker: no run goes through this tick
+                self.peaks.observe(key, "dec", n.dec, self.ticks)
+                self.peaks.observe(key, "pre", n.pre, self.ticks)
 
     def layout(self, now=None):
         if self.pinned != "auto":

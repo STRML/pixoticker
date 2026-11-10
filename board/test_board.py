@@ -650,11 +650,17 @@ class PeakLearning(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
         self.p = peaks.Peaks(clock=self.clock)
+        self.tick = 0
 
-    def feed(self, key, metric, values):
+    def observe(self, key, metric, value, skip=0, wall=1.0):
+        """One observation on the next tick, or `skip` ticks later; `wall` seconds pass."""
+        self.tick += 1 + skip
+        self.p.observe(key, metric, value, self.tick)
+        self.clock.t += wall
+
+    def feed(self, key, metric, values, **kw):
         for v in values:
-            self.p.observe(key, metric, v)
-            self.clock.t += 1
+            self.observe(key, metric, v, **kw)
 
     def assertPeak(self, key, metric, seed, want):
         self.assertAlmostEqual(self.p.get(key, metric, seed), want, delta=0.1)
@@ -677,45 +683,36 @@ class PeakLearning(unittest.TestCase):
         self.feed("a/1", "dec", [50.0] * 70 + [400.0, 400.0, 0.0, 400.0, 400.0, 0.0, 400.0])
         self.assertPeak("a/1", "dec", 150.0, 50.0)
 
-    def test_a_gap_in_the_samples_breaks_the_hold_whatever_the_caller_skipped(self):
+    def test_a_skipped_tick_breaks_the_hold_however_little_time_passed(self):
         self.feed("a/1", "dec", [50.0] * 70)
-        for _ in range(2):
-            self.p.observe("a/1", "dec", 400.0)
-            self.clock.t += 1
-        self.clock.t += 30          # the node went idle or stale: the caller made no observe calls
-        self.p.observe("a/1", "dec", 400.0)
+        self.feed("a/1", "dec", [400.0, 400.0], wall=0.1)
+        self.observe("a/1", "dec", 400.0, skip=1, wall=0.1)
         self.assertPeak("a/1", "dec", 150.0, 50.0)
 
-    def test_samples_one_tick_apart_still_hold(self):
+    def test_consecutive_ticks_hold_however_much_time_passes_between_them(self):
         self.feed("a/1", "dec", [50.0] * 70)
-        for _ in range(3):
-            self.p.observe("a/1", "dec", 90.0)
-            self.clock.t += 1.0
+        self.feed("a/1", "dec", [90.0] * 3, wall=1.7)         # a slow relay push
         self.assertPeak("a/1", "dec", 150.0, 90.0)
+        self.feed("a/1", "dec", [120.0] * 3, wall=45.0)       # a very slow one
+        self.assertPeak("a/1", "dec", 150.0, 120.0)
 
-    def test_a_long_pause_breaks_the_hold(self):
+    def test_a_change_of_key_ends_the_run_even_if_it_comes_back_the_next_tick(self):
         self.feed("a/1", "dec", [50.0] * 70)
-        for _ in range(2):
-            self.p.observe("a/1", "dec", 400.0)
-            self.clock.t += 1
-        self.clock.t += 2 * peaks.GAP_S
-        self.p.observe("a/1", "dec", 400.0)
+        self.feed("a/1", "dec", [400.0, 400.0])
+        self.observe("a/2", "dec", 400.0)                     # a worker joined for one tick
+        self.observe("a/1", "dec", 400.0)
         self.assertPeak("a/1", "dec", 150.0, 50.0)
 
-    def test_slow_ticks_still_hold(self):
+    def test_keys_and_metrics_keep_separate_runs(self):
         self.feed("a/1", "dec", [50.0] * 70)
-        for _ in range(3):
-            self.p.observe("a/1", "dec", 90.0)
-            self.clock.t += 1.6          # a relay push that took 0.6 s
+        self.feed("b/1", "dec", [50.0] * 70)
+        for tick_of in range(3):
+            self.tick += 1
+            self.p.observe("a/1", "dec", 90.0, self.tick)
+            self.p.observe("b/1", "dec", 400.0 if tick_of != 1 else 0.0, self.tick)
+            self.clock.t += 1
         self.assertPeak("a/1", "dec", 150.0, 90.0)
-
-    def test_breaking_the_runs_of_a_node_clears_every_group_size_and_metric(self):
-        for key in ("a/1", "a/4", "b/1"):
-            for metric in ("dec", "pre"):
-                self.p.observe(key, metric, 400.0)
-                self.p.observe(key, metric, 400.0)
-        self.p.break_runs("a/")
-        self.assertEqual(sorted(self.p.recent), [("b/1", "dec"), ("b/1", "pre")])
+        self.assertPeak("b/1", "dec", 150.0, 50.0)
 
     def test_the_peak_halves_every_half_life(self):
         self.feed("a/1", "dec", [100.0] * 70)
@@ -746,8 +743,8 @@ class PeakPersistence(unittest.TestCase):
 
     def learned(self):
         p = peaks.Peaks(self.path, clock=self.clock)
-        for _ in range(peaks.LEARN_N + 5):
-            p.observe("studio1/4", "dec", 77.0)
+        for tick in range(1, peaks.LEARN_N + 6):
+            p.observe("studio1/4", "dec", 77.0, tick)
             self.clock.t += 1
         return p
 
@@ -763,8 +760,8 @@ class PeakPersistence(unittest.TestCase):
         self.clock.t += peaks.SAVE_EVERY_S
         self.assertTrue(p.save_if_due())
         self.assertFalse(p.save_if_due())
-        for _ in range(peaks.HOLD):           # a held run changes the peak
-            p.observe("studio1/4", "dec", 77.0)
+        for tick in range(1000, 1000 + peaks.HOLD):       # a held run changes the peak
+            p.observe("studio1/4", "dec", 77.0, tick)
             self.clock.t += 1
         self.assertFalse(p.save_if_due())     # changed, but saved only a moment ago
         self.clock.t += peaks.SAVE_EVERY_S
@@ -786,8 +783,8 @@ class PeakPersistence(unittest.TestCase):
 
     def test_an_unwritable_path_is_logged_and_does_not_raise(self):
         p = peaks.Peaks(os.path.join(self.dir, "no", "such", "dir", "peaks.json"), clock=self.clock)
-        for _ in range(peaks.HOLD):
-            p.observe("a", "dec", 5.0)
+        for tick in range(1, peaks.HOLD + 1):
+            p.observe("a", "dec", 5.0, tick)
         self.clock.t += peaks.SAVE_EVERY_S
         self.assertFalse(p.save_if_due())
 
@@ -823,6 +820,16 @@ class BoardPeaks(unittest.TestCase):
         self.run_job(60.0, peaks.LEARN_N + 10)
         self.assertAlmostEqual(self.view("studio1").dec_peak, 60.0, delta=0.1)
 
+    def test_a_prefill_peak_is_learned_beside_the_decode_peak(self):
+        for _ in range(peaks.LEARN_N + 10):
+            self.board.ingest(report("studio1", dec=60.0, pre=1800.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            self.board.tick()
+            self.clock.t += 1
+        n = self.view("studio1")
+        self.assertAlmostEqual(n.pre_peak, 1800.0, delta=2.0)
+        self.assertAlmostEqual(n.dec_peak, 60.0, delta=0.5)
+
     def test_the_peak_is_unknown_until_learned(self):
         self.run_job(60.0, 5)
         self.assertIsNone(self.view("studio1").dec_peak)
@@ -844,6 +851,12 @@ class BoardPeaks(unittest.TestCase):
             self.clock.t += dt
             self.board.ingest(report("studio1", dec=dec, **body))
             self.board.tick()
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
+
+    def test_a_worker_joining_for_one_tick_does_not_join_the_solo_runs_either_side(self):
+        self.run_job(50.0, peaks.LEARN_N + 10)
+        for workers in ((), (), ("studio2",), ()):
+            self.run_job(400.0, 1, workers=workers, idle=() if workers else ("studio2",))
         self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
 
     def test_a_slow_relay_push_between_ticks_does_not_stop_a_peak_being_learned(self):
