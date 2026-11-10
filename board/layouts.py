@@ -33,6 +33,7 @@ DEC_FULL = 150.0    # tok/s that fills a decode tile
 PRE_FULL = 3000.0   # tok/s that fills a prefill tile
 HIST = 62           # samples a sparkline shows
 MEM_WARN = 85.0
+BAR_X, BAR_W = 32, 10   # spark: the GPU and memory bars beside their numbers
 
 LIVE, IDLE, STALE, ABSENT = "live", "idle", "stale", "absent"
 
@@ -256,7 +257,7 @@ def area(c, x, y, w, h, samples, peak, color):
 
 def spark(nodes):
     """A cluster row on top (total decode and prefill, total decode history), then one
-    14 px band per node: GPU and memory, a decode history on a scale shared by all
+    14 px band per node: GPU and memory as numbers with a 10 px bar each, a decode history on a scale shared by all
     nodes, the GPU trace over it, amber ticks where a prefill ran, and the rates."""
     c = Canvas()
     x0, wid = 43, HIST
@@ -279,6 +280,8 @@ def spark(nodes):
             continue
         c.text(14, y + 1, f"G{pct(n.gpu)}", gc)
         c.text(14, y + 7, f"M{pct(n.mem)}", mc)
+        c.hbar(BAR_X, y + 2, BAR_W, 3, frac(n.gpu), gc)
+        c.hbar(BAR_X, y + 8, BAR_W, 3, frac(n.mem), mc)
         pt, pc = shown(n, "pre", PRE_C)
         dt, dc = shown(n, "dec", DEC_C)
         samples = n.hist[-wid:]
@@ -331,34 +334,7 @@ def focus(nodes):
     return c.img
 
 
-def tile(c, x, y, w, h, text, base, level):
-    """A filled tile: the metric hue, brighter as `level` (0..1) rises, number centred."""
-    c.rect(x, y, w, h, tuple(int(ch * (0.18 + 0.62 * min(1.0, max(0.0, level)))) for ch in base))
-    c.text_center(x + w // 2, y + (h - font.H) // 2, text, FG)
-
-
-def matrix(nodes):
-    """A table of heat tiles: one row per node, columns GPU, memory, decode, prefill."""
-    c = Canvas()
-    heads = (("GPU", GPU_C), ("MEM", MEM_C), ("DEC", DEC_C), ("PRE", PRE_C))
-    for j, (label, color) in enumerate(heads):
-        c.text_center(16 + j * 28 + 14, 1, label, color)
-    for i, n in enumerate(nodes[:4]):
-        y = 8 + i * 14
-        c.text(1, y + 4, n.tag, FG if n.fresh else DIM)
-        if not n.fresh:
-            c.text(16, y + 4, status_text(n), BAD if n.state == STALE else DIM)
-            continue
-        dt, _ = shown(n, "dec", DEC_C)
-        pt, _ = shown(n, "pre", PRE_C)
-        tile(c, 16, y, 27, 13, pct(n.gpu), GPU_C, frac(n.gpu))
-        tile(c, 44, y, 27, 13, pct(n.mem), mem_color(n), frac(n.mem))
-        tile(c, 72, y, 27, 13, dt, DEC_C, (n.dec or n.dec_last or 0) / DEC_FULL)
-        tile(c, 100, y, 27, 13, pt, PRE_C, (n.pre or n.pre_last or 0) / PRE_FULL)
-    return c.img
-
-
-LAYOUTS = {"rows": rows, "cols": cols, "quad": quad, "spark": spark, "focus": focus, "matrix": matrix}
+LAYOUTS = {"rows": rows, "cols": cols, "quad": quad, "spark": spark, "focus": focus}
 
 
 def render(name, nodes):

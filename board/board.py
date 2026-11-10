@@ -38,6 +38,7 @@ TTL_S = 10
 TICK_S = 1.0
 ROTATE_S = 15
 BUSY_TPS = 0.5
+LAST_S = 30   # how long an idle node keeps showing its last request average
 MAX_BODY = 4096
 RATE_FIELDS = ("dec", "pre", "dec_last", "pre_last")
 
@@ -61,6 +62,7 @@ class Board:
         self.pinned = pinned
         self.rotation = rotation or list(layouts.LAYOUTS)
         self.started = clock()
+        self.busy_at = {}
 
     def ingest(self, body):
         """Store one agent report; returns an error string or None."""
@@ -96,6 +98,10 @@ class Board:
             node.mem = 100.0 * r["mem_gb"] / r["mem_total_gb"]
         busy = (r["running"] or 0) > 0 or (node.dec or 0) > BUSY_TPS or (node.pre or 0) > BUSY_TPS
         node.state = LIVE if busy else IDLE
+        if busy:
+            self.busy_at[name] = now
+        elif now - self.busy_at.get(name, float("-inf")) > LAST_S:
+            node.dec_last = node.pre_last = None
         return node
 
     def tick(self):

@@ -102,6 +102,25 @@ class BoardLogic(unittest.TestCase):
         for name in layouts.LAYOUTS:
             self.assertEqual(layouts.render(name, self.board.nodes()).size, (128, 64))
 
+    def test_last_request_average_expires_back_to_dashes(self):
+        idle = dict(dec=0.0, pre=0.0, running=0)
+        self.board.ingest(report("studio1", running=1))
+        self.assertEqual(self.states()[0], layouts.LIVE)
+        self.clock.t += 5
+        self.board.ingest(report("studio1", **idle))
+        n = self.board.nodes()[0]
+        self.assertEqual((n.dec_last, n.pre_last), (50.0, 2000.0))
+        self.clock.t += boardmod.LAST_S
+        self.board.ingest(report("studio1", **idle))
+        n = self.board.nodes()[0]
+        self.assertEqual((n.state, n.dec_last, n.pre_last), (layouts.IDLE, None, None))
+        self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C)[0], "--")
+
+    def test_a_node_never_seen_busy_shows_no_last_average(self):
+        self.board.ingest(report("studio1", dec=0.0, pre=0.0, running=0))
+        n = self.board.nodes()[0]
+        self.assertEqual((n.dec_last, n.pre_last), (None, None))
+
     def test_history_only_grows_while_fresh(self):
         self.board.ingest(report("studio1"))
         self.board.tick()
