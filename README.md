@@ -78,6 +78,15 @@ Each agent reads the local `/metrics.json` once a second and posts one small JSO
 last request's average, dimmed, until it is 30 s old (`LAST_S`), then `0`; a busy node whose prefill or decode has stopped shows a dimmed `0` too, in the metric's own colour (grey at the night-dimming level is nearly black on the panel). `--` means no data. The agent reports each average with its age (`dec_last_age`, `pre_last_age`), so the clocks of the Studios and the board need not agree, and an average with no age is not shown (an agent older than this change shows `0` there until it is updated). A node that stops reporting for 10 s turns grey with `STALE`, so a dead
 agent never leaves old numbers on the panel. A node that never reported shows `--`.
 
+**Night dimming.** Set `--dim "20:00-07:30@0.25"` (`BOARD_DIM`, with `--tz` or `BOARD_TZ`) and the board dims every
+frame it sends inside that window. The board does this because firmware brightness ops are not replayed after a
+reconnect. Each pixel scales by its brightest channel, so its hue survives. Plain scaling takes a grey label from
+95 to 24, which the LEDs barely show, so a content pixel (brightest channel 50 or more) never goes below a floor of
+40; `@0.25:55` sets another floor. Above the floor, brightness still climbs at half the dim level (at least 0.025
+a level, so two colours 40 apart stay a whole step apart at any setting), so a live colour stays brighter than its
+idle variant. A pixel never gets brighter than it was, and anything under 50 (bar tracks,
+rules) fades as usual.
+
 **Range bars.** The focus view draws a bar under the decode and prefill numbers: the live rate as a fraction of
 that node's usual peak, so 40 tok/s against a 200 tok/s peak reads as 20%. The board learns the peak by watching
 (`board/peaks.py`): the highest value that held for three samples in a row (a one-sample spike cannot set the

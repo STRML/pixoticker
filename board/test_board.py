@@ -350,7 +350,9 @@ class LiveNumbers(unittest.TestCase):
         node with the zero's text blanked, so the `P` label keeps its colour in both and cancels out."""
         import board as boardmod
         from unittest import mock
-        want = tuple(int(c * 0.6 * dim_by + 0.5) for c in layouts.PRE_C)
+        from PIL import Image
+        swatch = Image.new("RGB", (1, 1), layouts.dim(layouts.PRE_C, 0.6))
+        want = boardmod.dim_image(swatch, dim_by).getpixel((0, 0))
         real = layouts.shown
 
         def blanked(node, key, color):
@@ -463,7 +465,7 @@ class NightDim(unittest.TestCase):
         img = Image.new("RGB", (2, 1))
         img.putpixel((0, 0), (200, 100, 50))
         dimmed = boardmod.dim_image(img, 0.25)
-        self.assertEqual((dimmed.getpixel((0, 0)), dimmed.getpixel((1, 0))), ((50, 25, 13), (0, 0, 0)))
+        self.assertEqual((dimmed.getpixel((0, 0)), dimmed.getpixel((1, 0))), ((59, 29, 15), (0, 0, 0)))
         self.assertEqual(img.getpixel((0, 0)), (200, 100, 50))
 
     def test_full_brightness_sends_the_frame_untouched(self):
@@ -498,6 +500,8 @@ class NightDim(unittest.TestCase):
                 self.sent.append(img.tobytes())
 
         class Half:
+            floor = 0
+
             def factor(self, now):
                 return 0.5
 
