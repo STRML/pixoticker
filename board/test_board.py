@@ -138,6 +138,13 @@ class BoardLogic(unittest.TestCase):
         self.assertEqual((n.state, n.dec_last, n.pre_last), (layouts.LIVE, None, None))
         self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C)[0], "--")
 
+    def test_each_average_expires_on_its_own_clock(self):
+        idle = dict(dec=0.0, pre=0.0, running=0)
+        self.board.ingest(report("studio1", **dict(idle, dec_last=120.0, pre_last=5000.0)))
+        self.clock.t += boardmod.LAST_S + 1
+        self.board.ingest(report("studio1", **dict(idle, dec_last=120.0, pre_last=6000.0)))
+        self.assertEqual(self.last(), (None, 6000.0))
+
     def test_a_new_average_after_expiry_shows_again(self):
         self.board.ingest(report("studio1", dec=0.0, pre=0.0, running=0))
         self.clock.t += boardmod.LAST_S + 1
