@@ -22,13 +22,16 @@ import http.client
 import io
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections import deque
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import layouts
 import preview
@@ -262,20 +265,57 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
 
-def step(board, relay):
+class Dimmer:
+    """Scales what goes to the panel by `level` from `start` until `end` (local time in `tz`, the end
+    itself not dimmed; a window may run past midnight). Spec: HH:MM-HH:MM@LEVEL, e.g. 20:00-07:30@0.25."""
+
+    SPEC = re.compile(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})@(\d(?:\.\d+)?)$")
+
+    def __init__(self, spec, tz):
+        m = self.SPEC.match(spec or "")
+        if not m:
+            raise ValueError(f"dim spec {spec!r} is not HH:MM-HH:MM@LEVEL, for example 20:00-07:30@0.25")
+        h1, m1, h2, m2 = (int(g) for g in m.groups()[:4])
+        if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59:
+            raise ValueError(f"dim spec {spec!r} has a time that is not on the clock")
+        self.start, self.end, self.level = h1 * 60 + m1, h2 * 60 + m2, float(m.group(5))
+        if self.start == self.end:
+            raise ValueError(f"dim spec {spec!r} starts and ends at the same minute")
+        if not 0 < self.level <= 1:
+            raise ValueError(f"dim level {self.level} must be above 0 and at most 1")
+        try:
+            self.tz = ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(f"unknown time zone {tz!r}") from None
+
+    def factor(self, now):
+        local = datetime.fromtimestamp(now, self.tz)
+        minute = local.hour * 60 + local.minute
+        inside = self.start <= minute < self.end if self.start < self.end else minute >= self.start or minute < self.end
+        return self.level if inside else 1.0
+
+
+def dim_image(img, factor):
+    return img.point([int(i * factor + 0.5) for i in range(256)] * 3)
+
+
+def step(board, relay, dimmer=None, now=None):
     board.tick()
     if relay:
-        relay.push(board.frame()[1])
+        frame = board.frame()[1]
+        if dimmer:
+            frame = dim_image(frame, dimmer.factor(time.time() if now is None else now))
+        relay.push(frame)
 
 
-def render_loop(board, relay):
+def render_loop(board, relay, dimmer=None):
     """One step a second for the life of the process. A step that raises is logged once and the
     loop carries on, because a dead thread would leave the panel showing its last numbers."""
     failing = False
     while True:
         started = time.time()
         try:
-            step(board, relay)
+            step(board, relay, dimmer)
             failing = False
         except Exception as err:
             if not failing:
@@ -301,6 +341,9 @@ def main():
     ap.add_argument("--ingest-key-file", default=os.environ.get("BOARD_INGEST_KEY_FILE", "~/.pxt_ingest_key"))
     ap.add_argument("--relay", default=os.environ.get("BOARD_RELAY_URL", ""), help="relay base URL; empty draws previews only")
     ap.add_argument("--relay-key-file", default=os.environ.get("BOARD_RELAY_KEY_FILE", "~/.pxt_relay_key"))
+    ap.add_argument("--dim", default=os.environ.get("BOARD_DIM", ""),
+                    help="HH:MM-HH:MM@LEVEL: scale the panel's frames by LEVEL in that window, e.g. 20:00-07:30@0.25")
+    ap.add_argument("--tz", default=os.environ.get("BOARD_TZ", "UTC"), help="time zone of --dim, e.g. America/New_York")
     args = ap.parse_args()
 
     names = [n.strip() for n in args.nodes.split(",") if n.strip()]
@@ -311,9 +354,14 @@ def main():
         raise SystemExit(f"unknown layout {args.layout!r}")
     Handler.board, Handler.key = board, read_key(args.ingest_key_file)
     relay = Relay(args.relay, read_key(args.relay_key_file)) if args.relay else None
-    threading.Thread(target=render_loop, args=(board, relay), daemon=True).start()
+    try:
+        dimmer = Dimmer(args.dim, args.tz) if args.dim else None
+    except ValueError as err:
+        raise SystemExit(str(err))
+    threading.Thread(target=render_loop, args=(board, relay, dimmer), daemon=True).start()
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
-    print(f"board on {args.bind}:{args.port}, nodes {board.names}, relay {args.relay or 'off'}", flush=True)
+    print(f"board on {args.bind}:{args.port}, nodes {board.names}, relay {args.relay or 'off'}, "
+          f"dim {args.dim or 'off'} {args.tz if args.dim else ''}".rstrip(), flush=True)
     srv.serve_forever()
 
 
