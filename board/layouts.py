@@ -90,16 +90,18 @@ def dim(color, k=0.35):
 
 def shown(node, key, color):
     """(text, colour) for a rate. A busy node shows its live figure, and 0 when that phase has stopped:
-    a request's average is history, and showing it while the node works reads as a live number. An idle
-    node shows its last request's average dimmed, else dashes. A node that is not reporting shows dashes."""
+    a request's average is history, and showing it while the node works reads as a live number. The zero is the
+    metric's own colour dimmed, not grey: grey at the night-dimming level is close to black on the panel. An idle
+    node shows its last request's average dimmed while it is fresh, else 0. Dashes mean no data: a node that is
+    not reporting, or one whose agent sent no figure."""
     if not node.fresh:
         return "--", DIM
     live, last = getattr(node, key), getattr(node, key + "_last")
     if live:
         return rate(live), color
-    if node.state == LIVE:
-        return ("--", DIM) if live is None else ("0", DIM)
-    return (rate(last), dim(color, 0.6)) if last else ("--", DIM)
+    if node.state != LIVE and last:
+        return rate(last), dim(color, 0.6)
+    return ("--", DIM) if live is None else ("0", dim(color, 0.6))
 
 
 class Canvas:
@@ -252,7 +254,7 @@ def total_history(nodes):
 
 
 def total_text(value, color):
-    return ("D" if color == DEC_C else "P") + (rate(value) if value else "0"), color if value else DIM
+    return ("D" if color == DEC_C else "P") + (rate(value) if value else "0"), color if value else dim(color, 0.6)
 
 
 def area(c, x, y, w, h, samples, peak, color):
