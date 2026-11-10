@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 
 LOOP_S = 1.0
+TP_POLL_S = 5.0   # how often to look for a tensor-parallel worker process
 NAMES = re.compile(r"^[a-z0-9._-]{1,16}$")
 
 
@@ -190,6 +191,7 @@ def main():
         raise SystemExit("--name must be 1-16 characters of a-z 0-9 . _ -")
     key = read_key(args.key_file)
     rates = Rates()
+    tp, tp_next = tp_role([]), 0.0
     failing = False
     while True:
         started = time.time()
@@ -197,7 +199,9 @@ def main():
             used, total = memory()
             body = report(args.name, rates.update(fetch_metrics(args.metrics), started), used, total,
                           gpu_percent())
-            body.update(tp_role(process_commands()))
+            if started >= tp_next:
+                tp, tp_next = tp_role(process_commands()), started + TP_POLL_S
+            body.update(tp)
             post(args.board, key, body)
             if failing:
                 print("board reachable again", flush=True)
