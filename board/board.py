@@ -22,13 +22,16 @@ import http.client
 import io
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections import deque
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import layouts
 import preview
@@ -73,6 +76,9 @@ class Board:
                   "mem_total_gb": number(body.get("mem_total_gb")),
                   "running": number(body.get("running"))}
         report.update({k: number(body.get(k)) for k in RATE_FIELDS})
+        follows = body.get("follows")
+        report["worker"] = body.get("worker") is True
+        report["follows"] = follows if follows in self.names else None
         with self.lock:
             self.reports[name] = report
             self.seen[name] = self.clock()
@@ -81,7 +87,26 @@ class Board:
     def nodes(self):
         now = self.clock()
         with self.lock:
-            return [self._view(n, now) for n in self.names]
+            views = [self._view(n, now) for n in self.names]
+            self._mirror(views)
+            return views
+
+    def _mirror(self, views):
+        """A tensor-parallel worker has no server of its own, so it reports no tokens, yet every rank
+        decodes every token. Its view shows its leader's rates and state instead: the node it names, or
+        else the busiest fresh node that is not a worker. A worker never follows a worker or itself."""
+        by_name = {v.name: v for v in views}
+        is_worker = {n: bool((self.reports.get(n) or {}).get("worker")) for n in self.names}
+        servers = [v for v in views if v.fresh and not is_worker[v.name]]
+        for v in views:
+            if not is_worker[v.name] or not v.fresh:
+                continue
+            named = self.reports[v.name]["follows"]
+            lead = by_name.get(named) if named else max(servers, key=lambda s: s.activity, default=None)
+            if lead is None or not lead.fresh or is_worker[lead.name]:
+                continue
+            v.dec, v.pre, v.dec_last, v.pre_last = lead.dec, lead.pre, lead.dec_last, lead.pre_last
+            v.state, v.tp = lead.state, lead.name
 
     def _view(self, name, now):
         node = Node(name, hist=list(self.hist[name]))
@@ -108,7 +133,7 @@ class Board:
         """Append every fresh node's sample to its history; call once a second."""
         for n in self.nodes():
             if n.fresh:
-                self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0))
+                self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0, 0.0 if n.tp else n.dec or 0.0))
 
     def layout(self, now=None):
         if self.pinned != "auto":
@@ -262,20 +287,57 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
 
-def step(board, relay):
+class Dimmer:
+    """Scales what goes to the panel by `level` from `start` until `end` (local time in `tz`, the end
+    itself not dimmed; a window may run past midnight). Spec: HH:MM-HH:MM@LEVEL, e.g. 20:00-07:30@0.25."""
+
+    SPEC = re.compile(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})@(\d(?:\.\d+)?)$")
+
+    def __init__(self, spec, tz):
+        m = self.SPEC.match(spec or "")
+        if not m:
+            raise ValueError(f"dim spec {spec!r} is not HH:MM-HH:MM@LEVEL, for example 20:00-07:30@0.25")
+        h1, m1, h2, m2 = (int(g) for g in m.groups()[:4])
+        if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59:
+            raise ValueError(f"dim spec {spec!r} has a time that is not on the clock")
+        self.start, self.end, self.level = h1 * 60 + m1, h2 * 60 + m2, float(m.group(5))
+        if self.start == self.end:
+            raise ValueError(f"dim spec {spec!r} starts and ends at the same minute")
+        if not 0 < self.level <= 1:
+            raise ValueError(f"dim level {self.level} must be above 0 and at most 1")
+        try:
+            self.tz = ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(f"unknown time zone {tz!r}") from None
+
+    def factor(self, now):
+        local = datetime.fromtimestamp(now, self.tz)
+        minute = local.hour * 60 + local.minute
+        inside = self.start <= minute < self.end if self.start < self.end else minute >= self.start or minute < self.end
+        return self.level if inside else 1.0
+
+
+def dim_image(img, factor):
+    return img.point([int(i * factor + 0.5) for i in range(256)] * 3)
+
+
+def step(board, relay, dimmer=None, now=None):
     board.tick()
     if relay:
-        relay.push(board.frame()[1])
+        frame = board.frame()[1]
+        if dimmer:
+            frame = dim_image(frame, dimmer.factor(time.time() if now is None else now))
+        relay.push(frame)
 
 
-def render_loop(board, relay):
+def render_loop(board, relay, dimmer=None):
     """One step a second for the life of the process. A step that raises is logged once and the
     loop carries on, because a dead thread would leave the panel showing its last numbers."""
     failing = False
     while True:
         started = time.time()
         try:
-            step(board, relay)
+            step(board, relay, dimmer)
             failing = False
         except Exception as err:
             if not failing:
@@ -301,6 +363,9 @@ def main():
     ap.add_argument("--ingest-key-file", default=os.environ.get("BOARD_INGEST_KEY_FILE", "~/.pxt_ingest_key"))
     ap.add_argument("--relay", default=os.environ.get("BOARD_RELAY_URL", ""), help="relay base URL; empty draws previews only")
     ap.add_argument("--relay-key-file", default=os.environ.get("BOARD_RELAY_KEY_FILE", "~/.pxt_relay_key"))
+    ap.add_argument("--dim", default=os.environ.get("BOARD_DIM", ""),
+                    help="HH:MM-HH:MM@LEVEL: scale the panel's frames by LEVEL in that window, e.g. 20:00-07:30@0.25")
+    ap.add_argument("--tz", default=os.environ.get("BOARD_TZ", "UTC"), help="time zone of --dim, e.g. America/New_York")
     args = ap.parse_args()
 
     names = [n.strip() for n in args.nodes.split(",") if n.strip()]
@@ -311,9 +376,14 @@ def main():
         raise SystemExit(f"unknown layout {args.layout!r}")
     Handler.board, Handler.key = board, read_key(args.ingest_key_file)
     relay = Relay(args.relay, read_key(args.relay_key_file)) if args.relay else None
-    threading.Thread(target=render_loop, args=(board, relay), daemon=True).start()
+    try:
+        dimmer = Dimmer(args.dim, args.tz) if args.dim else None
+    except ValueError as err:
+        raise SystemExit(str(err))
+    threading.Thread(target=render_loop, args=(board, relay, dimmer), daemon=True).start()
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
-    print(f"board on {args.bind}:{args.port}, nodes {board.names}, relay {args.relay or 'off'}", flush=True)
+    print(f"board on {args.bind}:{args.port}, nodes {board.names}, relay {args.relay or 'off'}, "
+          f"dim {args.dim or 'off'} {args.tz if args.dim else ''}".rstrip(), flush=True)
     srv.serve_forever()
 
 
