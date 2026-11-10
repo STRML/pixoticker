@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "server"))
 import agent  # noqa: E402
 import board as boardmod  # noqa: E402
 import layouts  # noqa: E402
+import peaks  # noqa: E402
 import preview  # noqa: E402
 import pxtrelay  # noqa: E402
 
@@ -643,6 +644,212 @@ class AgentTp(unittest.TestCase):
         serve = "/Users/s/.local/bin/mlx-serve --serve --host 0.0.0.0 --port 11234 --metrics"
         other = "/usr/bin/python3 worker.py --coordinator 10.254.12.1:7000"
         self.assertEqual(agent.tp_role([serve, other, ""]), {"worker": False, "follows": None})
+
+
+class PeakLearning(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.p = peaks.Peaks(clock=self.clock)
+
+    def feed(self, key, metric, values):
+        for v in values:
+            self.p.observe(key, metric, v)
+            self.clock.t += 1
+
+    def assertPeak(self, key, metric, seed, want):
+        self.assertAlmostEqual(self.p.get(key, metric, seed), want, delta=0.1)
+
+    def test_the_seed_applies_until_enough_has_been_watched(self):
+        self.feed("studio1/1", "dec", [80.0] * (peaks.LEARN_N + peaks.HOLD - 2))
+        self.assertPeak("studio1/1", "dec", 150.0, 150.0)
+        self.feed("studio1/1", "dec", [80.0])
+        self.assertPeak("studio1/1", "dec", 150.0, 80.0)
+
+    def test_the_learned_peak_is_the_highest_value_that_held(self):
+        self.feed("a/1", "dec", [50.0] * 70 + [90.0, 90.0, 90.0] + [60.0] * 5)
+        self.assertPeak("a/1", "dec", 150.0, 90.0)
+
+    def test_a_spike_shorter_than_the_hold_does_not_set_the_peak(self):
+        self.feed("a/1", "dec", [50.0] * 70 + [400.0, 400.0] + [50.0] * 5)
+        self.assertPeak("a/1", "dec", 150.0, 50.0)
+
+    def test_a_pause_breaks_the_hold(self):
+        self.feed("a/1", "dec", [50.0] * 70 + [400.0, 400.0, 0.0, 400.0, 400.0, 0.0, 400.0])
+        self.assertPeak("a/1", "dec", 150.0, 50.0)
+
+    def test_the_peak_halves_every_half_life(self):
+        self.feed("a/1", "dec", [100.0] * 70)
+        self.clock.t += peaks.HALF_LIFE_S
+        self.assertAlmostEqual(self.p.get("a/1", "dec", 150.0), 50.0, delta=0.2)
+
+    def test_a_new_high_replaces_a_decayed_peak(self):
+        self.feed("a/1", "dec", [100.0] * 70)
+        self.clock.t += peaks.HALF_LIFE_S
+        self.feed("a/1", "dec", [80.0] * 4)
+        self.assertPeak("a/1", "dec", 150.0, 80.0)
+
+    def test_metrics_and_groups_learn_separately(self):
+        self.feed("a/1", "dec", [40.0] * 70)
+        self.feed("a/4", "dec", [150.0] * 70)
+        self.feed("a/1", "pre", [900.0] * 70)
+        self.assertPeak("a/1", "dec", 1.0, 40.0)
+        self.assertPeak("a/4", "dec", 1.0, 150.0)
+        self.assertPeak("a/1", "pre", 1.0, 900.0)
+
+
+class PeakPersistence(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="pxt-peaks-")
+        self.path = os.path.join(self.dir, "peaks.json")
+        self.clock = Clock()
+
+    def learned(self):
+        p = peaks.Peaks(self.path, clock=self.clock)
+        for _ in range(peaks.LEARN_N + 5):
+            p.observe("studio1/4", "dec", 77.0)
+            self.clock.t += 1
+        return p
+
+    def test_a_saved_peak_survives_a_restart(self):
+        p = self.learned()
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertTrue(p.save_if_due())
+        again = peaks.Peaks(self.path, clock=self.clock)
+        self.assertAlmostEqual(again.get("studio1/4", "dec", 150.0), 77.0, delta=0.1)
+
+    def test_saving_is_rate_limited_and_only_when_something_changed(self):
+        p = self.learned()
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertTrue(p.save_if_due())
+        self.assertFalse(p.save_if_due())
+        p.observe("studio1/4", "dec", 77.0)
+        self.assertFalse(p.save_if_due())
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertTrue(p.save_if_due())      # the observation above changed it
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertFalse(p.save_if_due())     # nothing since: no write
+
+    def test_a_corrupt_or_foreign_file_is_ignored_not_fatal(self):
+        bodies = ("not json", "[]", '{"peaks": {"a|dec": "x", "b": [1,2,3]}}',
+                  '{"peaks": {"a|dec": [-5, 0, 99]}}', '{"peaks": {"a|dec": [true, 0, 99]}}',
+                  '{"peaks": {"a|dec": [0, 0, 99]}}')
+        for body in bodies:
+            with open(self.path, "w") as f:
+                f.write(body)
+            self.assertEqual(peaks.Peaks(self.path, clock=self.clock).get("a", "dec", 150.0), 150.0, body)
+
+    def test_an_unwritable_path_is_logged_and_does_not_raise(self):
+        p = peaks.Peaks(os.path.join(self.dir, "no", "such", "dir", "peaks.json"), clock=self.clock)
+        for _ in range(peaks.HOLD):
+            p.observe("a", "dec", 5.0)
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertFalse(p.save_if_due())
+
+    def test_the_file_is_replaced_atomically(self):
+        p = self.learned()
+        self.clock.t += peaks.SAVE_EVERY_S
+        p.save_if_due()
+        self.assertEqual(sorted(os.listdir(self.dir)), ["peaks.json"])
+
+
+class BoardPeaks(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.board = boardmod.Board(["studio1", "studio2", "studio3", "studio4"], clock=self.clock,
+                                    peaks=peaks.Peaks(clock=self.clock))
+
+    def run_job(self, dec, seconds, workers=(), idle=()):
+        for _ in range(seconds):
+            self.board.ingest(report("studio1", dec=dec, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            for w in workers:
+                self.board.ingest(report(w, dec=0.0, pre=0.0, running=None, worker=True, follows="studio1"))
+            for w in idle:      # the same boxes once the job has ended: still reporting, no longer workers
+                self.board.ingest(report(w, dec=0.0, pre=0.0, running=0, dec_last=None, pre_last=None,
+                                         dec_last_age=None, pre_last_age=None))
+            self.board.tick()
+            self.clock.t += 1
+
+    def view(self, name):
+        return {n.name: n for n in self.board.nodes()}[name]
+
+    def test_a_solo_node_learns_its_own_peak(self):
+        self.run_job(60.0, peaks.LEARN_N + 10)
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 60.0, delta=0.1)
+
+    def test_the_peak_is_unknown_until_learned(self):
+        self.run_job(60.0, 5)
+        self.assertIsNone(self.view("studio1").dec_peak)
+
+    def test_workers_add_no_observations_of_their_own(self):
+        self.run_job(44.0, peaks.LEARN_N // 2 + peaks.HOLD, workers=("studio2", "studio3", "studio4"))
+        self.assertIsNone(self.view("studio1").dec_peak)
+
+    def test_a_stale_node_carries_no_peak(self):
+        self.run_job(60.0, peaks.LEARN_N + 10)
+        self.clock.t += 60
+        self.assertEqual(self.view("studio1").state, layouts.STALE)
+        self.assertIsNone(self.view("studio1").dec_peak)
+
+    def test_the_render_loop_step_saves_the_peaks_when_due(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(prefix="pxt-state-"), "peaks.json")
+        board = boardmod.Board(["studio1"], clock=self.clock, peaks=peaks.Peaks(path, clock=self.clock))
+        for _ in range(peaks.LEARN_N + 10):
+            board.ingest(report("studio1", dec=50.0, pre=0.0, running=1))
+            boardmod.step(board, None)
+            self.clock.t += 1
+        with open(path) as f:
+            self.assertIn("studio1/1|dec", json.load(f)["peaks"])
+
+    def test_a_tp_group_is_learned_under_its_size_and_workers_share_it(self):
+        self.run_job(44.0, peaks.LEARN_N + 10, workers=("studio2", "studio3", "studio4"))
+        for n in ("studio1", "studio2", "studio3", "studio4"):
+            self.assertAlmostEqual(self.view(n).dec_peak, 44.0, delta=0.1)
+        self.run_job(120.0, peaks.LEARN_N + 10, idle=("studio2", "studio3", "studio4"))
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 120.0, delta=0.1)
+        self.run_job(44.0, 1, workers=("studio2", "studio3", "studio4"))
+        self.assertAlmostEqual(self.view("studio2").dec_peak, 44.0, delta=0.1)
+
+
+class RangeBars(unittest.TestCase):
+    def node(self, dec, pre, dec_peak=None, pre_peak=None, state=layouts.LIVE):
+        return layouts.Node("studio1", state, gpu=80.0, mem=50.0, dec=dec, pre=pre, dec_peak=dec_peak, pre_peak=pre_peak)
+
+    def bar(self, img, colour, x0, x1, y=37):
+        px = img.load()
+        return sum(1 for x in range(x0, x1) if px[x, y] == colour)
+
+    def render(self, node):
+        return layouts.render("focus", [node] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)])
+
+    def test_the_bars_show_the_rate_as_a_fraction_of_its_peak(self):
+        img = self.render(self.node(40.0, 1500.0, dec_peak=200.0, pre_peak=3000.0))
+        self.assertEqual(self.bar(img, layouts.DEC_C, 0, 64), round(layouts.RATE_BAR_W * 0.2))
+        self.assertEqual(self.bar(img, layouts.PRE_C, 64, 128), round(layouts.RATE_BAR_W * 0.5))
+
+    def test_a_rate_above_its_peak_fills_the_bar_and_zero_leaves_it_empty(self):
+        img = self.render(self.node(300.0, 0.0, dec_peak=200.0, pre_peak=3000.0))
+        self.assertEqual(self.bar(img, layouts.DEC_C, 0, 64), layouts.RATE_BAR_W)
+        self.assertEqual(self.bar(img, layouts.PRE_C, 64, 128), 0)
+
+    def test_an_unlearned_peak_uses_the_default_scale(self):
+        img = self.render(self.node(75.0, 1500.0))
+        self.assertEqual(self.bar(img, layouts.DEC_C, 0, 64), round(layouts.RATE_BAR_W * 75.0 / layouts.DEC_FULL))
+        self.assertEqual(self.bar(img, layouts.PRE_C, 64, 128), round(layouts.RATE_BAR_W * 1500.0 / layouts.PRE_FULL))
+
+    def test_the_gpu_and_memory_bars_still_draw_below_the_rate_bars(self):
+        img = self.render(self.node(40.0, 0.0, dec_peak=200.0, pre_peak=3000.0))
+        px = img.load()
+        self.assertEqual(px[2, 40], layouts.GPU_C)
+        self.assertEqual(px[2, 43], layouts.MEM_C)
+
+    def test_an_idle_node_draws_empty_rate_bars(self):
+        n = self.node(0.0, 0.0, dec_peak=200.0, pre_peak=3000.0, state=layouts.IDLE)
+        n.dec_last, n.pre_last = 120.0, 2400.0
+        img = self.render(n)
+        self.assertEqual(self.bar(img, layouts.DEC_C, 0, 64) + self.bar(img, layouts.PRE_C, 64, 128), 0)
 
 
 class AgentRates(unittest.TestCase):

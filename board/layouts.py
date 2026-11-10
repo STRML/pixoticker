@@ -29,7 +29,9 @@ DEC_C = (0, 225, 120)
 PRE_C = (255, 190, 40)
 BAD = (255, 80, 80)
 
-DEC_FULL = 150.0    # tok/s floor of the decode history scale
+DEC_FULL = 150.0    # tok/s floor of the decode history scale, and the focus bar's scale until a peak is learned
+PRE_FULL = 3000.0   # the focus bar's prefill scale until a peak is learned
+RATE_BAR_W = 60     # the focus view's decode and prefill bars
 HIST = 62           # samples a sparkline shows
 MEM_WARN = 85.0
 BAR_X, BAR_W = 32, 10   # spark: the GPU and memory bars beside their numbers
@@ -50,6 +52,8 @@ class Node:
     age: int = 0
     hist: list = field(default_factory=list)   # [(dec, gpu, pre, share), ...] oldest first; share is its part of the cluster decode total
     tp: str | None = None   # a tensor-parallel worker: the node whose rates it shows
+    dec_peak: float | None = None   # the usual peak of each rate, learned by the board; None until it has watched enough
+    pre_peak: float | None = None
 
     @property
     def tag(self):
@@ -326,8 +330,11 @@ def focus(nodes):
         c.text_right(126, 1, f"G{pct(top.gpu)} M{pct(top.mem)}", FG)
         c.big(66, 10, pt, pc, scale=3)
         c.text(66, 30, "PREFILL TOK/S", DIM)
-        c.hbar(1, 38, 126, 2, frac(top.gpu), gc)
-        c.hbar(1, 41, 126, 2, frac(top.mem), mc)
+        live_dec, live_pre = top.dec or 0, top.pre or 0
+        c.hbar(1, 37, RATE_BAR_W, 2, live_dec / (top.dec_peak or DEC_FULL), DEC_C)
+        c.hbar(66, 37, RATE_BAR_W, 2, live_pre / (top.pre_peak or PRE_FULL), PRE_C)
+        c.hbar(1, 40, 126, 2, frac(top.gpu), gc)
+        c.hbar(1, 43, 126, 2, frac(top.mem), mc)
     else:
         c.text(14, 1, status_text(top), BAD if top.state == STALE else DIM)
     c.rect(0, 45, W, 1, RULE)
