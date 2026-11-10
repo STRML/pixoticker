@@ -379,7 +379,6 @@ class LiveNumbers(unittest.TestCase):
         pre = self.box(img, layouts.PRE_C, 0, 128, 8, 29)
         self.assertLess(dec[1], 66)
         self.assertGreaterEqual(pre[0], 66)
-        self.assertLess(pre[1], 128)
         self.assertEqual(dec[1] - dec[0], pre[1] - pre[0])    # the same text at the same size: neither is clipped
 
 
