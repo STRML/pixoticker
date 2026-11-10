@@ -65,8 +65,11 @@ class Node:
 
 
 def rate(v):
+    """At most five characters, so a focus number at scale 3 stays in its half of the panel: no real
+    server nears a million tok/s, and a corrupt report is capped at 999K."""
     if v is None:
         return "--"
+    v = min(v, 999_000)
     if v < 10:
         return f"{v:.1f}"
     if v < 1000:
