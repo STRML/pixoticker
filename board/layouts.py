@@ -220,7 +220,7 @@ def rows(nodes):
             c.text(14, y + 1, f"G{pct(n.gpu)}", gc)
             c.text(34, y + 1, f"M{pct(n.mem)}", mc)
             if t := temp_text(n.temp):
-                c.text(54, y + 1, *t)
+                c.text_right(54 + STAT_W, y + 1, *t)
             dt, dc = shown(n, "dec", DEC_C)
             pt, pc = shown(n, "pre", PRE_C)
             c.text_right(94, y + 1, "D" + dt, dc)

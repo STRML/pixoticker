@@ -485,6 +485,12 @@ class Drawn(unittest.TestCase):
             self.assertEqual(max(shown[layouts.CPU_C]), max(base[layouts.CPU_C]), (watts, cpu))
             self.assertEqual(max(shown[layouts.WATT_C]), max(base[layouts.WATT_C]), (watts, cpu))
 
+    def test_rows_temperature_keeps_its_right_edge_whatever_the_digit_count(self):
+        def right_edge(temp):
+            img = layouts.render("rows", self.nodes(temp=temp))
+            return max(x for x in range(50, 76) for y in range(1, 7) if img.getpixel((x, y)) == layouts.MEM_HOT)
+        self.assertEqual(right_edge(90.0), right_edge(100.0))
+
     def test_rows_bars_stop_short_of_the_stats(self):
         img = layouts.render("rows", self.nodes()).load()
         bars = [(x, y) for x in range(layouts.W) for y in range(layouts.H)
