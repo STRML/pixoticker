@@ -49,6 +49,7 @@ class Node:
     pre_last: float | None = None
     age: int = 0
     hist: list = field(default_factory=list)   # [(dec, gpu), ...] oldest first
+    tp: str | None = None   # a tensor-parallel worker: the node whose rates it shows
 
     @property
     def tag(self):
@@ -225,14 +226,15 @@ def quad(nodes):
 
 
 def totals(nodes):
-    """Cluster-wide live decode and prefill tok/s, summed over the nodes that are reporting."""
-    live = [n for n in nodes[:4] if n.fresh]
+    """Cluster-wide live decode and prefill tok/s, summed over the nodes that are reporting.
+    A tensor-parallel worker shows its leader's rates, so it is left out: each token counts once."""
+    live = [n for n in nodes[:4] if n.fresh and n.tp is None]
     return sum(n.dec or 0 for n in live), sum(n.pre or 0 for n in live)
 
 
 def total_history(nodes):
     """Decode tok/s of all reporting nodes added up, newest sample last."""
-    series = [n.hist for n in nodes[:4] if n.fresh]
+    series = [n.hist for n in nodes[:4] if n.fresh and n.tp is None]
     width = max((len(h) for h in series), default=0)
     out = [0.0] * width
     for h in series:

@@ -78,6 +78,14 @@ Each agent reads the local `/metrics.json` once a second and posts one small JSO
 last request's average, dimmed, until it is 30 s old (`LAST_S`), then `--`. The agent reports each average with its age (`dec_last_age`, `pre_last_age`), so the clocks of the Studios and the board need not agree, and an average with no age is not shown (an agent older than this change shows `--` there until it is updated). A node that stops reporting for 10 s turns grey with `STALE`, so a dead
 agent never leaves old numbers on the panel. A node that never reported shows `--`.
 
+**Tensor parallel.** Only rank 0 runs an HTTP server, so only it has token counters; the other ranks run
+`mlx-serve worker ... --coordinator 10.254.<ab>.<n>:<port>` and would show idle while their GPUs work. An agent
+that finds such a process reports `worker: true` and `follows: studio<n>` (the last octet of rank 0's cable
+address is rank 0's Studio number). The board then shows rank 0's live rates, last averages and state on each
+worker, since every rank decodes every token, and leaves the workers out of the `ALL` totals so a token counts
+once. A worker whose coordinator is off the mesh follows the busiest node that is not a worker. A worker never
+follows a worker, and one whose leader has gone stale shows its own numbers.
+
 ```sh
 python3 board/preview.py --out sheet.png                       # every layout x busy, prefill, degraded
 python3 board/board.py --port 18101 --ingest-key-file ~/.pxt_ingest_key   # gallery on :18101

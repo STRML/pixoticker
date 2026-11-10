@@ -24,6 +24,31 @@ LOOP_S = 1.0
 NAMES = re.compile(r"^[a-z0-9._-]{1,16}$")
 
 
+WORKER = re.compile(r"(?:^|/)mlx-serve\S*\s+worker\b")
+COORDINATOR = re.compile(r"--coordinator\s+(\d+)\.(\d+)\.(\d+)\.(\d+):\d+")
+
+
+def tp_role(commands):
+    """Is this box a tensor-parallel worker, and whose? A worker is `mlx-serve worker ... --coordinator
+    10.254.<ab>.<n>:<port>`: it serves no HTTP, so it has no counters. On the Thunderbolt mesh the last
+    octet of rank 0's cable address is rank 0's Studio number, which names the node whose rates it shares."""
+    for line in commands:
+        if not WORKER.search(line):
+            continue
+        m = COORDINATOR.search(line)
+        mesh = m and (m.group(1), m.group(2)) == ("10", "254")
+        return {"worker": True, "follows": f"studio{m.group(4)}" if mesh else None}
+    return {"worker": False, "follows": None}
+
+
+def process_commands():
+    try:
+        out = subprocess.run(["ps", "-Ao", "command"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return out.splitlines()
+
+
 def read_key(path):
     with open(os.path.expanduser(path)) as f:
         key = f.read().strip()
@@ -172,6 +197,7 @@ def main():
             used, total = memory()
             body = report(args.name, rates.update(fetch_metrics(args.metrics), started), used, total,
                           gpu_percent())
+            body.update(tp_role(process_commands()))
             post(args.board, key, body)
             if failing:
                 print("board reachable again", flush=True)

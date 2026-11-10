@@ -328,6 +328,96 @@ class EndToEnd(unittest.TestCase):
         self.board.pin("rows")
 
 
+class TpMirror(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.board = boardmod.Board(["studio1", "studio2", "studio3", "studio4"], clock=self.clock)
+
+    def leader(self, **kw):
+        self.board.ingest(report("studio1", running=1, **kw))
+
+    def worker(self, name, follows="studio1", **kw):
+        body = report(name, dec=0.0, pre=0.0, dec_last=None, pre_last=None, dec_last_age=None,
+                      pre_last_age=None, worker=True, follows=follows)
+        body.update(kw)
+        self.board.ingest(body)
+
+    def view(self, name):
+        return {n.name: n for n in self.board.nodes()}[name]
+
+    def test_a_worker_shows_its_leaders_live_rates_and_state(self):
+        self.leader(dec=118.4, pre=2400.0)
+        self.worker("studio2")
+        n = self.view("studio2")
+        self.assertEqual((n.dec, n.pre, n.state, n.tp), (118.4, 2400.0, layouts.LIVE, "studio1"))
+        self.assertEqual((n.dec_last, n.pre_last), (50.0, 2000.0))
+
+    def test_the_cluster_total_counts_each_token_once(self):
+        self.leader(dec=100.0, pre=3000.0)
+        self.worker("studio2")
+        self.worker("studio3")
+        self.assertEqual(layouts.totals(self.board.nodes()), (100.0, 3000.0))
+
+    def test_the_total_history_skips_mirrored_nodes(self):
+        self.leader(dec=100.0)
+        self.worker("studio2")
+        self.board.tick()
+        self.board.tick()
+        self.assertEqual(layouts.total_history(self.board.nodes()), [100.0, 100.0])
+
+    def test_without_a_named_leader_the_busiest_serving_node_leads(self):
+        self.leader(dec=90.0)
+        self.board.ingest(report("studio3", dec=0.0, pre=0.0, running=0, dec_last_age=None, pre_last_age=None))
+        self.worker("studio2", follows=None)
+        self.assertEqual((self.view("studio2").dec, self.view("studio2").tp), (90.0, "studio1"))
+
+    def test_a_stale_leader_leaves_the_worker_on_its_own_numbers(self):
+        self.leader(dec=90.0)
+        self.clock.t += 60
+        self.worker("studio2")
+        n = self.view("studio2")
+        self.assertEqual((n.dec, n.tp), (0.0, None))
+
+    def test_a_worker_never_follows_a_worker_or_itself(self):
+        self.worker("studio2", follows="studio3")
+        self.worker("studio3", follows="studio2")
+        self.worker("studio4", follows="studio4")
+        self.assertEqual([self.view(n).tp for n in ("studio2", "studio3", "studio4")], [None, None, None])
+
+    def test_a_node_that_is_not_a_worker_ignores_follows(self):
+        self.leader(dec=90.0)
+        self.board.ingest(report("studio2", dec=7.0, running=1, follows="studio1"))
+        n = self.view("studio2")
+        self.assertEqual((n.dec, n.tp), (7.0, None))
+
+    def test_junk_follows_is_dropped(self):
+        self.leader(dec=90.0)
+        self.worker("studio2", follows="../../etc")
+        self.worker("studio3", follows=7)
+        self.assertEqual((self.view("studio2").tp, self.view("studio3").tp), ("studio1", "studio1"))
+
+
+class AgentTp(unittest.TestCase):
+    WORKER = ("/Users/s/opt/mlx-serve-main/zig-out/bin/mlx-serve-main worker --rank 1 --size 2 "
+              "--coordinator 10.254.12.1:7000 --device rdma_en5 --model-dir /Users/s/models-big")
+
+    def test_a_worker_process_names_the_leader_by_its_cable_address(self):
+        self.assertEqual(agent.tp_role([self.WORKER]), {"worker": True, "follows": "studio1"})
+
+    def test_the_last_octet_of_the_coordinator_is_the_leaders_studio_number(self):
+        line = self.WORKER.replace("10.254.12.1", "10.254.34.3")
+        self.assertEqual(agent.tp_role([line])["follows"], "studio3")
+
+    def test_a_coordinator_off_the_mesh_still_marks_a_worker(self):
+        line = self.WORKER.replace("10.254.12.1", "192.168.86.151")
+        self.assertEqual(agent.tp_role([line]), {"worker": True, "follows": None})
+
+    def test_a_server_or_unrelated_process_is_not_a_worker(self):
+        serve = "/Users/s/.local/bin/mlx-serve --serve --host 0.0.0.0 --port 11234 --metrics"
+        other = "/usr/bin/python3 worker.py --coordinator 10.254.12.1:7000"
+        self.assertEqual(agent.tp_role([serve, other, ""]), {"worker": False, "follows": None})
+
+
 class AgentRates(unittest.TestCase):
     def metrics(self, gen, pl, gen_total, pre_total, dec_s, pre_s, start=1, running=1):
         return {"gauges": {"process_start_time_seconds": start, "generation_tokens_live": gen,
