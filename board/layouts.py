@@ -227,7 +227,7 @@ def rows(nodes):
         gc, mc = bar_colors(n)
         c.text(1, y + 1, n.tag, FG if n.fresh else DIM)
         if n.fresh:
-            draw_stats(c, 10, y + 1, loads(n))
+            draw_stats(c, 12, y + 1, loads(n))
             dt, dc = shown(n, "dec", DEC_C)
             pt, pc = shown(n, "pre", PRE_C)
             c.text_right(94, y + 1, "D" + dt, dc)

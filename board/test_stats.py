@@ -486,7 +486,14 @@ class Drawn(unittest.TestCase):
     def test_rows_draw_cpu_between_gpu_and_memory_in_the_number_row(self):
         diff = self.changed("rows", cpu=100.0)
         self.assertTrue(diff)
-        self.assertTrue(all(30 <= x <= 50 and y % 16 in range(1, 7) for x, y in diff), diff[:6])
+        self.assertTrue(all(32 <= x <= 52 and y % 16 in range(1, 7) for x, y in diff), diff[:6])
+
+    def test_rows_gpu_label_clears_a_three_character_tag_even_at_100_percent(self):
+        nodes = [layouts.Node("studio10", layouts.LIVE, gpu=100.0, mem=50.0, dec=10.0, pre=0.0)]
+        img = layouts.render("rows", nodes)
+        tag = [x for x in range(layouts.W) for y in range(1, 7) if img.getpixel((x, y)) == layouts.FG]
+        gpu = [x for x in range(layouts.W) for y in range(1, 7) if img.getpixel((x, y)) == layouts.GPU_C]
+        self.assertLess(max(tag), min(gpu))
 
     def test_rows_stat_columns_hold_still_whatever_the_digit_counts(self):
         def right_edges(temp, watts, cpu):
@@ -534,7 +541,7 @@ class Drawn(unittest.TestCase):
 
     def test_gpu_and_memory_labels_are_drawn_whole_at_every_width_in_every_layout(self):
         """The label's own pixels, and nothing else, fill its box: a bar, a rate or a neighbour reaching into it fails."""
-        places = {"rows": (("r", 30, 1), ("r", 70, 1)), "cols": (("l", 3, 37), ("l", 3, 44)),
+        places = {"rows": (("r", 32, 1), ("r", 72, 1)), "cols": (("l", 3, 37), ("l", 3, 44)),
                   "quad": (("r", 22, 22), ("r", 62, 22)), "spark": (("l", 14, 9), ("l", 14, 15)),
                   "focus": (("r", 86, 39), ("r", 126, 39))}
         for gpu, mem, text in ((88.0, 71.0, ("G88%", "M71%")), (5.0, 5.0, ("G05%", "M05%")), (100.0, 100.0, ("G100%", "M100%"))):
