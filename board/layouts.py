@@ -171,15 +171,21 @@ def cpu_text(cpu):
     return None if cpu is None else (f"{cpu:.0f}%", CPU_C)
 
 
+STAT_W = 4 * font.ADVANCE   # the widest figure: 999W, 100%, 100C
+STAT_GAP = 4
+
+
 def stats_width(parts):
-    parts = [p for p in parts if p]
-    return sum(font.width(text) for text, _ in parts) + 4 * max(0, len(parts) - 1)
+    return len(parts) * STAT_W + STAT_GAP * max(0, len(parts) - 1)
 
 
 def draw_stats(c, x, y, parts):
-    """The given (text, colour) parts left to right from x, a space apart; absent parts are skipped."""
-    for part in (p for p in parts if p):
-        x = c.text(x, y, *part) + 4
+    """The given (text, colour) parts left to right from x, each right-aligned in its own slot, so a figure gaining
+    or losing a digit never moves its neighbours. An absent part leaves its slot empty."""
+    for part in parts:
+        if part:
+            c.text_right(x + STAT_W, y, *part)
+        x += STAT_W + STAT_GAP
     return x
 
 
@@ -214,7 +220,7 @@ def rows(nodes):
             c.text(14, y + 1, f"G{pct(n.gpu)}", gc)
             c.text(34, y + 1, f"M{pct(n.mem)}", mc)
             if t := temp_text(n.temp):
-                c.text(54, y + 1, *t)
+                c.text_right(54 + STAT_W, y + 1, *t)
             dt, dc = shown(n, "dec", DEC_C)
             pt, pc = shown(n, "pre", PRE_C)
             c.text_right(94, y + 1, "D" + dt, dc)
