@@ -15,6 +15,7 @@ URL="${PXT_RELAY_URL:-}"
 KEYVAL="${PXT_RELAY_KEY:-}"
 RELAY_HOST="${PXT_RELAY_HOST:-}"
 SETTLE="${PXT_SETTLE:-60}"  # seconds the new build must hold before success
+FW_REMOTE="${PXT_RELAY_FW:-firmware/pxt.bin}"  # where the relay reads the image, relative to the ssh home or absolute
 BIN=".pio/build/esp32dev/firmware.bin"
 cd "$(dirname "$0")/.."
 
@@ -23,7 +24,11 @@ cd "$(dirname "$0")/.."
 [ -n "$KEYVAL" ] || { echo "set PXT_RELAY_KEY"; exit 1; }
 [ -n "$RELAY_HOST" ] || { echo "set PXT_RELAY_HOST: an image built without it never dials out"; exit 1; }
 
-PLATFORMIO_BUILD_FLAGS="-DPXT_RELAY_HOST=\\\"${RELAY_HOST}\\\" -DPXT_RELAY_KEY=\\\"${KEYVAL}\\\"" pio run -e esp32dev >/dev/null
+# SCons rebuilds by content hash, so an unchanged tree would reuse the last image with the same
+# build string, and the panel could not tell this publish from what it already runs. A stamp in
+# the flags changes the command line, which forces a full rebuild and a fresh build string.
+STAMP="$(date +%s)"
+PLATFORMIO_BUILD_FLAGS="-DPXT_RELAY_HOST=\\\"${RELAY_HOST}\\\" -DPXT_RELAY_KEY=\\\"${KEYVAL}\\\" -DPXT_PUBLISH_STAMP=${STAMP}" pio run -e esp32dev >/dev/null
 
 [ "${#KEYVAL}" -ge 16 ] || { echo "key too short"; exit 1; }
 grep -a -q -F -- "$KEYVAL" "$BIN" || { echo "refusing: relay key is not embedded in $BIN"; exit 1; }
@@ -31,8 +36,9 @@ grep -a -q -F -- "$KEYVAL" "$BIN" || { echo "refusing: relay key is not embedded
 SIZE=$(wc -c < "$BIN" | tr -d " ")
 SHA=$(shasum -a 256 "$BIN" | awk '{print $1}')
 
-ssh "$SSH_HOST" 'mkdir -p ~/firmware'
-scp -q "$BIN" "$SSH_HOST:firmware/pxt.bin"
+# One ssh with the image on stdin: a Synology has no sftp, so scp fails there. The image lands
+# beside its final name and is renamed into place, so a panel mid-download never reads a half file.
+ssh "$SSH_HOST" "mkdir -p \"\$(dirname \"$FW_REMOTE\")\" && cat > \"$FW_REMOTE.new\" && mv \"$FW_REMOTE.new\" \"$FW_REMOTE\"" < "$BIN"
 
 served=$(curl -sSf -m 30 -D - -o /dev/null -H "X-Api-Key: ${KEYVAL}" \
   "$URL/fw" | tr -d '\r' | awk 'tolower($1)=="x-firmware-sha256:"{print $2}')

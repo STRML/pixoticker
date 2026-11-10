@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -35,6 +36,7 @@ OP_MAX_BYTES = 180  # firmware op buffer is 224 bytes
 OP_TTL = 900        # an op older than this belongs to nobody
 STREAM_FPS = 4
 FW_PATH = os.path.expanduser("~/firmware/pxt.bin")
+RANGE = re.compile(r"^bytes=(\d+)-(\d*)$")
 
 
 def rle565(raw):
@@ -166,13 +168,37 @@ class Handler(BaseHTTPRequestHandler):
                 body = f.read()
         except OSError:
             return self._json(404, {"error": "no firmware"})
-        self.send_response(200)
+        size = len(body)
+        start, end = 0, size - 1
+        code = 200
+        # A panel whose download dies partway reconnects and asks for the rest.
+        # One range, "bytes=N-" or "bytes=N-M"; anything else gets the whole file.
+        m = RANGE.match(self.headers.get("Range", "").strip())
+        if m:
+            first = int(m.group(1))
+            last = int(m.group(2)) if m.group(2) else size - 1
+            if first >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if last >= first:
+                start, end, code = first, min(last, size - 1), 206
+        part = body[start:end + 1]
+        self.send_response(code)
         self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(part)))
+        self.send_header("Accept-Ranges", "bytes")
+        if code == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("X-Firmware-Sha256", hashlib.sha256(body).hexdigest())
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(part)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the panel hung up mid-download; it will ask again from where it stopped
 
     def _stream(self, last, op_since=0, enc="raw"):
         # The panel reports itself on the request rather than opening a second
@@ -186,7 +212,7 @@ class Handler(BaseHTTPRequestHandler):
                 raw = json.loads(state)
                 dev = {k: v for k, v in raw.items()
                        if k in ("build", "uptime", "heap", "maxblock", "frames",
-                                "errors", "phase", "rssi", "tls")
+                                "errors", "phase", "rssi", "tls", "ota")
                        and isinstance(v, (int, str)) and len(str(v)) < 48}
                 dev["_seen"] = int(time.time())
                 # The header is frozen at connect, so its frame count stays at
@@ -339,11 +365,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global FW_PATH
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18100)
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--key-file", default=os.path.expanduser("~/.pxt_relay_key"))
+    ap.add_argument("--firmware", default=FW_PATH, help="image served at /fw")
     args = ap.parse_args()
+    FW_PATH = os.path.expanduser(args.firmware)
 
     try:
         with open(args.key_file) as f:

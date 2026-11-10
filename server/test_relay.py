@@ -6,6 +6,7 @@ the panel and the tools do, and print one PASS/FAIL line per check.
 
 Stdlib only. Nothing leaves the machine; the key is random per run.
 """
+import hashlib
 import http.client
 import json
 import os
@@ -122,11 +123,68 @@ def http11():
           head.startswith("HTTP/1.1 200") and "Transfer-Encoding: chunked" in head)
 
 
+FW = bytes((i * 7 + 3) % 256 for i in range(5000))
+
+
+def fw_get(rng=None):
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=5)
+    headers = {"X-Api-Key": KEY}
+    if rng:
+        headers["Range"] = rng
+    c.request("GET", "/fw", headers=headers)
+    r = c.getresponse()
+    body = r.read()
+    out = (r.status, r.getheaders(), body)
+    c.close()
+    return out
+
+
+def header(headers, name):
+    return next((v for k, v in headers if k.lower() == name), None)
+
+
+def firmware_ranges():
+    # A panel whose download dies partway reconnects and asks for the rest.
+    status, headers, body = fw_get()
+    check("a whole firmware download is a 200 that advertises ranges",
+          status == 200 and body == FW and header(headers, "accept-ranges") == "bytes",
+          f"status={status}")
+    status, headers, body = fw_get("bytes=1000-")
+    check("Range: bytes=N- resumes at N with a 206 and a Content-Range",
+          status == 206 and body == FW[1000:] and header(headers, "content-range") == "bytes 1000-4999/5000"
+          and header(headers, "content-length") == "4000", f"status={status} len={len(body)}")
+    status, headers, body = fw_get("bytes=100-199")
+    check("Range: bytes=N-M returns exactly that slice",
+          status == 206 and body == FW[100:200] and header(headers, "content-range") == "bytes 100-199/5000")
+    status, headers, body = fw_get("bytes=4000-9999")
+    check("a range past the end is clipped to the end",
+          status == 206 and body == FW[4000:] and header(headers, "content-range") == "bytes 4000-4999/5000")
+    status, headers, body = fw_get("bytes=5000-")
+    check("a range that starts past the end is a 416 that names the size",
+          status == 416 and header(headers, "content-range") == "bytes */5000", f"status={status}")
+    status, headers, body = fw_get("bytes=abc-")
+    check("an unreadable Range header is ignored, not an error", status == 200 and body == FW, f"status={status}")
+    status, headers, body = fw_get("bytes=0-99,200-299")
+    check("several ranges are not supported and get the whole file", status == 200 and body == FW)
+    check("the firmware hash header is on a ranged reply too",
+          header(fw_get("bytes=10-")[1], "x-firmware-sha256") == hashlib.sha256(FW).hexdigest())
+
+
+def ota_state():
+    stream(json.dumps({"build": "b2", "ota": "ranged 65536/1153312 closed", "evil": "x"}))
+    time.sleep(0.5)
+    check("X-Pxt-State carries the panel's last download note",
+          req("/device").get("ota") == "ranged 65536/1153312 closed")
+
+
 def main():
-    with tempfile.NamedTemporaryFile("w", suffix=".key") as kf:
+    with tempfile.NamedTemporaryFile("w", suffix=".key") as kf, tempfile.NamedTemporaryFile(suffix=".bin") as fwf:
         kf.write(KEY)
         kf.flush()
-        proc = subprocess.Popen([sys.executable, RELAY, "--port", str(PORT), "--key-file", kf.name],
+        fwf.write(FW)
+        fwf.flush()
+        proc = subprocess.Popen([sys.executable, RELAY, "--port", str(PORT), "--key-file", kf.name,
+                                 "--firmware", fwf.name],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             for _ in range(50):
@@ -138,6 +196,8 @@ def main():
             device_state()
             sent_counter()
             http11()
+            firmware_ranges()
+            ota_state()
         finally:
             proc.terminate()
             proc.wait()

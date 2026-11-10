@@ -245,6 +245,10 @@ static bool clockReady() {
 // The panel only dials out. Rather than open a second TLS session just to
 // report itself (the handshake needs a contiguous block the pull already
 // holds), the state rides the pull request as a header the relay stores.
+// What the last firmware download did, for the relay's /device: with no serial cable it is
+// the only way to see why one failed. Fixed words and numbers only; it goes into JSON as is.
+static char s_ota_note[48] = "";
+
 static String stateHeader() {
   String j = "{\"build\":\"" + String(__DATE__ " " __TIME__) +
              "\",\"uptime\":" + String(millis() / 1000) +
@@ -254,7 +258,9 @@ static String stateHeader() {
              ",\"errors\":" + String((uint32_t)s_pull_errors) +
              ",\"phase\":\"" + String(s_pull_phase) + "\"" +
              ",\"rssi\":" + String(WiFi.RSSI()) +
-             ",\"tls\":\"" + String(s_tls_insecure ? "insecure" : "verified") + "\"}";
+             ",\"tls\":\"" + String(s_tls_insecure ? "insecure" : "verified") + "\"";
+  if (s_ota_note[0]) j += String(",\"ota\":\"") + s_ota_note + "\"";
+  j += "}";
   return j;
 }
 
@@ -499,8 +505,36 @@ static void handleTest() {
 
 // ---------------------------------------------------------------- OTA
 
+// The Updater is one global session, shared by the /u upload (web task) and the relay download
+// (pull task). Whoever holds the token owns the session. The other side refuses to start and makes
+// no Update call, so neither can write into, commit or abort the other's image.
+enum UpdOwner : uint8_t { UPD_NONE = 0, UPD_RELAY = 1, UPD_UPLOAD = 2 };
+static volatile uint8_t s_upd_owner = UPD_NONE;
+static portMUX_TYPE s_upd_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_up_mine = false;  // the /u upload in progress holds the token
+static bool s_up_busy = false;  // the /u upload in progress was refused because a download holds it
+
+static bool updTake(uint8_t who) {
+  bool got;
+  portENTER_CRITICAL(&s_upd_mux);
+  got = (s_upd_owner == UPD_NONE);
+  if (got) s_upd_owner = who;
+  portEXIT_CRITICAL(&s_upd_mux);
+  return got;
+}
+
+static void updRelease(uint8_t who) {
+  portENTER_CRITICAL(&s_upd_mux);
+  if (s_upd_owner == who) s_upd_owner = UPD_NONE;
+  portEXIT_CRITICAL(&s_upd_mux);
+}
+
 static void handleUpdateDone() {
-  Serial.printf("[ota] done ok=%d written=%u error=%d\n", s_ota_ok, s_ota_written, Update.hasError());
+  Serial.printf("[ota] done ok=%d written=%u busy=%d\n", s_ota_ok, s_ota_written, s_up_busy);
+  if (s_up_busy) {
+    s_http.send(409, "text/plain", "busy: a firmware download from the relay is running, try again in a few minutes");
+    return;
+  }
   if (!s_ota_ok || Update.hasError()) {
     s_http.send(500, "text/plain", String("update failed: ") + (s_ota_written ? Update.errorString() : "no upload received"));
     return;
@@ -515,15 +549,33 @@ static void otaChunk(HTTPUpload &up) {
   if (up.status == UPLOAD_FILE_START) {
     s_ota_ok = false;
     s_ota_written = 0;
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+    s_up_mine = false;
+    s_up_busy = false;
+    if (!updTake(UPD_UPLOAD)) {
+      s_up_busy = true;
+      Serial.println("[ota] /u refused: a download owns the updater");
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+      updRelease(UPD_UPLOAD);
+      return;
+    }
+    s_up_mine = true;
+  } else if (!s_up_mine) {
+    return;  // refused or failed to begin: touch nothing in a session that is not ours
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_END) {
     s_ota_written = up.totalSize + up.currentSize;
     s_ota_ok = Update.end(true);
     if (!s_ota_ok) Update.printError(Serial);
+    s_up_mine = false;
+    updRelease(UPD_UPLOAD);
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     Update.end();
+    s_up_mine = false;
+    updRelease(UPD_UPLOAD);
   }
 }
 
@@ -660,6 +712,11 @@ static bool readLine(WiFiClient &c, char *out, size_t cap, uint32_t ms) {
 
 
 // ---------------------------------------------------------------- firmware update
+// Off the task stack: mbedtls needs most of the 12 KB, and a 4 KB local here
+// is what overflowed the old 8 KB pull task and killed the display. The stream
+// loop and the download take turns with it, never together.
+static uint8_t s_rx[4096];
+
 // The panel has no inbound port, so a fix ships as a key-authenticated download:
 // the op carries the file's size and SHA-256, and nothing is committed unless
 // both match.
@@ -674,44 +731,132 @@ static String jsonStr(const char *js, const char *key) {
   return String(p).substring(0, e - p);
 }
 
-static bool otaFrom(const String &path, size_t want, const String &shaHex) {
+static void otaNote(const char *what, size_t total, size_t want) {
+  snprintf(s_ota_note, sizeof(s_ota_note), "%s %u/%u", what, (unsigned)total, (unsigned)want);
+  Serial.printf("[ota] %s\n", s_ota_note);
+}
+
+// A resume that fails this many times in a row without adding a byte gives up.
+static const int OTA_MAX_STALLS = 6;
+static const uint32_t OTA_STALL_MS = 15000;
+
+enum OtaStop { OTA_DONE, OTA_RETRY, OTA_FATAL };
+static char s_ota_why[24];
+
+// One connection: fetch from byte `total` to the end, feeding the hash and the flash as the
+// bytes arrive. The first download died after 64 KB with no sign of why, so a connection that
+// ends early is not the end of the file: the caller reconnects and asks for the rest.
+static OtaStop otaPull(const String &path, size_t want, const String &shaHex, size_t &total,
+                       mbedtls_sha256_context &ctx, bool &mine, const char *&why) {
   WiFiClientSecure c;
   c.setCACert(RELAY_CA);
   HTTPClient http;
   http.setTimeout(20000);
-  if (!http.begin(c, String("https://") + PXT_RELAY_HOST + path)) return false;
+  http.setConnectTimeout(10000);
+  if (!http.begin(c, PXT_RELAY_HOST, PXT_RELAY_PORT, path, true)) {
+    why = "begin";
+    return OTA_RETRY;
+  }
   http.addHeader("X-Api-Key", PXT_RELAY_KEY);
+  if (total) http.addHeader("Range", String("bytes=") + String((unsigned)total) + "-");
+  const char *served[] = {"X-Firmware-Sha256"};
+  http.collectHeaders(served, 1);
   int code = http.GET();
-  if (code != 200) {
-    Serial.printf("[ota] http %d\n", code);
+  if (code != (total ? 206 : 200)) {
+    snprintf(s_ota_why, sizeof(s_ota_why), "http %d", code);
+    why = s_ota_why;
     http.end();
-    return false;
+    return OTA_RETRY;
   }
   int len = http.getSize();
-  if (len <= 0 || (size_t)len != want) {
-    Serial.printf("[ota] size %d want %u\n", len, (unsigned)want);
+  if (len <= 0 || (size_t)len != want - total) {
+    snprintf(s_ota_why, sizeof(s_ota_why), "size %d", len);
+    why = s_ota_why;
     http.end();
-    return false;
+    return total ? OTA_RETRY : OTA_FATAL;
   }
-  if (!Update.begin((size_t)len)) {
-    Serial.println("[ota] begin failed");
+  // An image republished mid-download would pass every size check and fail only at the final
+  // hash, after the whole file came down. The relay names the image it serves on every reply.
+  String served_sha = http.header("X-Firmware-Sha256");
+  if (served_sha.length() && !served_sha.equalsIgnoreCase(shaHex)) {
+    why = "image changed";
     http.end();
-    return false;
+    return OTA_FATAL;
   }
+  // The flash buffer is taken after the first handshake, as it always was: the handshake needs the
+  // contiguous block it would otherwise share.
+  // `mine` says this download holds the Updater token. A /u upload in progress holds it instead,
+  // and then the download ends and leaves that upload alone; the op is queued again in a few seconds.
+  if (!mine) {
+    if (!updTake(UPD_RELAY)) {
+      why = "busy";
+      http.end();
+      return OTA_FATAL;
+    }
+    if (!Update.begin(want)) {
+      updRelease(UPD_RELAY);
+      why = "begin failed";
+      http.end();
+      return OTA_FATAL;
+    }
+    mine = true;
+  }
+  // The peer can close right after the headers; the client then has no stream to hand out.
+  WiFiClient *st = http.getStreamPtr();
+  if (!st) {
+    why = "closed";
+    http.end();
+    return OTA_RETRY;
+  }
+  uint32_t last = millis();
+  while (total < want) {
+    size_t ask = want - total;
+    if (ask > sizeof(s_rx)) ask = sizeof(s_rx);
+    int r = st->read(s_rx, ask);
+    if (r <= 0) {
+      if (!st->connected()) {
+        why = "closed";
+        http.end();
+        return OTA_RETRY;
+      }
+      if (millis() - last > OTA_STALL_MS) {
+        why = "stalled";
+        http.end();
+        return OTA_RETRY;
+      }
+      delay(1);
+      continue;
+    }
+    last = millis();
+    mbedtls_sha256_update(&ctx, s_rx, r);
+    if (Update.write(s_rx, r) != (size_t)r) {
+      why = "flash";
+      http.end();
+      return OTA_FATAL;
+    }
+    total += r;
+  }
+  http.end();
+  return OTA_DONE;
+}
+
+static bool otaFrom(const String &path, size_t want, const String &shaHex) {
   mbedtls_sha256_context ctx;
   mbedtls_sha256_init(&ctx);
   mbedtls_sha256_starts(&ctx, 0);
-  WiFiClient *st = http.getStreamPtr();
-  uint8_t buf[1024];
   size_t total = 0;
-  while (total < (size_t)len) {
-    size_t ask = sizeof(buf);
-    if ((size_t)len - total < ask) ask = (size_t)len - total;
-    size_t r = st->readBytes(buf, ask);
-    if (!r) break;
-    mbedtls_sha256_update(&ctx, buf, r);
-    Update.write(buf, r);
-    total += r;
+  int stalls = 0;
+  bool mine = false;
+  OtaStop stop = OTA_RETRY;
+  while (total < want && stalls < OTA_MAX_STALLS && stop != OTA_FATAL) {
+    size_t before = total;
+    const char *why = "";
+    stop = otaPull(path, want, shaHex, total, ctx, mine, why);
+    stalls = total > before ? 0 : stalls + 1;
+    if (total < want) {
+      otaNote(why, total, want);
+      delay(500);
+    }
   }
   uint8_t dig[32];
   mbedtls_sha256_finish(&ctx, dig);
@@ -719,13 +864,24 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
   char hex[65];
   for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", dig[i]);
   bool match = shaHex.equalsIgnoreCase(hex);
-  http.end();
-  if (total != (size_t)len || !match) {
-    Serial.printf("[ota] reject total=%u match=%d\n", (unsigned)total, match);
-    Update.abort();
+  if (total != want || !match) {
+    // A short download keeps the reason its last attempt left in the note; only a whole file
+    // that fails its hash needs a word of its own.
+    if (total == want) otaNote("hash", total, want);
+    if (mine) {
+      Update.abort();
+      updRelease(UPD_RELAY);
+    }
     return false;
   }
-  return Update.end(true);
+  bool ended = Update.end(true);
+  updRelease(UPD_RELAY);
+  if (!ended) {
+    otaNote("end failed", total, want);
+    return false;
+  }
+  otaNote("ok", total, want);
+  return true;
 }
 
 // Re-queued ops must not reinstall the image that is already running: that
@@ -953,10 +1109,6 @@ struct FrameSink {
     if (got == 16384) finish();
   }
 };
-
-// Off the task stack: mbedtls needs most of the 12 KB, and a 4 KB local here
-// is what overflowed the old 8 KB pull task and killed the display.
-static uint8_t s_rx[4096];
 
 static void pullTask(void *) {
   if (!strlen(PXT_RELAY_KEY) || !strlen(PXT_RELAY_HOST)) {
