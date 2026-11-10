@@ -102,23 +102,29 @@ a figure (`D118` decode, `P2.4K` prefill). The machine's own units go after the 
 The loads sit together in the order GPU, CPU, memory (`G93% C12% M82%`) and the hardware pair after the tag or beside
 the bars (`58C 209W`).
 
+`focus`, `spark`, `cols` and `quad` open with a cluster bar, with no label because the whole cluster is implied:
+`G64% C31% M64% 836W D217 P3.2K` is the average GPU, CPU and memory percent of the nodes that are reporting, the
+summed watts (`1.2KW` from a thousand, capped at `9.9KW`), and the summed decode and prefill rates. A tensor-parallel
+job counts once in the rates, and every machine counts in the averages. `rows` is full and has no bar.
+
 | Figure | Source (no sudo) | Shown |
 |---|---|---|
-| `temp`, GPU degrees C | `~/.local/bin/latch sensors` every 10 s (about 0.4 s of one core; a failed read keeps the last figure for a minute) | `rows` right of the bars, `quad` and `focus` in the header after the tag, as `58C`. White below 70, amber from 70, red from 85 |
-| `watts`, whole machine | the SMC key `PD0R` through IOKit and `ctypes`, every second (`PSTR` reads 0 on a Studio) | `rows` right of the bars, `spark` in the column after the history, `quad` and `focus` in the header after the tag, as `209W`. Capped at `999W` for width |
-| `cpu`, busy percent | the kernel's `host_statistics` tick counters between two reads | between GPU and memory, as `C12%`: `rows` in the number row, `quad` and `focus` in the row above the bars; `spark` keeps it under the watts. Every figure sits right-aligned in a fixed five-character slot (only `C100%` fills it), so one gaining a digit moves nothing beside it |
+| `temp`, GPU degrees C | `~/.local/bin/latch sensors` every 10 s (about 0.4 s of one core; a failed read keeps the last figure for a minute) | `rows` right of the bars and `quad` after the tag, as `58C`. White below 70, amber from 70, red from 85 |
+| `watts`, whole machine | the SMC key `PD0R` through IOKit and `ctypes`, every second (`PSTR` reads 0 on a Studio) | `rows` right of the bars, `spark` in the column after the history, `quad` after the tag, as `209W`, and summed in the cluster bar. Capped at `999W` a node for width |
+| `cpu`, busy percent | the kernel's `host_statistics` tick counters between two reads | between GPU and memory, as `C12%`: `rows` in the number row, `quad` and `focus` in the row of loads; `spark` keeps it under the watts; averaged in the cluster bar. Every figure sits right-aligned in a fixed five-character slot (only `C100%` fills it), so one gaining a digit moves nothing beside it |
 
-To make room the `rows` and `focus` GPU and memory bars are shorter, the `spark` history is 36 samples (it was 62),
-`quad` no longer prints `TOK/S` (a small `D` follows the big decode figure and `P` labels prefill beside it), and
-`focus` puts temperature and watts beside its tag, with the cluster totals on the right. `cols` has no room. A figure outside its
-range (temperature 10 to 130, watts above 1000, CPU outside 0 to 100) is dropped, a node that is not reporting shows
-none, and without Latch or readable SMC the agent just reports less.
+To make room the `rows` and `focus` GPU and memory bars are shorter, the `spark` history is 36 samples (it was 62) and
+its cluster history sparkline is gone, `quad` no longer prints `TOK/S` (a small `D` follows the big decode figure and
+`P` labels prefill beside it) and trades its two 1 px bars under the numbers for two 1 px columns on the quadrant's
+left edge, and `focus` leads its decode label with the node's tag and draws no temperature or watts of its own. A
+figure outside its range (temperature 10 to 130, watts above 1000, CPU outside 0 to 100) is dropped, a node that is not
+reporting shows none, and without Latch or readable SMC the agent just reports less.
 
 **Tensor parallel.** Only rank 0 runs an HTTP server, so only it has token counters; the other ranks run
 `mlx-serve worker ... --coordinator 10.254.<ab>.<n>:<port>` and would show idle while their GPUs work. An agent
 that finds such a process (and has no server of its own) reports `worker: true` and `follows: studio<n>` (the last octet of rank 0's cable
 address is rank 0's Studio number). The board then shows rank 0's live rates, last averages and state on each
-worker, since every rank decodes every token, and leaves the workers out of the `ALL` totals so a token counts
+worker, since every rank decodes every token, and leaves the workers out of the summed rates so a token counts
 once. A worker whose coordinator is off the mesh follows the busiest node that is not a worker. A worker never
 follows a worker, and one whose leader has gone stale shows its own numbers.
 

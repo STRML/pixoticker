@@ -56,7 +56,7 @@ class Node:
     dec_last: float | None = None
     pre_last: float | None = None
     age: int = 0
-    hist: list = field(default_factory=list)   # [(dec, gpu, pre, share), ...] oldest first; share is its part of the cluster decode total
+    hist: list = field(default_factory=list)   # [(dec, gpu, pre), ...] oldest first
     tp: str | None = None   # a tensor-parallel worker: the node whose rates it shows
     temp: float | None = None   # GPU degrees C, from the node's agent
     watts: float | None = None   # whole-machine power draw in watts (SMC PD0R)
@@ -243,16 +243,17 @@ def rows(nodes):
 
 
 def cols(nodes):
-    """Four 32 px columns: tag, a tall GPU bar beside a tall memory bar, then the numbers."""
+    """The cluster bar on top, then four 32 px columns: tag, a tall GPU bar beside a tall memory bar, the numbers."""
     c = Canvas()
+    draw_summary(c, nodes)
     for i, n in enumerate(nodes[:4]):
         x = i * 32
         gc, mc = bar_colors(n)
-        c.text_center(x + 16, 1, n.tag, FG if n.fresh else DIM)
-        c.vbar(x + 4, 9, 10, 26, frac(n.gpu) if n.fresh else 0, gc)
-        c.vbar(x + 18, 9, 10, 26, frac(n.mem) if n.fresh else 0, mc)
+        c.text_center(x + 16, 9, n.tag, FG if n.fresh else DIM)
+        c.vbar(x + 4, 16, 10, 19, frac(n.gpu) if n.fresh else 0, gc)
+        c.vbar(x + 18, 16, 10, 19, frac(n.mem) if n.fresh else 0, mc)
         if i:
-            c.rect(x - 1, 0, 1, H, RULE)
+            c.rect(x - 1, 8, 1, H - 8, RULE)
         if not n.fresh:
             word = status_text(n).split()
             for k, part in enumerate(word):
@@ -268,28 +269,30 @@ def cols(nodes):
 
 
 def quad(nodes):
-    """2x2 quadrants of 64x32: temperature and watts by the tag, a big decode figure with prefill beside it, then
-    GPU, CPU and memory percentages directly above the two bars."""
+    """The cluster bar on top, then 2x2 quadrants of 64x27: temperature and watts by the tag, a big decode figure
+    with prefill beside it, GPU, CPU and memory percentages beneath, and the two gauges as 1 px columns on the
+    quadrant's left edge."""
     c = Canvas()
-    c.rect(63, 0, 1, H, RULE)
-    c.rect(0, 31, W, 1, RULE)
+    draw_summary(c, nodes)
+    c.rect(63, 8, 1, H - 8, RULE)
+    c.rect(0, 35, W, 1, RULE)
     for i, n in enumerate(nodes[:4]):
-        x, y = (i % 2) * 64, (i // 2) * 32
+        x, y = (i % 2) * 64, 8 + (i // 2) * 28
         gc, mc = bar_colors(n)
-        c.text(x + 2, y + 1, n.tag, FG if n.fresh else DIM)
+        c.text(x + 3, y + 1, n.tag, FG if n.fresh else DIM)
         if not n.fresh:
             c.text(x + 16, y + 1, status_text(n), BAD if n.state == STALE else DIM)
             continue
-        draw_stats(c, x + 12, y + 1, hardware(n))
+        draw_stats(c, x + 13, y + 1, hardware(n))
         dt, dc = shown(n, "dec", DEC_C)
         pt, pc = shown(n, "pre", PRE_C)
-        c.big(x + 2, y + 9, dt, dc, scale=2)
+        c.big(x + 3, y + 8, dt, dc, scale=2)
         if len(dt) <= 4:
-            c.text(x + 4 + len(dt) * 2 * font.ADVANCE, y + 9, "D", dim(dc, 0.6))
-        c.text_right(x + 62, y + 9, "P" + pt, pc)
-        draw_stats(c, x + 2, y + 22, loads(n))
-        c.hbar(x + 2, y + 28, 60, 1, frac(n.gpu), gc)
-        c.hbar(x + 2, y + 30, 60, 1, frac(n.mem), mc)
+            c.text(x + 5 + len(dt) * 2 * font.ADVANCE, y + 8, "D", dim(dc, 0.6))
+        c.text_right(x + 62, y + 8, "P" + pt, pc)
+        draw_stats(c, x + 3, y + 21, loads(n))
+        c.vbar(x, y, 1, 27, frac(n.gpu), gc)
+        c.vbar(x + 1, y, 1, 27, frac(n.mem), mc)
     return c.img
 
 
@@ -300,21 +303,43 @@ def totals(nodes):
     return sum(n.dec or 0 for n in live), sum(n.pre or 0 for n in live)
 
 
-def total_history(nodes):
-    """Decode tok/s of all reporting nodes added up, newest sample last. A sample counts what its node
-    added to the total when it was taken (a worker's mirrored rate adds nothing), so a node changing
-    role later does not rewrite the past."""
-    series = [n.hist for n in nodes[:4] if n.fresh]
-    width = max((len(h) for h in series), default=0)
-    out = [0.0] * width
-    for h in series:
-        for k, sample in enumerate(reversed(h)):
-            out[width - 1 - k] += (sample[3] if len(sample) > 3 else sample[0]) or 0
-    return out
-
-
 def total_text(value, color):
     return ("D" if color == DEC_C else "P") + (rate(value) if value else "0"), color if value else dim(color, 0.6)
+
+
+def average(nodes, key):
+    values = [getattr(n, key) for n in nodes[:4] if n.fresh and getattr(n, key) is not None]
+    return sum(values) / len(values) if values else None
+
+
+def watts_total(nodes):
+    """("836W", colour) for the whole cluster's draw, "1.2KW" from a thousand and capped at 9.9KW so it never
+    passes five characters; None when no node reports watts."""
+    readings = [n.watts for n in nodes[:4] if n.fresh and n.watts is not None]
+    if not readings:
+        return None
+    watts = sum(readings)
+    return (f"{watts:.0f}W" if round(watts) < 1000 else f"{min(watts / 1000, 9.9):.1f}KW"), WATT_C
+
+
+def summary_parts(nodes):
+    """The cluster as one row of (text, colour): average GPU, CPU and memory percent, summed watts, summed decode
+    and prefill. With no node reporting, the percentages are dashes in grey."""
+    live = any(n.fresh for n in nodes[:4])
+    gpu, cpu, mem = (average(nodes, key) for key in ("gpu", "cpu", "mem"))
+    cpu_part = None if cpu is None else ("C" + pct(cpu), CPU_C)
+    colours = (GPU_C, MEM_HOT if (mem or 0) >= MEM_WARN else MEM_C) if live else (DIM, DIM)
+    dec_all, pre_all = totals(nodes)
+    return [("G" + pct(gpu), colours[0]), cpu_part, ("M" + pct(mem), colours[1]), watts_total(nodes),
+            total_text(dec_all, DEC_C), total_text(pre_all, PRE_C)]
+
+
+def draw_summary(c, nodes):
+    """The top bar of focus, spark, cols and quad: the whole cluster at a glance, no label needed."""
+    *left, prefill = summary_parts(nodes)
+    draw_stats(c, 4, 1, left)
+    c.text_right(126, 1, *prefill)
+    c.rect(0, 7, W, 1, RULE)
 
 
 def area(c, x, y, w, h, samples, peak, color):
@@ -327,20 +352,12 @@ def area(c, x, y, w, h, samples, peak, color):
 
 
 def spark(nodes):
-    """A cluster row on top (total decode and prefill, total decode history), then one
-    14 px band per node: GPU and memory as numbers with a 10 px bar each, a decode history (HIST samples) on a scale
-    shared by all nodes, the GPU trace over it, amber ticks where a prefill ran, watts over CPU percent, and the rates."""
+    """The cluster bar on top, then one 14 px band per node: GPU and memory as numbers with an 8 px bar each, a
+    decode history (HIST samples) on a scale shared by all nodes, the GPU trace over it, amber ticks where a prefill
+    ran, watts over CPU percent, and the rates."""
     c = Canvas()
     x0, wid = 43, HIST
-    dec_all, pre_all = totals(nodes)
-    td, tdc = total_text(dec_all, DEC_C)
-    tp, tpc = total_text(pre_all, PRE_C)
-    c.text(1, 1, "ALL", FG)
-    c.text(14, 1, td, tdc)
-    c.text_right(126, 1, tp, tpc)
-    history = total_history(nodes)
-    area(c, x0, 0, wid, 7, history, max([DEC_FULL] + history), DEC_C)
-    c.rect(0, 7, W, 1, RULE)
+    draw_summary(c, nodes)
     shared = max([DEC_FULL / 2] + [s[0] or 0 for n in nodes[:4] for s in n.hist])
     for i, n in enumerate(nodes[:4]):
         y = 8 + i * 14
@@ -370,26 +387,18 @@ def spark(nodes):
 
 
 def focus(nodes):
-    """The busiest node large on top, all four as thin strips below."""
+    """The cluster bar on top, the busiest node large (its tag leads the labels), all four as thin strips below."""
     c = Canvas()
+    draw_summary(c, nodes)
     live = [n for n in nodes[:4] if n.fresh]
     top = max(live, key=lambda n: n.activity) if live else nodes[0]
     gc, mc = bar_colors(top)
-    c.text(1, 1, top.tag, FG if top.fresh else DIM)
-    dec_all, pre_all = totals(nodes)
-    td, tdc = total_text(dec_all, DEC_C)
-    tp, tpc = total_text(pre_all, PRE_C)
-    x = 126 - font.width(tp)
-    c.text(x, 1, tp, tpc)
-    x -= 4 + font.width(td)
-    c.text(x, 1, td, tdc)
-    c.text(x - 4 - font.width("ALL"), 1, "ALL", DIM)
+    c.text(1, 30, top.tag, FG if top.fresh else DIM)
     if top.fresh:
         dt, dc = shown(top, "dec", DEC_C)
         pt, pc = shown(top, "pre", PRE_C)
         c.big(1, 10, dt, dc, scale=3)
-        c.text(1, 30, "DECODE TOK/S", DIM)
-        draw_stats(c, 12, 1, hardware(top))
+        c.text(13, 30, "DECODE TOK/S", DIM)
         c.big(66, 10, pt, pc, scale=3)
         c.text(66, 30, "PREFILL TOK/S", DIM)
         live_dec, live_pre = top.dec or 0, top.pre or 0
@@ -400,7 +409,7 @@ def focus(nodes):
         parts = loads(top)
         draw_stats(c, 126 - stats_width(parts), 39, parts)
     else:
-        c.text(14, 1, status_text(top), BAD if top.state == STALE else DIM)
+        c.text(13, 30, status_text(top), BAD if top.state == STALE else DIM)
     c.rect(0, 45, W, 1, RULE)
     for i, n in enumerate(nodes[:4]):
         x = i * 32

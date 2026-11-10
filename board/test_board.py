@@ -258,17 +258,39 @@ class Totals(unittest.TestCase):
                  layouts.Node("studio4")]
         self.assertEqual(layouts.totals(nodes), (150.5, 3000.0))
 
-    def test_total_history_adds_samples_newest_aligned_and_skips_silent_nodes(self):
-        a = layouts.Node("studio1", layouts.LIVE, hist=[(10, 0, 0), (20, 0, 0), (30, 0, 0)])
-        b = layouts.Node("studio2", layouts.IDLE, hist=[(1, 0, 0), (2, 0, 0)])
-        gone = layouts.Node("studio3", layouts.STALE, hist=[(500, 0, 0)] * 3)
-        self.assertEqual(layouts.total_history([a, b, gone]), [10, 21, 32])
+    def test_spark_focus_cols_and_quad_draw_the_same_cluster_bar(self):
+        bars = {name: layouts.render(name, preview.busy()).crop((0, 0, 128, 8)).tobytes()
+                for name in ("spark", "focus", "cols", "quad")}
+        self.assertEqual(len(set(bars.values())), 1)
+        top = layouts.render("focus", preview.busy()).crop((0, 0, 128, 7))
+        self.assertIn(layouts.DEC_C, [c for _, c in top.getcolors()])
 
-    def test_spark_and_focus_draw_the_total_row(self):
-        for name in ("spark", "focus"):
-            img = layouts.render(name, preview.busy())
-            top = img.crop((0, 0, 128, 7))
-            self.assertIn(layouts.DEC_C, [c for _, c in top.getcolors()], name)
+    def test_rows_has_no_room_for_the_cluster_bar(self):
+        self.assertNotEqual(layouts.render("rows", preview.busy()).crop((0, 0, 128, 8)).tobytes(),
+                            layouts.render("focus", preview.busy()).crop((0, 0, 128, 8)).tobytes())
+
+    def test_the_cluster_bar_averages_the_percentages_and_adds_the_rest(self):
+        nodes = [layouts.Node("studio1", layouts.LIVE, gpu=100.0, mem=60.0, cpu=10.0, watts=300.0, dec=100.0, pre=2000.0),
+                 layouts.Node("studio2", layouts.IDLE, gpu=50.0, mem=40.0, cpu=None, watts=250.0, dec=0.0, pre=1000.0),
+                 layouts.Node("studio3", layouts.STALE, gpu=0.0, mem=0.0, cpu=99.0, watts=999.0, dec=500.0, pre=500.0),
+                 layouts.Node("studio4")]
+        texts = [part and part[0] for part in layouts.summary_parts(nodes)]
+        self.assertEqual(texts, ["G75%", "C10%", "M50%", "550W", "D100", "P3.0K"])
+
+    def test_the_cluster_bar_counts_a_tensor_parallel_job_once_but_every_machines_load(self):
+        nodes = [layouts.Node("studio1", layouts.LIVE, gpu=90.0, mem=50.0, cpu=10.0, watts=200.0, dec=100.0, pre=3000.0),
+                 layouts.Node("studio2", layouts.LIVE, gpu=70.0, mem=50.0, cpu=20.0, watts=200.0, dec=100.0, pre=3000.0, tp="studio1")]
+        texts = [part and part[0] for part in layouts.summary_parts(nodes)]
+        self.assertEqual(texts, ["G80%", "C15%", "M50%", "400W", "D100", "P3.0K"])
+
+    def test_the_cluster_bar_switches_to_kilowatts_and_goes_grey_without_a_reporting_node(self):
+        busy = [layouts.Node(f"studio{i}", layouts.LIVE, gpu=1.0, mem=1.0, watts=300.0) for i in (1, 2, 3, 4)]
+        self.assertEqual(layouts.summary_parts(busy)[3][0], "1.2KW")
+        absurd = [layouts.Node(f"studio{i}", layouts.LIVE, watts=9999.0) for i in (1, 2, 3, 4)]
+        self.assertEqual(layouts.summary_parts(absurd)[3][0], "9.9KW")
+        dark = layouts.summary_parts([layouts.Node("studio1"), layouts.Node("studio2", layouts.STALE)])
+        self.assertEqual([part and part[0] for part in dark], ["G--", None, "M--", None, "D0", "P0"])
+        self.assertEqual((dark[0][1], dark[2][1]), (layouts.DIM, layouts.DIM))
 
 
 class EndToEnd(unittest.TestCase):
@@ -550,13 +572,6 @@ class TpMirror(unittest.TestCase):
         self.worker("studio3")
         self.assertEqual(layouts.totals(self.board.nodes()), (100.0, 3000.0))
 
-    def test_the_total_history_skips_mirrored_nodes(self):
-        self.leader(dec=100.0)
-        self.worker("studio2")
-        self.board.tick()
-        self.board.tick()
-        self.assertEqual(layouts.total_history(self.board.nodes()), [100.0, 100.0])
-
     def test_without_a_named_leader_the_busiest_serving_node_leads(self):
         self.leader(dec=90.0)
         self.board.ingest(report("studio3", dec=0.0, pre=0.0, running=0, dec_last_age=None, pre_last_age=None))
@@ -604,41 +619,15 @@ class TpHistory(unittest.TestCase):
         self.board.tick()
         self.clock.t += 1
 
-    def totals(self):
-        return layouts.total_history(self.board.nodes())
-
-    def test_history_taken_while_mirroring_is_not_added_back_when_the_job_ends(self):
-        for _ in range(3):
-            self.step(workers=True)
-        self.assertEqual(self.totals(), [100.0, 100.0, 100.0])
-        self.step(workers=False)
-        self.assertEqual(self.totals(), [100.0, 100.0, 100.0, 100.0])
-
-    def test_history_taken_while_serving_stays_when_the_box_becomes_a_worker(self):
-        for _ in range(2):
-            self.ingest("studio1", dec=100.0)
-            self.ingest("studio2", dec=20.0)
-            self.board.tick()
-            self.clock.t += 1
-        self.assertEqual(self.totals(), [120.0, 120.0])
-        self.ingest("studio1", dec=100.0)
-        self.ingest("studio2", worker=True, dec=0.0, running=0)
-        self.board.tick()
-        self.assertEqual(self.totals(), [120.0, 120.0, 100.0])
-
     def test_every_layout_draws_history_the_board_recorded(self):
         for _ in range(3):
             self.step(workers=True)
         for name in layouts.LAYOUTS:
             self.assertEqual(layouts.render(name, self.board.nodes()).size, (128, 64), name)
 
-    def test_a_stale_leader_does_not_inflate_the_total_history(self):
-        for _ in range(3):
-            self.step(workers=True)
-        self.clock.t += 60
-        self.ingest("studio2", worker=True, dec=0.0, running=0)
-        self.ingest("studio3", worker=True, dec=0.0, running=0)
-        self.assertEqual(self.totals(), [0.0, 0.0, 0.0])
+    def test_the_board_records_decode_gpu_and_prefill_samples(self):
+        self.step(workers=False)
+        self.assertEqual(self.board.nodes()[0].hist[-1], (100.0, 80.0, 0.0))
 
 
 class TpWatchTests(unittest.TestCase):

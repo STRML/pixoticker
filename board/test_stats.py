@@ -478,6 +478,10 @@ class Drawn(unittest.TestCase):
         b = layouts.render(name, self.nodes(state, dec)).load()
         return [(x, y) for x in range(layouts.W) for y in range(layouts.H) if a[x, y] != b[x, y]]
 
+    def below_the_bar(self, name, **stats):
+        """The same, without the cluster bar's rows (the first eight)."""
+        return [(x, y) for x, y in self.changed(name, **stats) if y >= 8]
+
     def test_rows_draw_temperature_and_watts_right_aligned_beside_the_bars(self):
         diff = self.changed("rows", temp=100.0, watts=9999.0)
         self.assertTrue(diff)
@@ -513,23 +517,24 @@ class Drawn(unittest.TestCase):
 
     def test_spark_draws_watts_over_cpu_in_the_column_after_a_shorter_history(self):
         self.assertEqual(layouts.HIST, 36)
-        diff = self.changed("spark", watts=9999.0, cpu=100.0)
+        diff = self.below_the_bar("spark", watts=9999.0, cpu=100.0)
         self.assertTrue(diff)
         self.assertTrue(all(82 <= x <= 100 and (y - 8) % 14 in range(1, 13) for x, y in diff), diff[:6])
         ys = {(y - 8) % 14 for _, y in diff}
         self.assertTrue(any(v <= 6 for v in ys) and any(v >= 7 for v in ys))
 
     def test_quad_draws_temperature_and_watts_beside_the_tag_and_cpu_in_the_row_above_the_bars(self):
-        hardware = self.changed("quad", temp=100.0, watts=9999.0)
+        quadrants = {(0, 0), (1, 0), (0, 1), (1, 1)}
+        hardware = self.below_the_bar("quad", temp=100.0, watts=9999.0)
         self.assertTrue(hardware)
-        self.assertTrue(all(12 <= x % 64 < 52 and y % 32 in range(1, 7) for x, y in hardware), hardware[:6])
-        self.assertEqual({(x // 64, y // 32) for x, y in hardware}, {(0, 0), (1, 0), (0, 1), (1, 1)})
-        cpu = self.changed("quad", cpu=100.0)
-        self.assertTrue(all(22 <= x % 64 <= 40 and y % 32 in range(22, 28) for x, y in cpu), cpu[:6])
-        self.assertEqual({(x // 64, y // 32) for x, y in cpu}, {(0, 0), (1, 0), (0, 1), (1, 1)})
+        self.assertTrue(all(13 <= x % 64 < 53 and (y - 8) % 28 in range(1, 7) for x, y in hardware), hardware[:6])
+        self.assertEqual({(x // 64, (y - 8) // 28) for x, y in hardware}, quadrants)
+        cpu = self.below_the_bar("quad", cpu=100.0)
+        self.assertTrue(all(23 <= x % 64 <= 41 and (y - 8) % 28 in range(21, 27) for x, y in cpu), cpu[:6])
+        self.assertEqual({(x // 64, (y - 8) // 28) for x, y in cpu}, quadrants)
 
     def test_gpu_and_cpu_percentages_sit_side_by_side_with_memory_after_them(self):
-        bands = {"rows": (1, 7, 0, 128), "quad": (22, 28, 0, 62), "focus": (39, 45, 68, 128)}
+        bands = {"rows": (1, 7, 0, 128), "quad": (29, 35, 2, 62), "focus": (39, 45, 68, 128)}
         for name, (y0, y1, x0, x1) in bands.items():
             img = layouts.render(name, self.nodes(cpu=12.0))
             ink = lambda colour: [x for x in range(x0, x1) for y in range(y0, y1) if img.getpixel((x, y)) == colour]
@@ -542,7 +547,7 @@ class Drawn(unittest.TestCase):
     def test_gpu_and_memory_labels_are_drawn_whole_at_every_width_in_every_layout(self):
         """The label's own pixels, and nothing else, fill its box: a bar, a rate or a neighbour reaching into it fails."""
         places = {"rows": (("r", 32, 1), ("r", 72, 1)), "cols": (("l", 3, 37), ("l", 3, 44)),
-                  "quad": (("r", 22, 22), ("r", 62, 22)), "spark": (("l", 14, 9), ("l", 14, 15)),
+                  "quad": (("r", 23, 29), ("r", 63, 29)), "spark": (("l", 14, 9), ("l", 14, 15)),
                   "focus": (("r", 86, 39), ("r", 126, 39))}
         for gpu, mem, text in ((88.0, 71.0, ("G88%", "M71%")), (5.0, 5.0, ("G05%", "M05%")), (100.0, 100.0, ("G100%", "M100%"))):
             nodes = [layouts.Node("studio1", layouts.LIVE, gpu=gpu, mem=mem, dec=118.4, pre=2400.0, **self.WIDEST)]
@@ -561,27 +566,25 @@ class Drawn(unittest.TestCase):
         for dec in (118.4, 9949.0, 9999.0):
             nodes = [layouts.Node("studio1", layouts.LIVE, gpu=50.0, mem=50.0, dec=dec, pre=9999.0)]
             img = layouts.render("quad", nodes).load()
-            decode = {x for x in range(64) for y in range(9, 21) if img[x, y] in (layouts.DEC_C, layouts.dim(layouts.DEC_C, 0.6))}
-            prefill = {x for x in range(64) for y in range(9, 15) if img[x, y] == layouts.PRE_C}
+            decode = {x for x in range(64) for y in range(16, 28) if img[x, y] in (layouts.DEC_C, layouts.dim(layouts.DEC_C, 0.6))}
+            prefill = {x for x in range(64) for y in range(16, 22) if img[x, y] == layouts.PRE_C}
             self.assertLess(max(decode), min(prefill), dec)
 
     def test_quad_labels_prefill_beside_the_decode_figure_and_marks_decode_with_a_d(self):
         img = layouts.render("quad", self.nodes(dec=118.4)).load()
-        pre = [x for x in range(64) for y in range(9, 15) if img[x, y] == layouts.PRE_C]
+        pre = [x for x in range(64) for y in range(16, 22) if img[x, y] == layouts.PRE_C]
         self.assertTrue(pre and min(pre) >= 42 and max(pre) == 60, (min(pre), max(pre)))
-        d = [x for x in range(64) for y in range(9, 15) if img[x, y] == layouts.dim(layouts.DEC_C, 0.6)]
-        self.assertTrue(d and min(d) >= 2 + 3 * 8 + 2 and max(d) < 42, d)
+        d = [x for x in range(64) for y in range(16, 22) if img[x, y] == layouts.dim(layouts.DEC_C, 0.6)]
+        self.assertTrue(d and min(d) >= 3 + 3 * 8 + 2 and max(d) < 42, d)
 
-    def test_focus_header_puts_the_nodes_temperature_and_watts_beside_its_tag_and_the_totals_on_the_right(self):
-        diff = self.changed("focus", temp=100.0, watts=9999.0)
-        self.assertTrue(diff)
-        self.assertTrue(all(12 <= x < 52 and 1 <= y < 7 for x, y in diff), diff[:6])
-        img = layouts.render("focus", self.nodes(temp=100.0, watts=9999.0)).load()
-        right = [x for x in range(52, layouts.W) for y in range(1, 7) if img[x, y] != layouts.BG]
-        self.assertTrue(right and max(right) == 124, max(right))
+    def test_focus_leads_its_decode_label_with_the_tag_and_draws_no_hardware_of_its_own(self):
+        img = layouts.render("focus", self.nodes()).load()
+        tag = [x for x in range(layouts.W) for y in range(30, 36) if img[x, y] == layouts.FG]
+        self.assertTrue(tag and max(tag) < 13, tag)
+        self.assertEqual(self.changed("focus", temp=100.0), [])
 
-    def test_focus_draws_gpu_cpu_and_memory_right_of_the_shorter_bars_not_in_the_header(self):
-        diff = self.changed("focus", cpu=100.0)
+    def test_focus_draws_gpu_cpu_and_memory_right_of_the_shorter_bars_and_the_cluster_bar_above(self):
+        diff = self.below_the_bar("focus", cpu=100.0)
         self.assertTrue(diff)
         self.assertTrue(all(x >= 68 and 39 <= y <= 44 for x, y in diff), diff[:6])
         img = layouts.render("focus", self.nodes()).load()
@@ -590,17 +593,19 @@ class Drawn(unittest.TestCase):
         self.assertLess(track_end, 66)
 
     def test_each_stat_alone_is_drawn_where_it_has_room(self):
-        for name in ("rows", "focus", "quad", "spark"):
+        for name in ("rows", "focus", "quad", "spark", "cols"):
             for stat in (dict(temp=70.0), dict(watts=180.0), dict(cpu=9.0)):
                 drawn = bool(self.changed(name, **stat))
-                expected = not (name == "spark" and "temp" in stat)
+                expected = not ("temp" in stat and name in ("spark", "focus", "cols"))
                 self.assertEqual(drawn, expected, (name, stat))
 
-    def test_cols_has_no_room_and_is_unchanged(self):
-        self.assertEqual(self.changed("cols", **self.WIDEST), [])
+    def test_cols_draws_the_cluster_bar_and_no_hardware_of_its_own(self):
+        diff = self.changed("cols", **self.WIDEST)
+        self.assertTrue(diff)
+        self.assertTrue(all(y < 7 for _, y in diff), diff[:6])
 
     def test_the_stats_only_add_ink_to_empty_space_even_beside_the_widest_neighbours(self):
-        for name in ("rows", "spark", "focus", "quad"):
+        for name in ("rows", "spark", "focus", "quad", "cols"):
             for dec in (118.4, 9999.0):
                 a = layouts.render(name, self.nodes(dec=dec, **self.WIDEST)).load()
                 b = layouts.render(name, self.nodes(dec=dec)).load()
@@ -609,7 +614,7 @@ class Drawn(unittest.TestCase):
                 self.assertEqual(overwritten, [], (name, dec))
 
     def test_a_node_that_is_not_reporting_shows_none(self):
-        for name in ("rows", "spark", "focus", "quad"):
+        for name in ("rows", "spark", "focus", "quad", "cols"):
             self.assertEqual(self.changed(name, state=layouts.STALE, **self.WIDEST), [], name)
 
 

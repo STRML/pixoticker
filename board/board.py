@@ -161,7 +161,7 @@ class Board:
         views = self.nodes()
         for n in views:
             if n.fresh:
-                self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0, 0.0 if n.tp else n.dec or 0.0))
+                self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0))
             if n.state == LIVE and n.tp is None:
                 key = self.peak_key(n, views)
                 self.peaks.observe(key, "dec", n.dec, self.ticks)
