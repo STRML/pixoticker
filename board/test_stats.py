@@ -167,9 +167,9 @@ class BoardCarriesIt(unittest.TestCase):
 
 
 class TempText(unittest.TestCase):
-    def test_the_figure_is_a_t_and_a_rounded_number(self):
-        self.assertEqual(layouts.temp_text(45.9)[0], "T46")
-        self.assertEqual(layouts.temp_text(100.0)[0], "T100")
+    def test_the_figure_is_a_rounded_number_and_a_c(self):
+        self.assertEqual(layouts.temp_text(45.9)[0], "46C")
+        self.assertEqual(layouts.temp_text(100.0)[0], "100C")
 
     def test_it_warms_up_with_the_temperature(self):
         self.assertEqual(layouts.temp_text(69.9)[1], layouts.FG)
@@ -403,28 +403,42 @@ class BoardCarriesStats(unittest.TestCase):
 
 class TextAndGeometry(unittest.TestCase):
     def test_watts_text_is_whole_watts_and_never_wider_than_four_characters(self):
-        self.assertEqual(layouts.watts_text(182.4)[0], "W182")
-        self.assertEqual(layouts.watts_text(7.2)[0], "W7")
-        self.assertEqual(layouts.watts_text(999.9)[0], "W999")
-        self.assertEqual(layouts.watts_text(1000.0)[0], "W999")
+        self.assertEqual(layouts.watts_text(182.4)[0], "182W")
+        self.assertEqual(layouts.watts_text(7.2)[0], "7W")
+        self.assertEqual(layouts.watts_text(999.9)[0], "999W")
+        self.assertEqual(layouts.watts_text(1000.0)[0], "999W")
         self.assertIsNone(layouts.watts_text(None))
 
-    def test_cpu_text_is_a_c_and_the_whole_percent(self):
-        self.assertEqual(layouts.cpu_text(9.4)[0], "C9")
-        self.assertEqual(layouts.cpu_text(100.0)[0], "C100")
+    def test_cpu_text_is_a_c_the_whole_percent_and_its_sign(self):
+        self.assertEqual(layouts.cpu_text(9.4)[0], "C09%")
+        self.assertEqual(layouts.cpu_text(100.0)[0], "C100%")
         self.assertIsNone(layouts.cpu_text(None))
+
+    def test_percent_figures_carry_a_sign_and_pad_to_two_digits_so_they_do_not_jump(self):
+        self.assertEqual(layouts.pct(93.4), "93%")
+        self.assertEqual(layouts.pct(8.0), "08%")
+        self.assertEqual(layouts.pct(0.0), "00%")
+        self.assertEqual(layouts.pct(100.0), "100%")
+        self.assertEqual(layouts.pct(None), "--")
 
     def lit_columns(self, canvas, colour):
         px = canvas.img.load()
         return sorted({x for x in range(layouts.W) for y in range(layouts.H) if px[x, y] == colour})
 
-    def test_stats_sit_in_fixed_slots_a_space_apart_and_the_width_helper_agrees(self):
+    def test_stats_sit_in_fixed_five_character_slots_and_the_width_helper_agrees(self):
         parts = [layouts.watts_text(182.0), layouts.cpu_text(9.0)]
-        self.assertEqual(layouts.stats_width(parts), 4 * 4 + 4 + 4 * 4)
+        self.assertEqual(layouts.stats_width(parts), 2 * 5 * 4)
         c = layouts.Canvas()
         end = layouts.draw_stats(c, 10, 0, parts)
-        self.assertEqual(end, 10 + layouts.stats_width(parts) + 4)
-        self.assertEqual(max(self.lit_columns(c, layouts.CPU_C)), 10 + 16 + 4 + 16 - 1 - 1)
+        self.assertEqual(end, 10 + layouts.stats_width(parts))
+        self.assertEqual(max(self.lit_columns(c, layouts.CPU_C)), end - 1 - 1)
+
+    def test_the_widest_figure_fills_its_slot_and_the_figure_before_it_stays_clear(self):
+        c = layouts.Canvas()
+        layouts.draw_stats(c, 10, 0, [layouts.watts_text(999.0), layouts.cpu_text(100.0)])
+        watts, cpu = self.lit_columns(c, layouts.WATT_C), self.lit_columns(c, layouts.CPU_C)
+        self.assertEqual(min(cpu), 10 + 20)
+        self.assertLess(max(watts), min(cpu) - 1)
 
     def test_a_figure_gaining_a_digit_does_not_move_its_neighbours(self):
         def drawn(watts, cpu):
@@ -502,17 +516,33 @@ class Drawn(unittest.TestCase):
         self.assertEqual(layouts.HIST, 36)
         diff = self.changed("spark", watts=9999.0, cpu=100.0)
         self.assertTrue(diff)
-        self.assertTrue(all(80 <= x <= 99 and (y - 8) % 14 in range(1, 13) for x, y in diff), diff[:6])
+        self.assertTrue(all(82 <= x <= 100 and (y - 8) % 14 in range(1, 13) for x, y in diff), diff[:6])
         ys = {(y - 8) % 14 for _, y in diff}
         self.assertTrue(any(v <= 6 for v in ys) and any(v >= 7 for v in ys))
 
     def test_quad_draws_temperature_watts_and_cpu_in_one_row_under_the_figures(self):
         diff = self.changed("quad", **self.WIDEST)
         self.assertTrue(diff)
-        self.assertTrue(all(2 <= x % 64 <= 58 and y % 32 in range(22, 28) for x, y in diff), diff[:6])
+        self.assertTrue(all(2 <= x % 64 <= 60 and y % 32 in range(22, 28) for x, y in diff), diff[:6])
         self.assertEqual({(x // 64, y // 32) for x, y in diff}, {(0, 0), (1, 0), (0, 1), (1, 1)})
         base = layouts.render("quad", self.nodes()).load()
-        self.assertTrue(all(base[x, y] == layouts.BG for x in range(2, 60) for y in range(22, 28)), "the row is for the stats only")
+        self.assertTrue(all(base[x, y] == layouts.BG for x in range(2, 62) for y in range(22, 28)), "the row is for the stats only")
+
+    def test_gpu_and_memory_labels_are_drawn_whole_at_every_width_in_every_layout(self):
+        """The label's own pixels, and nothing else, fill its box: a bar, a rate or a neighbour reaching into it fails."""
+        places = {"rows": ((14, 1), (35, 1)), "cols": ((3, 37), (3, 44)), "quad": ((16, 1), (38, 1)),
+                  "spark": ((14, 9), (14, 15)), "focus": ((14, 1), (35, 1))}
+        for gpu, mem, text in ((88.0, 71.0, ("G88%", "M71%")), (5.0, 5.0, ("G05%", "M05%")), (100.0, 100.0, ("G100%", "M100%"))):
+            nodes = [layouts.Node("studio1", layouts.LIVE, gpu=gpu, mem=mem, dec=118.4, pre=2400.0, **self.WIDEST)]
+            nodes += [layouts.Node(f"studio{i}", layouts.LIVE, gpu=gpu, mem=mem, dec=90.0, pre=0.0, **self.WIDEST) for i in (2, 3, 4)]
+            gc, mc = layouts.bar_colors(nodes[0])
+            for name, spots in places.items():
+                img = layouts.render(name, nodes)
+                for (x, y), label, colour in zip(spots, text, (gc, mc)):
+                    alone = layouts.Canvas()
+                    alone.text(x, y, label, colour)
+                    box = [(px, py) for px in range(x, x + layouts.font.width(label) - 1) for py in range(y, y + 6)]
+                    self.assertEqual([img.getpixel(p) for p in box], [alone.img.getpixel(p) for p in box], (name, label))
 
     def test_quad_decode_mark_and_prefill_never_touch_even_at_the_widest_rates(self):
         for dec in (118.4, 9949.0, 9999.0):

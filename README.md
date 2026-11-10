@@ -96,14 +96,15 @@ alone, and per metric. Until 60 such samples have been seen the bars use a defau
 3000 tok/s prefill). `--state-file` (env `BOARD_STATE_FILE`) saves the peaks every minute, so a restart keeps them.
 
 **Machine stats.** The agent also reports the machine's GPU temperature, power and CPU load, and the layouts draw them
-where there is room. Every number on the panel is a letter and a figure in its metric's colour: `G93` GPU, `M82`
-memory, `D118` decode, `P2.4K` prefill, and for the machine `T58` temperature, `W209` watts, `C12` CPU percent.
+where there is room. Every number on the panel is in its metric's colour. A percentage is a letter, two digits and a
+`%` (`G93%` GPU, `M82%` memory, `C12%` CPU; a single digit pads to `C08%` so the figure never jumps). A rate is a letter and
+a figure (`D118` decode, `P2.4K` prefill). The machine's own units go after the figure: `58C` temperature, `209W` watts.
 
 | Figure | Source (no sudo) | Shown |
 |---|---|---|
-| `temp`, GPU degrees C | `~/.local/bin/latch sensors` every 10 s (about 0.4 s of one core; a failed read keeps the last figure for a minute) | `rows` in the gap after memory, `quad` and `focus` in the stats row, as `T58`. White below 70, amber from 70, red from 85 |
-| `watts`, whole machine | the SMC key `PD0R` through IOKit and `ctypes`, every second (`PSTR` reads 0 on a Studio) | `rows` right of the bars, `spark` in the column after the history, `quad` and `focus` in the stats row, as `W209`. Capped at `W999` for width |
-| `cpu`, busy percent | the kernel's `host_statistics` tick counters between two reads | with the watts, as `C12`. Temperature, watts and CPU each sit right-aligned in a fixed four-character slot, so a figure gaining a digit moves nothing beside it |
+| `temp`, GPU degrees C | `~/.local/bin/latch sensors` every 10 s (about 0.4 s of one core; a failed read keeps the last figure for a minute) | `rows` in the gap after memory, `quad` and `focus` in the stats row, as `58C`. White below 70, amber from 70, red from 85 |
+| `watts`, whole machine | the SMC key `PD0R` through IOKit and `ctypes`, every second (`PSTR` reads 0 on a Studio) | `rows` right of the bars, `spark` in the column after the history, `quad` and `focus` in the stats row, as `209W`. Capped at `999W` for width |
+| `cpu`, busy percent | the kernel's `host_statistics` tick counters between two reads | with the watts, as `C12%`. Temperature, watts and CPU each sit right-aligned in a fixed five-character slot (only `C100%` fills it), so a figure gaining a digit moves nothing beside it |
 
 To make room the `rows` and `focus` GPU and memory bars are shorter, the `spark` history is 36 samples (it was 62),
 `quad` no longer prints `TOK/S` (a small `D` follows the big decode figure and `P` labels prefill beside it), and
