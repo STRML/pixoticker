@@ -122,7 +122,6 @@ class BoardLogic(unittest.TestCase):
         self.clock.t += 4
         self.assertEqual(self.last(), (50.0, 2000.0))
         self.clock.t += 2
-        self.board.ingest(report("studio1", dec=0.0, pre=0.0, running=0, dec_last_age=31.0, pre_last_age=31.0))
         self.assertEqual(self.last(), (None, None))
 
     def test_a_request_shorter_than_a_sample_shows_its_average(self):
@@ -138,10 +137,6 @@ class BoardLogic(unittest.TestCase):
     def test_each_average_expires_on_its_own_age(self):
         self.ingest_last(120.0, 6000.0, boardmod.LAST_S + 1.0, 1.0)
         self.assertEqual(self.last(), (None, 6000.0))
-
-    def test_a_fresh_average_equal_to_the_expired_one_shows(self):
-        self.ingest_last(120.0, 6000.0, 0.0, 0.0)
-        self.assertEqual(self.last(), (120.0, 6000.0))
 
     def test_an_average_with_no_age_is_not_shown(self):
         self.ingest_last(120.0, 6000.0)
@@ -385,6 +380,14 @@ class AgentRates(unittest.TestCase):
         out = r.update(None, 12.0)
         self.assertEqual((out["dec"], out["pre"], out["serving"], out["dec_last"]), (None, None, False, 100.0))
         self.assertEqual((out["dec_last_age"], out["pre_last_age"]), (1.0, None))
+
+    def test_a_second_request_with_the_same_average_refreshes_the_age(self):
+        r = agent.Rates()
+        self.feed(r, (10.0, self.metrics(0, 0, 0, 0, 0, 0)), (11.0, self.metrics(200, 0, 200, 0, 2.0, 0)))
+        out = r.update(self.metrics(200, 0, 200, 0, 2.0, 0, running=0), 50.0)
+        self.assertEqual((out["dec_last"], out["dec_last_age"]), (100.0, 39.0))
+        out = r.update(self.metrics(400, 0, 400, 0, 4.0, 0), 51.0)
+        self.assertEqual((out["dec_last"], out["dec_last_age"]), (100.0, 0.0))
 
     def test_an_average_never_measured_has_no_age(self):
         out = agent.Rates().update(self.metrics(0, 0, 0, 0, 0, 0), 10.0)
