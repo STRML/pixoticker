@@ -73,6 +73,9 @@ class Board:
                   "mem_total_gb": number(body.get("mem_total_gb")),
                   "running": number(body.get("running"))}
         report.update({k: number(body.get(k)) for k in RATE_FIELDS})
+        follows = body.get("follows")
+        report["worker"] = body.get("worker") is True
+        report["follows"] = follows if follows in self.names else None
         with self.lock:
             self.reports[name] = report
             self.seen[name] = self.clock()
@@ -81,7 +84,26 @@ class Board:
     def nodes(self):
         now = self.clock()
         with self.lock:
-            return [self._view(n, now) for n in self.names]
+            views = [self._view(n, now) for n in self.names]
+            self._mirror(views)
+            return views
+
+    def _mirror(self, views):
+        """A tensor-parallel worker has no server of its own, so it reports no tokens, yet every rank
+        decodes every token. Its view shows its leader's rates and state instead: the node it names, or
+        else the busiest fresh node that is not a worker. A worker never follows a worker or itself."""
+        by_name = {v.name: v for v in views}
+        is_worker = {n: bool((self.reports.get(n) or {}).get("worker")) for n in self.names}
+        servers = [v for v in views if v.fresh and not is_worker[v.name]]
+        for v in views:
+            if not is_worker[v.name] or not v.fresh:
+                continue
+            named = self.reports[v.name]["follows"]
+            lead = by_name.get(named) if named else max(servers, key=lambda s: s.activity, default=None)
+            if lead is None or not lead.fresh or is_worker[lead.name]:
+                continue
+            v.dec, v.pre, v.dec_last, v.pre_last = lead.dec, lead.pre, lead.dec_last, lead.pre_last
+            v.state, v.tp = lead.state, lead.name
 
     def _view(self, name, now):
         node = Node(name, hist=list(self.hist[name]))
@@ -108,7 +130,7 @@ class Board:
         """Append every fresh node's sample to its history; call once a second."""
         for n in self.nodes():
             if n.fresh:
-                self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0))
+                self.hist[n.name].append((n.dec or 0.0, n.gpu or 0.0, n.pre or 0.0, 0.0 if n.tp else n.dec or 0.0))
 
     def layout(self, now=None):
         if self.pinned != "auto":
