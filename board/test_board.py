@@ -180,7 +180,7 @@ class Hardening(unittest.TestCase):
     def test_render_loop_survives_a_step_that_raises(self):
         calls = []
 
-        def flaky(board, relay):
+        def flaky(board, relay, dimmer=None):
             calls.append(1)
             if len(calls) < 3:
                 raise RuntimeError("boom")
@@ -326,6 +326,98 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(call(self.url + "/preview/none.png")[0], 404)
         self.assertEqual(call(self.url + "/")[0], 200)
         self.board.pin("rows")
+
+
+class NightDim(unittest.TestCase):
+    NY = "America/New_York"
+
+    def at(self, dimmer, iso):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return dimmer.factor(datetime.fromisoformat(iso).replace(tzinfo=ZoneInfo(self.NY)).timestamp())
+
+    def test_dim_from_the_start_until_the_end_the_end_is_not_dimmed(self):
+        d = boardmod.Dimmer("20:00-07:30@0.25", self.NY)
+        got = [self.at(d, f"2026-11-10T{h}") for h in
+               ("19:59", "20:00", "23:59", "00:00", "03:15", "07:29", "07:30", "12:00")]
+        self.assertEqual(got, [1.0, 0.25, 0.25, 0.25, 0.25, 0.25, 1.0, 1.0])
+
+    def test_a_window_inside_one_day_works_too(self):
+        d = boardmod.Dimmer("12:00-13:00@0.5", self.NY)
+        self.assertEqual([self.at(d, f"2026-11-10T{h}") for h in ("11:59", "12:00", "12:59", "13:00")],
+                         [1.0, 0.5, 0.5, 1.0])
+
+    def test_the_window_follows_local_time_through_daylight_saving(self):
+        d = boardmod.Dimmer("20:00-07:30@0.25", self.NY)
+        self.assertEqual(self.at(d, "2026-07-01T20:00"), 0.25)    # EDT, UTC-4
+        self.assertEqual(self.at(d, "2026-07-01T19:59"), 1.0)
+        self.assertEqual(self.at(d, "2026-12-01T20:00"), 0.25)    # EST, UTC-5
+        self.assertEqual(self.at(d, "2026-12-01T19:59"), 1.0)
+
+    def test_a_bad_spec_or_zone_is_refused_with_a_reason(self):
+        for spec in ("", "20:00", "20:00-07:30", "25:00-07:30@0.25", "20:60-07:30@0.25", "20:00-20:00@0.25",
+                     "20:00-07:30@0", "20:00-07:30@1.5", "20:00-07:30@dim"):
+            with self.assertRaises(ValueError, msg=spec):
+                boardmod.Dimmer(spec, self.NY)
+        with self.assertRaises(ValueError):
+            boardmod.Dimmer("20:00-07:30@0.25", "Mars/Olympus")
+
+    def test_dimming_scales_every_channel_and_leaves_black_black(self):
+        from PIL import Image
+        img = Image.new("RGB", (2, 1))
+        img.putpixel((0, 0), (200, 100, 50))
+        dimmed = boardmod.dim_image(img, 0.25)
+        self.assertEqual((dimmed.getpixel((0, 0)), dimmed.getpixel((1, 0))), ((50, 25, 13), (0, 0, 0)))
+        self.assertEqual(img.getpixel((0, 0)), (200, 100, 50))
+
+    def test_full_brightness_sends_the_frame_untouched(self):
+        img = layouts.render("rows", preview.busy())
+        self.assertEqual(boardmod.dim_image(img, 1.0).tobytes(), img.tobytes())
+
+    def test_a_step_pushes_the_dimmed_frame_and_pushes_again_when_the_level_changes(self):
+        class Spy:
+            def __init__(self):
+                self.sent = []
+
+            def push(self, img):
+                self.sent.append(img.tobytes())
+
+        board = boardmod.Board(["studio1"], clock=Clock())
+        board.ingest(report("studio1"))
+        d, spy = boardmod.Dimmer("20:00-07:30@0.25", self.NY), Spy()
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        epoch = lambda iso: datetime.fromisoformat(iso).replace(tzinfo=ZoneInfo(self.NY)).timestamp()
+        boardmod.step(board, spy, d, epoch("2026-11-10T19:59"))
+        boardmod.step(board, spy, d, epoch("2026-11-10T20:00"))
+        bright, dim = spy.sent
+        self.assertEqual(dim, boardmod.dim_image(board.frame()[1], 0.25).tobytes())
+        self.assertGreater(sum(bright), sum(dim) * 2)
+
+    def test_the_render_loop_hands_the_dimmer_to_every_step(self):
+        class Spy:
+            sent = []
+
+            def push(self, img):
+                self.sent.append(img.tobytes())
+
+        class Half:
+            def factor(self, now):
+                return 0.5
+
+        board = boardmod.Board(["studio1"], clock=Clock())
+        board.ingest(report("studio1"))
+        spy, real_tick = Spy(), boardmod.TICK_S
+        boardmod.TICK_S = 0.01
+        try:
+            threading.Thread(target=boardmod.render_loop, args=(board, spy, Half()), daemon=True).start()
+            deadline = time.time() + 3
+            while not spy.sent and time.time() < deadline:
+                time.sleep(0.01)
+        finally:
+            boardmod.TICK_S = real_tick
+        self.assertEqual(spy.sent[0], boardmod.dim_image(board.frame()[1], 0.5).tobytes())
+        self.assertNotEqual(spy.sent[0], board.frame()[1].tobytes())
 
 
 class TpMirror(unittest.TestCase):
