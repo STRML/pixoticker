@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "server"))
 import agent  # noqa: E402
 import board as boardmod  # noqa: E402
 import layouts  # noqa: E402
+import peaks  # noqa: E402
 import preview  # noqa: E402
 import pxtrelay  # noqa: E402
 
@@ -110,12 +111,12 @@ class BoardLogic(unittest.TestCase):
         self.board.ingest(report("studio1", dec=0.0, pre=live_pre, running=running, dec_last=dec, pre_last=pre,
                                  dec_last_age=dec_age, pre_last_age=pre_age))
 
-    def test_an_average_shows_until_its_age_passes_last_s_then_dashes(self):
+    def test_an_average_shows_until_its_age_passes_last_s_then_zero(self):
         self.ingest_last(50.0, 2000.0, 5.0, 5.0)
         self.assertEqual(self.last(), (50.0, 2000.0))
         self.ingest_last(50.0, 2000.0, boardmod.LAST_S + 1.0, boardmod.LAST_S + 1.0)
         self.assertEqual(self.last(), (None, None))
-        self.assertEqual(layouts.shown(self.board.nodes()[0], "dec", layouts.DEC_C)[0], "--")
+        self.assertEqual(layouts.shown(self.board.nodes()[0], "dec", layouts.DEC_C)[0], "0")
 
     def test_time_since_the_report_counts_toward_the_age(self):
         self.ingest_last(50.0, 2000.0, 25.0, 25.0)
@@ -336,9 +337,44 @@ class LiveNumbers(unittest.TestCase):
 
     def test_a_busy_node_with_a_stopped_phase_shows_zero_not_the_last_average(self):
         n = self.node(layouts.LIVE, dec=44.4, pre=0.0)
-        self.assertEqual(layouts.shown(n, "pre", layouts.PRE_C), ("0", layouts.DIM))
+        self.assertEqual(layouts.shown(n, "pre", layouts.PRE_C), ("0", layouts.dim(layouts.PRE_C, 0.6)))
         n = self.node(layouts.LIVE, dec=0.0, pre=1289.5)
-        self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C), ("0", layouts.DIM))
+        self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C), ("0", layouts.dim(layouts.DEC_C, 0.6)))
+
+    def test_the_cluster_total_zero_keeps_its_metric_colour(self):
+        self.assertEqual(layouts.total_text(0.0, layouts.PRE_C), ("P0", layouts.dim(layouts.PRE_C, 0.6)))
+        self.assertEqual(layouts.total_text(0.0, layouts.DEC_C), ("D0", layouts.dim(layouts.DEC_C, 0.6)))
+
+    def zero_pixels(self, name, dim_by=1.0):
+        """Pixels of the zero's colour that the rendered zero glyph adds. The baseline render is the same
+        node with the zero's text blanked, so the `P` label keeps its colour in both and cancels out."""
+        import board as boardmod
+        from unittest import mock
+        want = tuple(int(c * 0.6 * dim_by + 0.5) for c in layouts.PRE_C)
+        real = layouts.shown
+
+        def blanked(node, key, color):
+            text, col = real(node, key, color)
+            return ("" if key == "pre" and text == "0" else text), col
+
+        counts = []
+        for patch in (None, blanked):
+            nodes = [self.node(layouts.LIVE, dec=44.4, pre=0.0)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
+            with mock.patch.object(layouts, "shown", patch or real):
+                img = boardmod.dim_image(layouts.render(name, nodes), dim_by)
+            counts.append(sum(n for n, c in img.getcolors() if c == want))
+        return counts[0] - counts[1], want
+
+    def test_every_layout_draws_a_zero_prefill_in_a_colour_the_panel_can_show(self):
+        for name in layouts.LAYOUTS:
+            added, _ = self.zero_pixels(name)
+            self.assertGreater(added, 0, name)
+
+    def test_a_zero_survives_the_night_dimming_as_something_the_panel_can_show(self):
+        for name in layouts.LAYOUTS:
+            added, want = self.zero_pixels(name, 0.25)
+            self.assertGreater(added, 0, name)
+        self.assertGreaterEqual(max(want), 30)
 
     def test_a_busy_node_with_no_live_figure_shows_dashes(self):
         n = self.node(layouts.LIVE, dec=None, pre=None)
@@ -348,6 +384,12 @@ class LiveNumbers(unittest.TestCase):
         n = self.node(layouts.IDLE)
         text, colour = layouts.shown(n, "dec", layouts.DEC_C)
         self.assertEqual((text, colour), ("120", layouts.dim(layouts.DEC_C, 0.6)))
+
+    def test_an_idle_node_with_no_fresh_average_reads_zero_and_with_no_figure_dashes(self):
+        zero = self.node(layouts.IDLE, dec_last=None, pre_last=None)
+        self.assertEqual(layouts.shown(zero, "pre", layouts.PRE_C), ("0", layouts.dim(layouts.PRE_C, 0.6)))
+        nofig = self.node(layouts.IDLE, dec=None, pre=None, dec_last=None, pre_last=None)
+        self.assertEqual(layouts.shown(nofig, "pre", layouts.PRE_C), ("--", layouts.DIM))
 
     def test_a_live_figure_shows_in_the_metric_colour(self):
         n = self.node(layouts.LIVE, dec=44.4, pre=1289.5)
@@ -643,6 +685,311 @@ class AgentTp(unittest.TestCase):
         serve = "/Users/s/.local/bin/mlx-serve --serve --host 0.0.0.0 --port 11234 --metrics"
         other = "/usr/bin/python3 worker.py --coordinator 10.254.12.1:7000"
         self.assertEqual(agent.tp_role([serve, other, ""]), {"worker": False, "follows": None})
+
+
+class PeakLearning(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.p = peaks.Peaks(clock=self.clock)
+        self.tick = 0
+
+    def observe(self, key, metric, value, skip=0, wall=1.0):
+        """One observation on the next tick, or `skip` ticks later; `wall` seconds pass."""
+        self.tick += 1 + skip
+        self.p.observe(key, metric, value, self.tick)
+        self.clock.t += wall
+
+    def feed(self, key, metric, values, **kw):
+        for v in values:
+            self.observe(key, metric, v, **kw)
+
+    def assertPeak(self, key, metric, seed, want):
+        self.assertAlmostEqual(self.p.get(key, metric, seed), want, delta=0.1)
+
+    def test_the_seed_applies_until_enough_has_been_watched(self):
+        self.feed("studio1/1", "dec", [80.0] * (peaks.LEARN_N + peaks.HOLD - 2))
+        self.assertPeak("studio1/1", "dec", 150.0, 150.0)
+        self.feed("studio1/1", "dec", [80.0])
+        self.assertPeak("studio1/1", "dec", 150.0, 80.0)
+
+    def test_the_learned_peak_is_the_highest_value_that_held(self):
+        self.feed("a/1", "dec", [50.0] * 70 + [90.0, 90.0, 90.0] + [60.0] * 5)
+        self.assertPeak("a/1", "dec", 150.0, 90.0)
+
+    def test_a_spike_shorter_than_the_hold_does_not_set_the_peak(self):
+        self.feed("a/1", "dec", [50.0] * 70 + [400.0, 400.0] + [50.0] * 5)
+        self.assertPeak("a/1", "dec", 150.0, 50.0)
+
+    def test_a_pause_breaks_the_hold(self):
+        self.feed("a/1", "dec", [50.0] * 70 + [400.0, 400.0, 0.0, 400.0, 400.0, 0.0, 400.0])
+        self.assertPeak("a/1", "dec", 150.0, 50.0)
+
+    def test_a_skipped_tick_breaks_the_hold_however_little_time_passed(self):
+        self.feed("a/1", "dec", [50.0] * 70)
+        self.feed("a/1", "dec", [400.0, 400.0], wall=0.1)
+        self.observe("a/1", "dec", 400.0, skip=1, wall=0.1)
+        self.assertPeak("a/1", "dec", 150.0, 50.0)
+
+    def test_consecutive_ticks_hold_however_much_time_passes_between_them(self):
+        self.feed("a/1", "dec", [50.0] * 70)
+        self.feed("a/1", "dec", [90.0] * 3, wall=1.7)         # a slow relay push
+        self.assertPeak("a/1", "dec", 150.0, 90.0)
+        self.feed("a/1", "dec", [120.0] * 3, wall=45.0)       # a very slow one
+        self.assertPeak("a/1", "dec", 150.0, 120.0)
+
+    def test_a_change_of_key_ends_the_run_even_if_it_comes_back_the_next_tick(self):
+        self.feed("a/1", "dec", [50.0] * 70)
+        self.feed("a/1", "dec", [400.0, 400.0])
+        self.observe("a/2", "dec", 400.0)                     # a worker joined for one tick
+        self.observe("a/1", "dec", 400.0)
+        self.assertPeak("a/1", "dec", 150.0, 50.0)
+
+    def test_keys_and_metrics_keep_separate_runs(self):
+        self.feed("a/1", "dec", [50.0] * 70)
+        self.feed("b/1", "dec", [50.0] * 70)
+        for tick_of in range(3):
+            self.tick += 1
+            self.p.observe("a/1", "dec", 90.0, self.tick)
+            self.p.observe("b/1", "dec", 400.0 if tick_of != 1 else 0.0, self.tick)
+            self.clock.t += 1
+        self.assertPeak("a/1", "dec", 150.0, 90.0)
+        self.assertPeak("b/1", "dec", 150.0, 50.0)
+
+    def test_the_peak_halves_every_half_life(self):
+        self.feed("a/1", "dec", [100.0] * 70)
+        self.clock.t += peaks.HALF_LIFE_S
+        self.assertAlmostEqual(self.p.get("a/1", "dec", 150.0), 50.0, delta=0.2)
+
+    def test_a_new_high_replaces_a_decayed_peak(self):
+        self.feed("a/1", "dec", [100.0] * 70)
+        self.clock.t += peaks.HALF_LIFE_S
+        self.feed("a/1", "dec", [80.0] * 4)
+        self.assertPeak("a/1", "dec", 150.0, 80.0)
+
+    def test_metrics_and_groups_learn_separately(self):
+        self.feed("a/1", "dec", [40.0] * 70)
+        self.feed("a/4", "dec", [150.0] * 70)
+        self.feed("a/1", "pre", [900.0] * 70)
+        self.assertPeak("a/1", "dec", 1.0, 40.0)
+        self.assertPeak("a/4", "dec", 1.0, 150.0)
+        self.assertPeak("a/1", "pre", 1.0, 900.0)
+
+
+class PeakPersistence(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="pxt-peaks-")
+        self.path = os.path.join(self.dir, "peaks.json")
+        self.clock = Clock()
+
+    def learned(self):
+        p = peaks.Peaks(self.path, clock=self.clock)
+        for tick in range(1, peaks.LEARN_N + 6):
+            p.observe("studio1/4", "dec", 77.0, tick)
+            self.clock.t += 1
+        return p
+
+    def test_a_saved_peak_survives_a_restart(self):
+        p = self.learned()
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertTrue(p.save_if_due())
+        again = peaks.Peaks(self.path, clock=self.clock)
+        self.assertAlmostEqual(again.get("studio1/4", "dec", 150.0), 77.0, delta=0.1)
+
+    def test_saving_is_rate_limited_and_only_when_something_changed(self):
+        p = self.learned()
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertTrue(p.save_if_due())
+        self.assertFalse(p.save_if_due())
+        for tick in range(1000, 1000 + peaks.HOLD):       # a held run changes the peak
+            p.observe("studio1/4", "dec", 77.0, tick)
+            self.clock.t += 1
+        self.assertFalse(p.save_if_due())     # changed, but saved only a moment ago
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertTrue(p.save_if_due())
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertFalse(p.save_if_due())     # nothing since: no write
+
+    def test_a_corrupt_or_foreign_file_is_ignored_not_fatal(self):
+        bodies = ("not json", "[]", '{"peaks": {"a|dec": "x", "b": [1,2,3]}}',
+                  '{"peaks": {"a|dec": [-5, 0, 99]}}', '{"peaks": {"a|dec": [true, 0, 99]}}',
+                  '{"peaks": {"a|dec": [0, 0, 99]}}', '{"peaks": {"a|dec": [1, 0, Infinity]}}',
+                  '{"peaks": {"a|dec": [NaN, 0, 99]}}', '{"peaks": {"a|dec": [Infinity, 0, 99]}}',
+                  '{"peaks": {"a|dec": [1, NaN, 99]}}', '{"peaks": {"a|dec": [1, 0, ' + "9" * 400 + ']}}',
+                  '{"peaks": {"a|dec": [' + "9" * 400 + ', 0, 99]}}')
+        for body in bodies:
+            with open(self.path, "w") as f:
+                f.write(body)
+            self.assertEqual(peaks.Peaks(self.path, clock=self.clock).get("a", "dec", 150.0), 150.0, body)
+
+    def test_an_unwritable_path_is_logged_and_does_not_raise(self):
+        p = peaks.Peaks(os.path.join(self.dir, "no", "such", "dir", "peaks.json"), clock=self.clock)
+        for tick in range(1, peaks.HOLD + 1):
+            p.observe("a", "dec", 5.0, tick)
+        self.clock.t += peaks.SAVE_EVERY_S
+        self.assertFalse(p.save_if_due())
+
+    def test_the_file_is_replaced_atomically(self):
+        p = self.learned()
+        self.clock.t += peaks.SAVE_EVERY_S
+        p.save_if_due()
+        self.assertEqual(sorted(os.listdir(self.dir)), ["peaks.json"])
+
+
+class BoardPeaks(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.board = boardmod.Board(["studio1", "studio2", "studio3", "studio4"], clock=self.clock,
+                                    peaks=peaks.Peaks(clock=self.clock))
+
+    def run_job(self, dec, seconds, workers=(), idle=()):
+        for _ in range(seconds):
+            self.board.ingest(report("studio1", dec=dec, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            for w in workers:
+                self.board.ingest(report(w, dec=0.0, pre=0.0, running=None, worker=True, follows="studio1"))
+            for w in idle:      # the same boxes once the job has ended: still reporting, no longer workers
+                self.board.ingest(report(w, dec=0.0, pre=0.0, running=0, dec_last=None, pre_last=None,
+                                         dec_last_age=None, pre_last_age=None))
+            self.board.tick()
+            self.clock.t += 1
+
+    def view(self, name):
+        return {n.name: n for n in self.board.nodes()}[name]
+
+    def test_a_solo_node_learns_its_own_peak(self):
+        self.run_job(60.0, peaks.LEARN_N + 10)
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 60.0, delta=0.1)
+
+    def test_a_prefill_peak_is_learned_beside_the_decode_peak(self):
+        for _ in range(peaks.LEARN_N + 10):
+            self.board.ingest(report("studio1", dec=60.0, pre=1800.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            self.board.tick()
+            self.clock.t += 1
+        n = self.view("studio1")
+        self.assertAlmostEqual(n.pre_peak, 1800.0, delta=2.0)
+        self.assertAlmostEqual(n.dec_peak, 60.0, delta=0.5)
+
+    def test_the_peak_is_unknown_until_learned(self):
+        self.run_job(60.0, 5)
+        self.assertIsNone(self.view("studio1").dec_peak)
+
+    def test_an_idle_tick_between_two_busy_stretches_does_not_join_them(self):
+        self.run_job(50.0, peaks.LEARN_N + 10)
+        for dec, running in ((400.0, 1), (400.0, 1), (0.0, 0), (400.0, 1)):
+            self.board.ingest(report("studio1", dec=dec, pre=0.0, running=running, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            self.board.tick()
+            self.clock.t += 1
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
+
+    def test_a_delayed_observe_does_not_join_the_runs_either_side_of_an_idle_tick(self):
+        self.run_job(50.0, peaks.LEARN_N + 10)
+        live = dict(pre=0.0, running=1, dec_last=None, pre_last=None, dec_last_age=None, pre_last_age=None)
+        idle = dict(live, running=0)
+        for dt, dec, body in ((0.0, 400.0, live), (0.8, 400.0, live), (0.2, 0.0, idle), (1.0, 400.0, live)):
+            self.clock.t += dt
+            self.board.ingest(report("studio1", dec=dec, **body))
+            self.board.tick()
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
+
+    def test_a_worker_joining_for_one_tick_does_not_join_the_solo_runs_either_side(self):
+        self.run_job(50.0, peaks.LEARN_N + 10)
+        for workers in ((), (), ("studio2",), ()):
+            self.run_job(400.0, 1, workers=workers, idle=() if workers else ("studio2",))
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
+
+    def test_a_slow_relay_push_between_ticks_does_not_stop_a_peak_being_learned(self):
+        for _ in range(peaks.LEARN_N + 10):
+            self.board.ingest(report("studio1", dec=60.0, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            self.board.tick()
+            self.clock.t += 1.7
+            self.board.ingest(report("studio1", dec=60.0, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 60.0, delta=0.5)
+
+    def test_a_node_that_turns_into_a_worker_for_a_tick_does_not_join_its_runs(self):
+        self.run_job(50.0, peaks.LEARN_N + 10)
+        steps = [("studio1", 400.0, False), ("studio1", 400.0, False), ("studio1", 400.0, True), ("studio1", 400.0, False)]
+        for _, dec, worker in steps:
+            self.board.ingest(report("studio3", dec=400.0, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None))
+            self.board.ingest(report("studio1", dec=dec, pre=0.0, running=1, dec_last=None, pre_last=None,
+                                     dec_last_age=None, pre_last_age=None, worker=worker, follows="studio3" if worker else None))
+            self.board.tick()
+            self.clock.t += 1
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 50.0, delta=0.5)
+
+    def test_workers_add_no_observations_of_their_own(self):
+        self.run_job(44.0, peaks.LEARN_N // 2 + peaks.HOLD, workers=("studio2", "studio3", "studio4"))
+        self.assertIsNone(self.view("studio1").dec_peak)
+
+    def test_a_stale_node_carries_no_peak(self):
+        self.run_job(60.0, peaks.LEARN_N + 10)
+        self.clock.t += 60
+        self.assertEqual(self.view("studio1").state, layouts.STALE)
+        self.assertIsNone(self.view("studio1").dec_peak)
+
+    def test_the_render_loop_step_saves_the_peaks_when_due(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(prefix="pxt-state-"), "peaks.json")
+        board = boardmod.Board(["studio1"], clock=self.clock, peaks=peaks.Peaks(path, clock=self.clock))
+        for _ in range(peaks.LEARN_N + 10):
+            board.ingest(report("studio1", dec=50.0, pre=0.0, running=1))
+            boardmod.step(board, None)
+            self.clock.t += 1
+        with open(path) as f:
+            self.assertIn("studio1/1|dec", json.load(f)["peaks"])
+
+    def test_a_tp_group_is_learned_under_its_size_and_workers_share_it(self):
+        self.run_job(44.0, peaks.LEARN_N + 10, workers=("studio2", "studio3", "studio4"))
+        for n in ("studio1", "studio2", "studio3", "studio4"):
+            self.assertAlmostEqual(self.view(n).dec_peak, 44.0, delta=0.1)
+        self.run_job(120.0, peaks.LEARN_N + 10, idle=("studio2", "studio3", "studio4"))
+        self.assertAlmostEqual(self.view("studio1").dec_peak, 120.0, delta=0.1)
+        self.run_job(44.0, 1, workers=("studio2", "studio3", "studio4"))
+        self.assertAlmostEqual(self.view("studio2").dec_peak, 44.0, delta=0.1)
+
+
+class RangeBars(unittest.TestCase):
+    def node(self, dec, pre, dec_peak=None, pre_peak=None, state=layouts.LIVE):
+        return layouts.Node("studio1", state, gpu=80.0, mem=50.0, dec=dec, pre=pre, dec_peak=dec_peak, pre_peak=pre_peak)
+
+    def bar(self, img, colour, x0, x1, y=37):
+        px = img.load()
+        return sum(1 for x in range(x0, x1) if px[x, y] == colour)
+
+    def render(self, node):
+        return layouts.render("focus", [node] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)])
+
+    def test_the_bars_show_the_rate_as_a_fraction_of_its_peak(self):
+        img = self.render(self.node(40.0, 1500.0, dec_peak=200.0, pre_peak=3000.0))
+        self.assertEqual(self.bar(img, layouts.DEC_C, 0, 64), round(layouts.RATE_BAR_W * 0.2))
+        self.assertEqual(self.bar(img, layouts.PRE_C, 64, 128), round(layouts.RATE_BAR_W * 0.5))
+
+    def test_a_rate_above_its_peak_fills_the_bar_and_zero_leaves_it_empty(self):
+        img = self.render(self.node(300.0, 0.0, dec_peak=200.0, pre_peak=3000.0))
+        self.assertEqual(self.bar(img, layouts.DEC_C, 0, 64), layouts.RATE_BAR_W)
+        self.assertEqual(self.bar(img, layouts.PRE_C, 64, 128), 0)
+
+    def test_an_unlearned_peak_uses_the_default_scale(self):
+        img = self.render(self.node(75.0, 1500.0))
+        self.assertEqual(self.bar(img, layouts.DEC_C, 0, 64), round(layouts.RATE_BAR_W * 75.0 / layouts.DEC_FULL))
+        self.assertEqual(self.bar(img, layouts.PRE_C, 64, 128), round(layouts.RATE_BAR_W * 1500.0 / layouts.PRE_FULL))
+
+    def test_the_gpu_and_memory_bars_still_draw_below_the_rate_bars(self):
+        img = self.render(self.node(40.0, 0.0, dec_peak=200.0, pre_peak=3000.0))
+        px = img.load()
+        self.assertEqual(px[2, 40], layouts.GPU_C)
+        self.assertEqual(px[2, 43], layouts.MEM_C)
+
+    def test_an_idle_node_draws_empty_rate_bars(self):
+        n = self.node(0.0, 0.0, dec_peak=200.0, pre_peak=3000.0, state=layouts.IDLE)
+        n.dec_last, n.pre_last = 120.0, 2400.0
+        img = self.render(n)
+        self.assertEqual(self.bar(img, layouts.DEC_C, 0, 64) + self.bar(img, layouts.PRE_C, 64, 128), 0)
 
 
 class AgentRates(unittest.TestCase):

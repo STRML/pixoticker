@@ -75,8 +75,16 @@ agent.py (each Mac) ──POST /ingest──▶ board.py ──POST /frame──
 Each agent reads the local `/metrics.json` once a second and posts one small JSON document with
 `X-Api-Key`. Live rates are the counter growth over 8 s, because the server's counters move in lumps
 (a prefill chunk, a round of drafted tokens). A busy node shows its live rate; an idle one shows the
-last request's average, dimmed, until it is 30 s old (`LAST_S`), then `--`. The agent reports each average with its age (`dec_last_age`, `pre_last_age`), so the clocks of the Studios and the board need not agree, and an average with no age is not shown (an agent older than this change shows `--` there until it is updated). A node that stops reporting for 10 s turns grey with `STALE`, so a dead
+last request's average, dimmed, until it is 30 s old (`LAST_S`), then `0`; a busy node whose prefill or decode has stopped shows a dimmed `0` too, in the metric's own colour (grey at the night-dimming level is nearly black on the panel). `--` means no data. The agent reports each average with its age (`dec_last_age`, `pre_last_age`), so the clocks of the Studios and the board need not agree, and an average with no age is not shown (an agent older than this change shows `0` there until it is updated). A node that stops reporting for 10 s turns grey with `STALE`, so a dead
 agent never leaves old numbers on the panel. A node that never reported shows `--`.
+
+**Range bars.** The focus view draws a bar under the decode and prefill numbers: the live rate as a fraction of
+that node's usual peak, so 40 tok/s against a 200 tok/s peak reads as 20%. The board learns the peak by watching
+(`board/peaks.py`): the highest value that held for three samples in a row (a one-sample spike cannot set the
+scale), decaying with a three-day half-life so it follows a node that got slower. It is kept per node and per
+number of nodes sharing the job, because four Studios in tensor parallel decode at a different rate from one
+alone, and per metric. Until 60 such samples have been seen the bars use a default scale (150 tok/s decode,
+3000 tok/s prefill). `--state-file` (env `BOARD_STATE_FILE`) saves the peaks every minute, so a restart keeps them.
 
 **GPU temperature.** The agent runs `~/.local/bin/latch sensors` (Latch is on every Studio; no sudo) every 10 s,
 about 0.4 s of one core each time, and reports the GPU's degrees C as `temp`; a failed read keeps the last figure for

@@ -31,7 +31,9 @@ DEC_C = (0, 225, 120)
 PRE_C = (255, 190, 40)
 BAD = (255, 80, 80)
 
-DEC_FULL = 150.0    # tok/s floor of the decode history scale
+DEC_FULL = 150.0    # tok/s floor of the decode history scale, and the focus bar's scale until a peak is learned
+PRE_FULL = 3000.0   # the focus bar's prefill scale until a peak is learned
+RATE_BAR_W = 60     # the focus view's decode and prefill bars
 HIST = 62           # samples a sparkline shows
 MEM_WARN = 85.0
 BAR_X, BAR_W = 32, 10   # spark: the GPU and memory bars beside their numbers
@@ -53,6 +55,10 @@ class Node:
     hist: list = field(default_factory=list)   # [(dec, gpu, pre, share), ...] oldest first; share is its part of the cluster decode total
     tp: str | None = None   # a tensor-parallel worker: the node whose rates it shows
     temp: float | None = None   # GPU degrees C, from the node's agent
+    watts: float | None = None   # whole-machine power draw in watts (SMC PD0R)
+    cpu: float | None = None   # CPU busy percent, 0 to 100
+    dec_peak: float | None = None   # the usual peak of each rate, learned by the board; None until it has watched enough
+    pre_peak: float | None = None
 
     @property
     def tag(self):
@@ -93,16 +99,18 @@ def dim(color, k=0.35):
 
 def shown(node, key, color):
     """(text, colour) for a rate. A busy node shows its live figure, and 0 when that phase has stopped:
-    a request's average is history, and showing it while the node works reads as a live number. An idle
-    node shows its last request's average dimmed, else dashes. A node that is not reporting shows dashes."""
+    a request's average is history, and showing it while the node works reads as a live number. The zero is the
+    metric's own colour dimmed, not grey: grey at the night-dimming level is close to black on the panel. An idle
+    node shows its last request's average dimmed while it is fresh, else 0. Dashes mean no data: a node that is
+    not reporting, or one whose agent sent no figure."""
     if not node.fresh:
         return "--", DIM
     live, last = getattr(node, key), getattr(node, key + "_last")
     if live:
         return rate(live), color
-    if node.state == LIVE:
-        return ("--", DIM) if live is None else ("0", DIM)
-    return (rate(last), dim(color, 0.6)) if last else ("--", DIM)
+    if node.state != LIVE and last:
+        return rate(last), dim(color, 0.6)
+    return ("--", DIM) if live is None else ("0", dim(color, 0.6))
 
 
 class Canvas:
@@ -266,7 +274,7 @@ def total_history(nodes):
 
 
 def total_text(value, color):
-    return ("D" if color == DEC_C else "P") + (rate(value) if value else "0"), color if value else DIM
+    return ("D" if color == DEC_C else "P") + (rate(value) if value else "0"), color if value else dim(color, 0.6)
 
 
 def area(c, x, y, w, h, samples, peak, color):
@@ -343,8 +351,11 @@ def focus(nodes):
             c.text_right(122 - font.width(gm), 1, *t)
         c.big(66, 10, pt, pc, scale=3)
         c.text(66, 30, "PREFILL TOK/S", DIM)
-        c.hbar(1, 38, 126, 2, frac(top.gpu), gc)
-        c.hbar(1, 41, 126, 2, frac(top.mem), mc)
+        live_dec, live_pre = top.dec or 0, top.pre or 0
+        c.hbar(1, 37, RATE_BAR_W, 2, live_dec / (top.dec_peak or DEC_FULL), DEC_C)
+        c.hbar(66, 37, RATE_BAR_W, 2, live_pre / (top.pre_peak or PRE_FULL), PRE_C)
+        c.hbar(1, 40, 126, 2, frac(top.gpu), gc)
+        c.hbar(1, 43, 126, 2, frac(top.mem), mc)
     else:
         c.text(14, 1, status_text(top), BAD if top.state == STALE else DIM)
     c.rect(0, 45, W, 1, RULE)
