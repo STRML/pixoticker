@@ -40,7 +40,8 @@ ROWS_BAR_W = 88     # rows: GPU and memory bars, leaving the right edge for watt
 FOCUS_BAR_W = 64    # focus: the same, leaving room for the GPU, CPU and memory percentages
 HIST = 36           # samples a sparkline shows
 MEM_WARN = 85.0
-BAR_X, BAR_W = 34, 8    # spark: the GPU and memory bars beside their numbers, clear of G100%
+BAR_X, BAR_W = 34, 8    # spark: the GPU and memory bars beside their numbers
+SUMMARY_X = (1, 22, 43, 64, 85)   # the cluster bar's first five figures, 21 px apart; prefill ends the row at 126
 
 LIVE, IDLE, STALE, ABSENT = "live", "idle", "stale", "absent"
 
@@ -94,7 +95,8 @@ def rate(v):
 
 
 def pct(v):
-    return "--" if v is None else f"{v:02.0f}%"
+    """Two digits and a sign, shown as 99% at most: nothing here is expected to reach 100."""
+    return "--" if v is None else f"{min(v, 99):02.0f}%"
 
 
 def dim(color, k=0.35):
@@ -171,7 +173,7 @@ def cpu_text(cpu):
     return None if cpu is None else ("C" + pct(cpu), CPU_C)
 
 
-STAT_W = 5 * font.ADVANCE   # the widest figure, C100%; every other is four characters, so its slot keeps a blank cell to the left
+STAT_W = 5 * font.ADVANCE   # a slot holds five characters; every per-node figure is four, so it keeps a blank cell to its left
 
 
 def stats_width(parts):
@@ -335,11 +337,13 @@ def summary_parts(nodes):
 
 
 def draw_summary(c, nodes):
-    """The top bar of focus, spark, cols and quad: the whole cluster at a glance, no label needed."""
-    gpu, *middle, prefill = summary_parts(nodes)
-    c.text(4, 1, *gpu)
-    draw_stats(c, 20, 1, middle)
-    c.text_right(125, 1, *prefill)
+    """The top bar of focus, spark, cols and quad: the whole cluster at a glance, no label needed. It starts where the
+    node tags do (x 1) and ends where the rates below end (right edge 126), with an even gap between figures."""
+    *left, prefill = summary_parts(nodes)
+    for x, part in zip(SUMMARY_X, left):
+        if part:
+            c.text(x, 1, *part)
+    c.text_right(126, 1, *prefill)
     c.rect(0, 7, W, 1, RULE)
 
 

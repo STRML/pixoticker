@@ -411,14 +411,15 @@ class TextAndGeometry(unittest.TestCase):
 
     def test_cpu_text_is_a_c_the_whole_percent_and_its_sign(self):
         self.assertEqual(layouts.cpu_text(9.4)[0], "C09%")
-        self.assertEqual(layouts.cpu_text(100.0)[0], "C100%")
+        self.assertEqual(layouts.cpu_text(100.0)[0], "C99%")
         self.assertIsNone(layouts.cpu_text(None))
 
-    def test_percent_figures_carry_a_sign_and_pad_to_two_digits_so_they_do_not_jump(self):
+    def test_percent_figures_carry_a_sign_pad_to_two_digits_and_stop_at_99(self):
         self.assertEqual(layouts.pct(93.4), "93%")
         self.assertEqual(layouts.pct(8.0), "08%")
         self.assertEqual(layouts.pct(0.0), "00%")
-        self.assertEqual(layouts.pct(100.0), "100%")
+        self.assertEqual(layouts.pct(99.6), "99%")
+        self.assertEqual(layouts.pct(100.0), "99%")
         self.assertEqual(layouts.pct(None), "--")
 
     def lit_columns(self, canvas, colour):
@@ -433,12 +434,14 @@ class TextAndGeometry(unittest.TestCase):
         self.assertEqual(end, 10 + layouts.stats_width(parts))
         self.assertEqual(max(self.lit_columns(c, layouts.CPU_C)), end - 1 - 1)
 
-    def test_the_widest_figure_fills_its_slot_and_the_figure_before_it_stays_clear(self):
+    def test_a_five_character_figure_fills_its_slot_and_the_figure_before_it_stays_clear(self):
+        kilowatts = layouts.watts_total([layouts.Node("studio1", layouts.LIVE, watts=1200.0)])
+        self.assertEqual(kilowatts[0], "1.2KW")
         c = layouts.Canvas()
-        layouts.draw_stats(c, 10, 0, [layouts.watts_text(999.0), layouts.cpu_text(100.0)])
-        watts, cpu = self.lit_columns(c, layouts.WATT_C), self.lit_columns(c, layouts.CPU_C)
-        self.assertEqual(min(cpu), 10 + 20)
-        self.assertLess(max(watts), min(cpu) - 1)
+        layouts.draw_stats(c, 10, 0, [layouts.cpu_text(99.0), kilowatts])
+        cpu, watts = self.lit_columns(c, layouts.CPU_C), self.lit_columns(c, layouts.WATT_C)
+        self.assertEqual(min(watts), 10 + 20)
+        self.assertLess(max(cpu), min(watts) - 1)
 
     def test_a_figure_gaining_a_digit_does_not_move_its_neighbours(self):
         def drawn(watts, cpu):
@@ -549,7 +552,7 @@ class Drawn(unittest.TestCase):
         places = {"rows": (("r", 32, 1), ("r", 72, 1)), "cols": (("l", 3, 37), ("l", 3, 44)),
                   "quad": (("r", 23, 29), ("r", 63, 29)), "spark": (("l", 14, 9), ("l", 14, 15)),
                   "focus": (("r", 86, 39), ("r", 126, 39))}
-        for gpu, mem, text in ((88.0, 71.0, ("G88%", "M71%")), (5.0, 5.0, ("G05%", "M05%")), (100.0, 100.0, ("G100%", "M100%"))):
+        for gpu, mem, text in ((88.0, 71.0, ("G88%", "M71%")), (5.0, 5.0, ("G05%", "M05%")), (100.0, 100.0, ("G99%", "M99%"))):
             nodes = [layouts.Node("studio1", layouts.LIVE, gpu=gpu, mem=mem, dec=118.4, pre=2400.0, **self.WIDEST)]
             nodes += [layouts.Node(f"studio{i}", layouts.LIVE, gpu=gpu, mem=mem, dec=90.0, pre=0.0, **self.WIDEST) for i in (2, 3, 4)]
             gc, mc = layouts.bar_colors(nodes[0])

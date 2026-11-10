@@ -265,13 +265,15 @@ class Totals(unittest.TestCase):
         top = layouts.render("focus", preview.busy()).crop((0, 0, 128, 7))
         self.assertIn(layouts.DEC_C, [c for _, c in top.getcolors()])
 
-    def test_the_cluster_bar_has_the_same_margin_left_and_right(self):
+    def test_the_cluster_bar_lines_up_with_the_tags_and_the_rates_below_it_in_spark(self):
         for gpu in (5.0, 67.0, 100.0):
             nodes = [layouts.Node(f"studio{i}", layouts.LIVE, gpu=gpu, mem=50.0, cpu=12.0, watts=200.0, dec=118.0, pre=2400.0)
                      for i in (1, 2, 3, 4)]
-            img = layouts.render("focus", nodes)
-            ink = [x for x in range(layouts.W) for y in range(1, 7) if img.getpixel((x, y)) != layouts.BG]
-            self.assertEqual(min(ink), layouts.W - 1 - max(ink), gpu)
+            img = layouts.render("spark", nodes)
+            at = lambda colour, rows: [x for x in range(layouts.W) for y in rows if img.getpixel((x, y)) == colour]
+            bar = [x for x in range(layouts.W) for y in range(1, 7) if img.getpixel((x, y)) != layouts.BG]
+            self.assertEqual(min(bar), min(at(layouts.FG, range(12, 18))), gpu)
+            self.assertEqual(max(bar), max(at(layouts.PRE_C, range(15, 21))), gpu)
 
     def test_rows_has_no_room_for_the_cluster_bar(self):
         self.assertNotEqual(layouts.render("rows", preview.busy()).crop((0, 0, 128, 8)).tobytes(),
