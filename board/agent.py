@@ -108,7 +108,9 @@ class Rates:
                 self.last_dec, self.dec_at = dec, now
             if pre:
                 self.last_pre, self.pre_at = pre, now
-        return {"dec": self._rate("gen"), "pre": self._rate("pl"), **self._last(now),
+        prefilling = g.get("requests_prefilling")
+        pre = 0.0 if prefilling == 0 else self._rate("pl")   # the window averages 8 s; nothing prefilling is 0 at once
+        return {"dec": self._rate("gen"), "pre": pre, **self._last(now),
                 "running": g.get("requests_running"), "serving": True}
 
     def _last(self, now):
