@@ -132,7 +132,7 @@ class BoardLogic(unittest.TestCase):
         self.ingest_last(120.0, 5000.0, 100.0, 100.0, running=1, live_pre=2800.0)
         n = self.board.nodes()[0]
         self.assertEqual((n.state, n.dec_last, n.pre_last), (layouts.LIVE, None, None))
-        self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C)[0], "--")
+        self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C)[0], "0")
 
     def test_each_average_expires_on_its_own_age(self):
         self.ingest_last(120.0, 6000.0, boardmod.LAST_S + 1.0, 1.0)
@@ -326,6 +326,60 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(call(self.url + "/preview/none.png")[0], 404)
         self.assertEqual(call(self.url + "/")[0], 200)
         self.board.pin("rows")
+
+
+class LiveNumbers(unittest.TestCase):
+    def node(self, state, **kw):
+        base = dict(name="studio1", state=state, gpu=80.0, mem=50.0, dec=0.0, pre=0.0, dec_last=120.0, pre_last=2400.0)
+        base.update(kw)
+        return layouts.Node(**base)
+
+    def test_a_busy_node_with_a_stopped_phase_shows_zero_not_the_last_average(self):
+        n = self.node(layouts.LIVE, dec=44.4, pre=0.0)
+        self.assertEqual(layouts.shown(n, "pre", layouts.PRE_C), ("0", layouts.DIM))
+        n = self.node(layouts.LIVE, dec=0.0, pre=1289.5)
+        self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C), ("0", layouts.DIM))
+
+    def test_a_busy_node_with_no_live_figure_shows_dashes(self):
+        n = self.node(layouts.LIVE, dec=None, pre=None)
+        self.assertEqual(layouts.shown(n, "dec", layouts.DEC_C)[0], "--")
+
+    def test_an_idle_node_still_shows_its_last_average_dimmed(self):
+        n = self.node(layouts.IDLE)
+        text, colour = layouts.shown(n, "dec", layouts.DEC_C)
+        self.assertEqual((text, colour), ("120", layouts.dim(layouts.DEC_C, 0.6)))
+
+    def test_a_live_figure_shows_in_the_metric_colour(self):
+        n = self.node(layouts.LIVE, dec=44.4, pre=1289.5)
+        self.assertEqual(layouts.shown(n, "pre", layouts.PRE_C), ("1.3K", layouts.PRE_C))
+
+    def box(self, img, colour, x0, x1, y0, y1):
+        px = img.load()
+        pts = [(x, y) for x in range(x0, x1) for y in range(y0, y1) if px[x, y] == colour]
+        self.assertTrue(pts, "no pixels of that colour")
+        return (min(p[0] for p in pts), max(p[0] for p in pts), min(p[1] for p in pts), max(p[1] for p in pts))
+
+    def test_focus_draws_decode_and_prefill_numbers_at_one_size_and_height(self):
+        nodes = [self.node(layouts.LIVE, dec=118.0, pre=2400.0)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
+        img = layouts.render("focus", nodes)
+        dec = self.box(img, layouts.DEC_C, 0, 64, 8, 29)
+        pre = self.box(img, layouts.PRE_C, 64, 128, 8, 29)
+        self.assertEqual((dec[2], dec[3]), (pre[2], pre[3]))
+
+    def test_a_rate_never_prints_more_than_five_characters(self):
+        for v in (0, 0.04, 9.95, 999.5, 9999.5, 9999.99, 99999.5, 999_000, 9_999_500, 1e6, 1e9):
+            self.assertLessEqual(len(layouts.rate(float(v))), 5, v)
+        self.assertEqual(layouts.rate(1e9), "999K")
+
+    def test_the_widest_focus_numbers_stay_in_their_own_half(self):
+        nodes = [self.node(layouts.LIVE, dec=9999.0, pre=9999.0)] + [layouts.Node(f"studio{i}") for i in (2, 3, 4)]
+        self.assertEqual(layouts.rate(9999.0), "10.0K")
+        img = layouts.render("focus", nodes)
+        dec = self.box(img, layouts.DEC_C, 0, 128, 8, 29)
+        pre = self.box(img, layouts.PRE_C, 0, 128, 8, 29)
+        self.assertLess(dec[1], 66)
+        self.assertGreaterEqual(pre[0], 66)
+        self.assertEqual(dec[1] - dec[0], pre[1] - pre[0])    # the same text at the same size: neither is clipped
 
 
 class NightDim(unittest.TestCase):
@@ -592,9 +646,12 @@ class AgentTp(unittest.TestCase):
 
 
 class AgentRates(unittest.TestCase):
-    def metrics(self, gen, pl, gen_total, pre_total, dec_s, pre_s, start=1, running=1):
-        return {"gauges": {"process_start_time_seconds": start, "generation_tokens_live": gen,
-                           "prefill_tokens_live": pl, "requests_running": running},
+    def metrics(self, gen, pl, gen_total, pre_total, dec_s, pre_s, start=1, running=1, prefilling=None):
+        gauges = {"process_start_time_seconds": start, "generation_tokens_live": gen,
+                  "prefill_tokens_live": pl, "requests_running": running}
+        if prefilling is not None:
+            gauges["requests_prefilling"] = prefilling
+        return {"gauges": gauges,
                 "counters": {"generation_tokens_total": gen_total, "prefill_tokens_total": pre_total},
                 "histograms": {"decode_time_seconds": {"sum": dec_s}, "prefill_time_seconds": {"sum": pre_s}}}
 
@@ -622,6 +679,21 @@ class AgentRates(unittest.TestCase):
                         (12.0, self.metrics(0, 0, 0, 6000, 0, 2.0)))
         self.assertEqual(out["pre"], 2000.0)
         self.assertEqual(out["pre_last"], 3000.0)
+
+    def test_prefill_reads_zero_the_moment_nothing_is_prefilling(self):
+        r = agent.Rates()
+        pre = lambda t, pl, total, s, prefilling: r.update(self.metrics(500, pl, 500, total, 5.0, s, running=1, prefilling=prefilling), t)
+        pre(10.0, 0, 0, 0, 1)
+        out = pre(11.0, 3000, 0, 0, 1)
+        self.assertEqual(out["pre"], 3000.0)
+        out = pre(12.0, 3000, 3000, 2.0, 0)
+        self.assertEqual((out["pre"], out["pre_last"]), (0.0, 1500.0))
+        out = pre(13.0, 3000, 3000, 2.0, 0)
+        self.assertEqual(out["pre"], 0.0)
+
+    def test_without_the_prefilling_gauge_the_windowed_rate_is_unchanged(self):
+        out = self.feed(agent.Rates(), (10.0, self.metrics(0, 0, 0, 0, 0, 0)), (11.0, self.metrics(0, 4000, 0, 0, 0, 0)))
+        self.assertEqual(out["pre"], 4000.0)
 
     def test_nothing_running_zeroes_live_rates_at_once(self):
         r = agent.Rates()

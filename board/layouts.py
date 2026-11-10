@@ -66,8 +66,11 @@ class Node:
 
 
 def rate(v):
+    """At most five characters, so a focus number at scale 3 stays in its half of the panel: no real
+    server nears a million tok/s, and a corrupt report is capped at 999K."""
     if v is None:
         return "--"
+    v = min(v, 999_000)
     if v < 10:
         return f"{v:.1f}"
     if v < 1000:
@@ -86,13 +89,16 @@ def dim(color, k=0.35):
 
 
 def shown(node, key, color):
-    """(text, colour) for a rate: the live figure while busy, else the last
-    request's average dimmed, else dashes. A node that is not reporting shows dashes."""
+    """(text, colour) for a rate. A busy node shows its live figure, and 0 when that phase has stopped:
+    a request's average is history, and showing it while the node works reads as a live number. An idle
+    node shows its last request's average dimmed, else dashes. A node that is not reporting shows dashes."""
     if not node.fresh:
         return "--", DIM
     live, last = getattr(node, key), getattr(node, key + "_last")
     if live:
         return rate(live), color
+    if node.state == LIVE:
+        return ("--", DIM) if live is None else ("0", DIM)
     return (rate(last), dim(color, 0.6)) if last else ("--", DIM)
 
 
@@ -318,8 +324,8 @@ def focus(nodes):
         c.big(1, 10, dt, dc, scale=3)
         c.text(1, 30, "DECODE TOK/S", DIM)
         c.text_right(126, 1, f"G{pct(top.gpu)} M{pct(top.mem)}", FG)
-        c.big(66, 10, pt, pc, scale=2)
-        c.text(66, 24, "PREFILL TOK/S", DIM)
+        c.big(66, 10, pt, pc, scale=3)
+        c.text(66, 30, "PREFILL TOK/S", DIM)
         c.hbar(1, 38, 126, 2, frac(top.gpu), gc)
         c.hbar(1, 41, 126, 2, frac(top.mem), mc)
     else:
