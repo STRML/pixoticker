@@ -73,8 +73,8 @@ class Rates:
     cumulative; prefill_tokens_live is progress inside one request and resets, so
     only its increases count. With nothing running the live rates are 0 at once.
     last: when a request finished in the interval, its average (tokens over the
-    phase's own seconds), which stays on the board dim until the next request
-    replaces it.
+    phase's own seconds). The agent keeps reporting it until the next request
+    replaces it; the board shows it dim for LAST_S seconds after it changes.
     """
 
     def __init__(self):

@@ -38,7 +38,7 @@ TTL_S = 10
 TICK_S = 1.0
 ROTATE_S = 15
 BUSY_TPS = 0.5
-LAST_S = 30   # how long an idle node keeps showing its last request average
+LAST_S = 30   # how long a node shows a request average after the agent reported it
 MAX_BODY = 4096
 RATE_FIELDS = ("dec", "pre", "dec_last", "pre_last")
 
@@ -62,7 +62,7 @@ class Board:
         self.pinned = pinned
         self.rotation = rotation or list(layouts.LAYOUTS)
         self.started = clock()
-        self.busy_at = {}
+        self.last_at = {}   # when each node last reported a different request average
 
     def ingest(self, body):
         """Store one agent report; returns an error string or None."""
@@ -74,6 +74,9 @@ class Board:
                   "running": number(body.get("running"))}
         report.update({k: number(body.get(k)) for k in RATE_FIELDS})
         with self.lock:
+            before = self.reports.get(name) or {}
+            if any(before.get(k) != report[k] for k in ("dec_last", "pre_last")):
+                self.last_at[name] = self.clock()
             self.reports[name] = report
             self.seen[name] = self.clock()
         return None
@@ -98,9 +101,7 @@ class Board:
             node.mem = 100.0 * r["mem_gb"] / r["mem_total_gb"]
         busy = (r["running"] or 0) > 0 or (node.dec or 0) > BUSY_TPS or (node.pre or 0) > BUSY_TPS
         node.state = LIVE if busy else IDLE
-        if busy:
-            self.busy_at[name] = now
-        elif now - self.busy_at.get(name, float("-inf")) > LAST_S:
+        if now - self.last_at.get(name, float("-inf")) > LAST_S:
             node.dec_last = node.pre_last = None
         return node
 

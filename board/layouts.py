@@ -29,8 +29,7 @@ DEC_C = (0, 225, 120)
 PRE_C = (255, 190, 40)
 BAD = (255, 80, 80)
 
-DEC_FULL = 150.0    # tok/s that fills a decode tile
-PRE_FULL = 3000.0   # tok/s that fills a prefill tile
+DEC_FULL = 150.0    # tok/s floor of the decode history scale
 HIST = 62           # samples a sparkline shows
 MEM_WARN = 85.0
 BAR_X, BAR_W = 32, 10   # spark: the GPU and memory bars beside their numbers

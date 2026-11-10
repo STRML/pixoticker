@@ -75,7 +75,7 @@ agent.py (each Mac) ──POST /ingest──▶ board.py ──POST /frame──
 Each agent reads the local `/metrics.json` once a second and posts one small JSON document with
 `X-Api-Key`. Live rates are the counter growth over 8 s, because the server's counters move in lumps
 (a prefill chunk, a round of drafted tokens). A busy node shows its live rate; an idle one shows the
-last request's average, dimmed, for 30 s (`LAST_S`), then `--`. A node that stops reporting for 10 s turns grey with `STALE`, so a dead
+last request's average, dimmed, for 30 s (`LAST_S`) after the agent reports it, then `--`. A node that stops reporting for 10 s turns grey with `STALE`, so a dead
 agent never leaves old numbers on the panel. A node that never reported shows `--`.
 
 ```sh
