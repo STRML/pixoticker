@@ -21,13 +21,16 @@ GOOD = {"counters": {}, "gauges": {"requests_running": 0}, "histograms": {}}
 
 
 def serve(statuses):
-    """A server that answers its requests with `statuses` in turn (200 sends GOOD, anything else is an error)."""
+    """A server that answers its requests with `statuses` in turn: 200 sends GOOD, another code sends an error
+    body, and a (code, body) pair sends that body."""
     answers = iter(statuses)
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             code = next(answers)
-            body = json.dumps(GOOD if code == 200 else {"error": "missing or invalid API key"}).encode()
+            code, given = code if isinstance(code, tuple) else (code, None)
+            default = GOOD if code == 200 else {"error": "missing or invalid API key"}
+            body = json.dumps(default if given is None else given).encode()
             self.send_response(code)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -50,6 +53,22 @@ class FetchReportsARefusal(unittest.TestCase):
         got = [agent.fetch_metrics(url, refused=seen.append) for _ in range(3)]
         self.assertEqual([g is None for g in got], [True, False, True])
         self.assertEqual([e.code for e in seen], [401, 401])
+
+    def test_a_workers_404_is_its_normal_state_and_is_not_reported(self):
+        server, url = serve([(404, {"error": "worker", "follows": "studio1"})])
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        seen = []
+        self.assertIsNone(agent.fetch_metrics(url, refused=seen.append))
+        self.assertEqual(seen, [])
+
+    def test_a_404_that_is_not_a_worker_is_reported(self):
+        server, url = serve([(404, {"error": "unknown node"})])
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        seen = []
+        agent.fetch_metrics(url, refused=seen.append)
+        self.assertEqual([e.code for e in seen], [404])
 
     def test_no_server_at_all_is_not_a_refusal(self):
         server, url = serve([])

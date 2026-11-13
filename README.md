@@ -72,13 +72,19 @@ agent.py (each Mac) ──POST /ingest──▶ board.py ──POST /frame──
                                          └── GET /  every layout, live, as LED dots
 ```
 
-Each agent reads the local `/metrics.json` once a second (`--metrics URL` names the server's own port; a router that
-spreads reads over several groups makes the figures flip between them, and a group that answers with an error is
-logged as `metrics refused: HTTP 401 from <url>`, once a minute) and posts one small JSON document with
+Each agent reads its box's `/metrics.json` once a second and posts one small JSON document with
 `X-Api-Key`. Live rates are the counter growth over 8 s, because the server's counters move in lumps
 (a prefill chunk, a round of drafted tokens). A busy node shows its live rate; an idle one shows the
 last request's average, dimmed, until it is 30 s old (`LAST_S`), then `0`; a busy node whose prefill or decode has stopped shows a dimmed `0` too, in the metric's own colour (grey at the night-dimming level is nearly black on the panel). `--` means no data. The agent reports each average with its age (`dec_last_age`, `pre_last_age`), so the clocks of the Studios and the board need not agree, and an average with no age is not shown (an agent older than this change shows `0` there until it is updated). A node that stops reporting for 10 s turns grey with `STALE`, so a dead
 agent never leaves old numbers on the panel. A node that never reported shows `--`.
+
+**Metrics source.** `--metrics URL` is where the agent reads. The default is the local server's
+`http://127.0.0.1:11234/metrics.json`. Behind the DS41 router, give each Studio the router's per-studio URL, for
+example `http://127.0.0.1:11234/metrics.json?node=studio1`: the router answers `200` with that box's server, `404
+{"error": "worker"}` for a tensor-parallel worker (silent here, since the agent finds its leader through `ps`), `404
+{"error": "unknown node"}` or `503` otherwise. The agent logs any other error status as `metrics refused: HTTP 503
+from <url>`, once a minute per status. A bare `/metrics.json` on the router is answered by a different group on each
+read, and one that refuses makes the panel flip between figures and `--`.
 
 **Night dimming.** Set `--dim "20:00-07:30@0.25"` (`BOARD_DIM`, with `--tz` or `BOARD_TZ`) and the board dims every
 frame it sends inside that window. The board does this because firmware brightness ops are not replayed after a

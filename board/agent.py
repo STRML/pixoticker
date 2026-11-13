@@ -411,13 +411,23 @@ class RefusalLog:
             pass
 
 
+def is_worker_answer(err):
+    """The router answers 404 {"error": "worker", ...} for a box that runs a tensor-parallel worker: it has no
+    server, and the agent finds its leader through ps."""
+    try:
+        return err.code == 404 and json.loads(err.read()).get("error") == "worker"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def fetch_metrics(url, timeout=2.0, refused=None):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as err:
+        worker = is_worker_answer(err)
         err.close()
-        if refused:
+        if refused and not worker:
             refused(err)
         return None
     except (OSError, ValueError, urllib.error.URLError):
