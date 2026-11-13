@@ -86,6 +86,12 @@ example `http://127.0.0.1:11234/metrics.json?node=studio1`: the router answers `
 from <url>`, once a minute per status. A bare `/metrics.json` on the router is answered by a different group on each
 read, and one that refuses makes the panel flip between figures and `--`.
 
+**On a Studio.** The agent runs from `~/opt/pixoticker/agent.py` under the launchd agent `local.pixostat`
+(`~/Library/LaunchAgents/local.pixostat.plist`) and logs to `~/.mlx-serve/logs/pixostat.log`. The Studios run
+the stock Python 3.9, so `agent.py` stays standard-library only. `launchctl kickstart -k` restarts the process but
+does not re-read an edited plist; after changing its arguments, run `launchctl bootout gui/$UID/local.pixostat`
+and then `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/local.pixostat.plist`.
+
 **Night dimming.** Set `--dim "20:00-07:30@0.25"` (`BOARD_DIM`, with `--tz` or `BOARD_TZ`) and the board dims every
 frame it sends inside that window. The board does this because firmware brightness ops are not replayed after a
 reconnect. Each pixel scales by its brightest channel, so its hue survives. Plain scaling takes a grey label from
