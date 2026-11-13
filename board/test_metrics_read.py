@@ -85,6 +85,16 @@ class RefusalLog(unittest.TestCase):
         self.refuse(500, 1.0)
         self.assertEqual(len(self.lines), 2)
 
+    def test_two_statuses_alternating_each_log_once_a_minute(self):
+        for second in range(0, 59):
+            self.refuse(401 if second % 2 else 503, float(second))
+        self.assertEqual(len(self.lines), 2)
+
+    def test_a_log_that_cannot_be_written_does_not_stop_the_agent(self):
+        def broken(line):
+            raise OSError(9, "Bad file descriptor")
+        agent.RefusalLog(broken).note(0.0, agent.urllib.error.HTTPError("http://x/", 401, "Unauthorized", {}, None))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -399,13 +399,16 @@ class RefusalLog:
 
     def __init__(self, out=None):
         self.out = out or (lambda line: print(line, file=sys.stderr, flush=True))
-        self.code, self.next = None, 0.0
+        self.next = {}
 
     def note(self, now, err):
-        if err.code == self.code and now < self.next:
+        if now < self.next.get(err.code, 0.0):
             return
-        self.code, self.next = err.code, now + REFUSAL_LOG_S
-        self.out(f"metrics refused: HTTP {err.code} from {err.filename}")
+        self.next[err.code] = now + REFUSAL_LOG_S
+        try:
+            self.out(f"metrics refused: HTTP {err.code} from {err.filename}")
+        except OSError:
+            pass
 
 
 def fetch_metrics(url, timeout=2.0, refused=None):
@@ -413,6 +416,7 @@ def fetch_metrics(url, timeout=2.0, refused=None):
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as err:
+        err.close()
         if refused:
             refused(err)
         return None
