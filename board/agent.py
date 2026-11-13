@@ -412,7 +412,9 @@ class RefusalLog:
 
 
 def fetch_metrics(url, timeout=2.0, refused=None, key=None):
-    request = urllib.request.Request(url, headers={"x-api-key": key} if key else {})
+    request = urllib.request.Request(url)
+    if key:
+        request.add_unredirected_header("x-api-key", key)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as r:
             return json.loads(r.read())

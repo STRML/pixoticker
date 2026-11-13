@@ -89,6 +89,43 @@ class FetchSendsTheKey(unittest.TestCase):
         self.assertIsNone(agent.fetch_metrics(url))
         self.assertEqual(agent.fetch_metrics(url, key=self.KEY), GOOD)
 
+    def test_the_key_stays_with_the_server_it_was_given_to(self):
+        seen = []
+
+        class Elsewhere(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("x-api-key"))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        other = http.server.HTTPServer(("127.0.0.1", 0), Elsewhere)
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        target = f"http://127.0.0.1:{other.server_port}/metrics.json"
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        front = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=front.serve_forever, daemon=True).start()
+        self.addCleanup(front.server_close)
+        self.addCleanup(front.shutdown)
+        agent.fetch_metrics(f"http://127.0.0.1:{front.server_port}/metrics.json", key=self.KEY)
+        self.assertEqual(seen, [None])
+
     def test_a_key_file_is_read_with_its_newline_stripped(self):
         with tempfile.NamedTemporaryFile("w", suffix=".key") as f:
             f.write(self.KEY + "\n")
