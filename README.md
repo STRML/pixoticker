@@ -72,7 +72,9 @@ agent.py (each Mac) ──POST /ingest──▶ board.py ──POST /frame──
                                          └── GET /  every layout, live, as LED dots
 ```
 
-Each agent reads the local `/metrics.json` once a second and posts one small JSON document with
+Each agent reads the local `/metrics.json` once a second (`--metrics URL` names the server's own port; a router that
+spreads reads over several groups makes the figures flip between them, and a group that answers with an error is
+logged as `metrics refused: HTTP 401 from <url>`, once a minute) and posts one small JSON document with
 `X-Api-Key`. Live rates are the counter growth over 8 s, because the server's counters move in lumps
 (a prefill chunk, a round of drafted tokens). A busy node shows its live rate; an idle one shows the
 last request's average, dimmed, until it is 30 s old (`LAST_S`), then `0`; a busy node whose prefill or decode has stopped shows a dimmed `0` too, in the metric's own colour (grey at the night-dimming level is nearly black on the panel). `--` means no data. The agent reports each average with its age (`dec_last_age`, `pre_last_age`), so the clocks of the Studios and the board need not agree, and an average with no age is not shown (an agent older than this change shows `0` there until it is updated). A node that stops reporting for 10 s turns grey with `STALE`, so a dead

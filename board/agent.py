@@ -390,10 +390,32 @@ class Rates:
         return round(dn / dt, 1) if dt > 0 and dn > 0 else None
 
 
-def fetch_metrics(url, timeout=2.0):
+REFUSAL_LOG_S = 60.0
+
+
+class RefusalLog:
+    """Names a server's error answer in the log at most once a minute per status. A router that alternates
+    between two groups, one of them refusing, would otherwise print every second."""
+
+    def __init__(self, out=None):
+        self.out = out or (lambda line: print(line, file=sys.stderr, flush=True))
+        self.code, self.next = None, 0.0
+
+    def note(self, now, err):
+        if err.code == self.code and now < self.next:
+            return
+        self.code, self.next = err.code, now + REFUSAL_LOG_S
+        self.out(f"metrics refused: HTTP {err.code} from {err.filename}")
+
+
+def fetch_metrics(url, timeout=2.0, refused=None):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return json.loads(r.read())
+    except urllib.error.HTTPError as err:
+        if refused:
+            refused(err)
+        return None
     except (OSError, ValueError, urllib.error.URLError):
         return None
 
@@ -427,11 +449,13 @@ def main():
     watch = TpWatch(args.name)
     temps, cpu = TempWatch(), CpuLoad()
     failing = False
+    refusals = RefusalLog()
     while True:
         started = time.time()
         try:
             used, total = memory()
-            measured = rates.update(fetch_metrics(args.metrics), started)
+            fetched = fetch_metrics(args.metrics, refused=lambda err: refusals.note(started, err))
+            measured = rates.update(fetched, started)
             body = report(args.name, measured, used, total, gpu_percent())
             body.update(watch.check(started, measured["serving"]))
             body["temp"] = temps.check(started)
