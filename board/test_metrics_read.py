@@ -62,6 +62,28 @@ class FetchReportsARefusal(unittest.TestCase):
         self.assertIsNone(agent.fetch_metrics(url, refused=seen.append))
         self.assertEqual(seen, [])
 
+    def test_a_404_cut_off_mid_body_is_a_failed_read_not_an_exception(self):
+        class Cut(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(404)
+                self.send_header("Content-Length", "200")
+                self.end_headers()
+                self.wfile.write(b'{"error": "wor')
+                self.wfile.flush()
+                self.close_connection = True
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Cut)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        seen = []
+        url = f"http://127.0.0.1:{server.server_port}/metrics.json"
+        self.assertIsNone(agent.fetch_metrics(url, refused=seen.append))
+        self.assertEqual([e.code for e in seen], [404])
+
     def test_a_404_that_is_not_a_worker_is_reported(self):
         server, url = serve([(404, {"error": "unknown node"})])
         self.addCleanup(server.server_close)

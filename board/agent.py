@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import http.client
 import json
 import math
 import os
@@ -416,7 +417,7 @@ def is_worker_answer(err):
     server, and the agent finds its leader through ps."""
     try:
         return err.code == 404 and json.loads(err.read()).get("error") == "worker"
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, http.client.HTTPException):
         return False
 
 
@@ -425,8 +426,10 @@ def fetch_metrics(url, timeout=2.0, refused=None):
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as err:
-        worker = is_worker_answer(err)
-        err.close()
+        try:
+            worker = is_worker_answer(err)
+        finally:
+            err.close()
         if refused and not worker:
             refused(err)
         return None
