@@ -411,9 +411,10 @@ class RefusalLog:
             pass
 
 
-def fetch_metrics(url, timeout=2.0, refused=None):
+def fetch_metrics(url, timeout=2.0, refused=None, key=None):
+    request = urllib.request.Request(url, headers={"x-api-key": key} if key else {})
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with urllib.request.urlopen(request, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as err:
         err.close()
@@ -445,10 +446,13 @@ def main():
     ap.add_argument("--board", required=True, help="board base URL")
     ap.add_argument("--key-file", default="~/.pxt_ingest_key")
     ap.add_argument("--metrics", default="http://127.0.0.1:11234/metrics.json")
+    ap.add_argument("--metrics-key-file", default="",
+                    help="API key the metrics server asks for, sent as x-api-key; empty sends none")
     args = ap.parse_args()
     if not NAMES.match(args.name):
         raise SystemExit("--name must be 1-16 characters of a-z 0-9 . _ -")
     key = read_key(args.key_file)
+    metrics_key = read_key(args.metrics_key_file) if args.metrics_key_file else None
     rates = Rates()
     watch = TpWatch(args.name)
     temps, cpu = TempWatch(), CpuLoad()
@@ -458,7 +462,7 @@ def main():
         started = time.time()
         try:
             used, total = memory()
-            fetched = fetch_metrics(args.metrics, refused=lambda err: refusals.note(started, err))
+            fetched = fetch_metrics(args.metrics, refused=lambda err: refusals.note(started, err), key=metrics_key)
             measured = rates.update(fetched, started)
             body = report(args.name, measured, used, total, gpu_percent())
             body.update(watch.check(started, measured["serving"]))

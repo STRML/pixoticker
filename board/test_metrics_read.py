@@ -9,6 +9,7 @@ import http.server
 import json
 import os
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -57,6 +58,42 @@ class FetchReportsARefusal(unittest.TestCase):
         seen = []
         self.assertIsNone(agent.fetch_metrics(url, refused=seen.append))
         self.assertEqual(seen, [])
+
+
+class FetchSendsTheKey(unittest.TestCase):
+    KEY = "k" * 24
+
+    def serve_locked(self):
+        key = self.KEY
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                ok = self.headers.get("x-api-key") == key
+                body = json.dumps(GOOD if ok else {"error": "missing or invalid API key"}).encode()
+                self.send_response(200 if ok else 401)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}/metrics.json"
+
+    def test_a_key_opens_a_locked_server(self):
+        url = self.serve_locked()
+        self.assertIsNone(agent.fetch_metrics(url))
+        self.assertEqual(agent.fetch_metrics(url, key=self.KEY), GOOD)
+
+    def test_a_key_file_is_read_with_its_newline_stripped(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".key") as f:
+            f.write(self.KEY + "\n")
+            f.flush()
+            self.assertEqual(agent.read_key(f.name), self.KEY)
 
 
 class RefusalLog(unittest.TestCase):
