@@ -18,6 +18,7 @@
 #include <Update.h>
 #include <HTTPClient.h>
 #include <esp_ota_ops.h>
+#include <esp_image_format.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/md.h>
 #include <esp_timer.h>
@@ -562,11 +563,10 @@ static volatile uint8_t s_upd_owner = UPD_NONE;
 static portMUX_TYPE s_upd_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_up_mine = false;  // the /u upload in progress holds the token
 static bool s_up_busy = false;  // the /u upload in progress was refused because a download holds it
-// The /u upload hashes what it writes and records the image like a relay
-// install, so a later ota op for the same file is seen as already here.
-// Static, so an upload can never succeed without its hash for want of memory.
-static mbedtls_sha256_context s_up_sha;
-static bool rememberInstalled(const String &shaHex);
+// Bumped whenever an install starts or commits, so a cached hash of the boot
+// image is never trusted across one (see imagesHash).
+static volatile uint32_t s_img_gen = 0;
+static void imagesChanged() { s_img_gen = s_img_gen + 1; }
 
 
 static bool updTake(uint8_t who) {
@@ -611,40 +611,27 @@ static void otaChunk(HTTPUpload &up) {
       Serial.println("[ota] /u refused: a download owns the updater");
       return;
     }
+    imagesChanged();
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(Serial);
       updRelease(UPD_UPLOAD);
       return;
     }
-    mbedtls_sha256_init(&s_up_sha);
-    mbedtls_sha256_starts(&s_up_sha, 0);
     s_up_mine = true;
   } else if (!s_up_mine) {
     return;  // refused or failed to begin: touch nothing in a session that is not ours
   } else if (up.status == UPLOAD_FILE_WRITE) {
-    mbedtls_sha256_update(&s_up_sha, up.buf, up.currentSize);
     if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_END) {
     // The last chunk came as a WRITE already; at END buf still holds it and
     // totalSize counts it.
     s_ota_written = up.totalSize;
-    uint8_t dig[32];
-    mbedtls_sha256_finish(&s_up_sha, dig);
-    mbedtls_sha256_free(&s_up_sha);
-    char hex[65];
-    for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", dig[i]);
-    if (!rememberInstalled(hex)) {
-      Serial.println("[ota] /u: could not record the image hash, not installing");
-      Update.abort();
-      s_ota_ok = false;
-    } else {
-      s_ota_ok = Update.end(true);
-      if (!s_ota_ok) Update.printError(Serial);
-    }
+    s_ota_ok = Update.end(true);
+    imagesChanged();
+    if (!s_ota_ok) Update.printError(Serial);
     s_up_mine = false;
     updRelease(UPD_UPLOAD);
   } else if (up.status == UPLOAD_FILE_ABORTED) {
-    mbedtls_sha256_free(&s_up_sha);
     Update.end();
     s_up_mine = false;
     updRelease(UPD_UPLOAD);
@@ -866,6 +853,7 @@ static OtaStop otaPull(const String &path, size_t want, const String &shaHex, si
       http.end();
       return OTA_FATAL;
     }
+    imagesChanged();
     if (!Update.begin(want)) {
       updRelease(UPD_RELAY);
       why = "begin failed";
@@ -947,13 +935,8 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
     }
     return false;
   }
-  if (!rememberInstalled(shaHex)) {
-    Update.abort();
-    updRelease(UPD_RELAY);
-    otaNote("nvs", total, want);
-    return false;
-  }
   bool ended = Update.end(true);
+  imagesChanged();
   updRelease(UPD_RELAY);
   if (!ended) {
     otaNote("end failed", total, want);
@@ -963,98 +946,88 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
   return true;
 }
 
-// Re-queued ops must not reinstall the image that is already running: that
-// would reboot the panel on every reconnect. NVS survives an app flash, so the
-// version written after a verified install is the one to compare.
-static String s_ota_installed;
+// Re-queued ops must not reinstall an image already on the device: that would
+// restart the panel on every reconnect. The answer comes from the flash, not
+// from a record: the SHA-256 of the image in the running partition and in the
+// boot partition, each over the partition's bytes up to the image length.
+// With the digest the build appends, that is the whole .bin, so it equals the
+// hash in the ota op (sha256 of firmware.bin).
+struct ImageHash {
+  const esp_partition_t *part = nullptr;
+  uint32_t gen = 0;
+  char hex[65] = "";
+};
+static ImageHash s_img_running, s_img_boot;
 
-// Each slot has its own pending record, "pend" + its label: the image
-// installed there that has not shown a whole frame yet (otaSlotFate).
-static String pendKey(const char *label) { return String("pend") + label; }
-
-static const char *runningSlot() {
-  const esp_partition_t *running = esp_ota_get_running_partition();
-  return running ? running->label : "";
+// Reads in s_rx-sized chunks and yields every 64 KB, so the idle task (and
+// with it the task watchdog) keeps running. Uses s_rx: call only while the
+// stream is closed.
+static bool imageHash(const esp_partition_t *part, char hex[65]) {
+  esp_partition_pos_t pos = {part->address, part->size};
+  esp_image_metadata_t meta;
+  if (esp_image_get_metadata(&pos, &meta) != ESP_OK || !meta.image_len || meta.image_len > part->size) return false;
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  bool ok = true;
+  for (uint32_t off = 0; off < meta.image_len && ok; off += sizeof(s_rx)) {
+    uint32_t n = meta.image_len - off;
+    if (n > sizeof(s_rx)) n = sizeof(s_rx);
+    ok = esp_partition_read(part, off, s_rx, n) == ESP_OK;
+    if (ok) mbedtls_sha256_update(&ctx, s_rx, n);
+    if ((off / sizeof(s_rx)) % 16 == 15) delay(1);
+  }
+  uint8_t dig[32];
+  mbedtls_sha256_finish(&ctx, dig);
+  mbedtls_sha256_free(&ctx);
+  if (!ok) return false;
+  for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", dig[i]);
+  return true;
 }
 
-// Called before Update.end(true) commits the image, so the next update
-// partition is the slot being written. It touches only that slot's record,
-// never the running image's, so a commit that then fails leaves the image on
-// trial as it was. False when the record did not stick: the caller aborts,
-// because an image installed without its hash would be reinstalled by the
-// next ota op for it.
-static bool rememberInstalled(const String &shaHex) {
-  const esp_partition_t *slot = esp_ota_get_next_update_partition(nullptr);
-  if (!slot) return false;
+// The cached hash for a partition, or "" when it is not known for the image
+// there now.
+static const char *imageKnown(const ImageHash &h, const esp_partition_t *part) {
+  return (part && h.part == part && h.gen == s_img_gen) ? h.hex : "";
+}
+
+static void imageFill(ImageHash &h, const esp_partition_t *part) {
+  if (!part || imageKnown(h, part)[0]) return;
+  uint32_t gen = s_img_gen;
+  char hex[65];
+  if (!imageHash(part, hex) || gen != s_img_gen) return;  // an install moved under us: try again next time
+  memcpy(h.hex, hex, sizeof(hex));
+  h.part = part;
+  h.gen = gen;
+}
+
+// Hashes the running and boot images not cached yet. Only from otaRun: the
+// stream is closed, s_rx is free, and no TLS handshake is under way. First
+// time, a little over a second for two images (estimate).
+static void imagesHash() {
+  uint32_t t = millis();
+  imageFill(s_img_running, esp_ota_get_running_partition());
+  imageFill(s_img_boot, esp_ota_get_boot_partition());
+  Serial.printf("[ota] images hashed in %u ms\n", (unsigned)(millis() - t));
+}
+
+// True when the image is on the device; known reports whether the cache could
+// answer at all.
+static bool otaHere(const String &sha, bool &known) {
+  const esp_partition_t *run = esp_ota_get_running_partition(), *boot = esp_ota_get_boot_partition();
+  const char *r = imageKnown(s_img_running, run);
+  const char *b = boot == run ? r : imageKnown(s_img_boot, boot);
+  known = r[0] && b[0];
+  return otaImageHere(sha.c_str(), r, b);
+}
+
+// Firmware before this kept hash records in NVS. Nothing reads them now.
+static void forgetOtaRecords() {
+  static const char *const keys[] = {"otasha", "otapending", "otaslot", "pendapp0", "pendapp1"};
   prefsBegin(false);
-  bool ok = s_prefs.putString(pendKey(slot->label).c_str(), shaHex) == shaHex.length();
+  for (const char *k : keys)
+    if (s_prefs.isKey(k)) s_prefs.remove(k);
   prefsEnd();
-  return ok;
-}
-
-// The running slot's record only: a frame proves the image that drew it.
-static void promoteInstalled() {
-  String key = pendKey(runningSlot());
-  prefsBegin(false);
-  String pending = s_prefs.getString(key.c_str(), "");
-  if (pending.length()) {
-    s_prefs.putString("otasha", pending);
-    s_prefs.remove(key.c_str());
-    s_ota_installed = pending;
-  }
-  prefsEnd();
-}
-
-static String pendingForRunning() {
-  String key = pendKey(runningSlot());
-  prefsBegin(true);
-  String pending = s_prefs.getString(key.c_str(), "");
-  prefsEnd();
-  return pending;
-}
-
-// At boot, settle every slot's record: drop the ones whose slot is not
-// running, promote the running slot's when a confirm was cut short.
-static void settlePending() {
-  const esp_partition_t *running = esp_ota_get_running_partition();
-  esp_ota_img_states_t st;
-  bool confirmed = running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_VALID;
-  prefsBegin(false);
-  // Firmware before this kept one record, in otapending and otaslot. Move it
-  // to its slot's key, so an image that firmware installed is still known.
-  // The old keys go only once the record is safe in its new one.
-  String legacy = s_prefs.getString("otapending", ""), legacy_slot = s_prefs.getString("otaslot", "");
-  const char *dest = legacyPendingSlot(legacy_slot.c_str(), running ? running->label : "", confirmed);
-  bool moved = !legacy.length() || !dest[0] ||
-               s_prefs.putString(pendKey(dest).c_str(), legacy) == legacy.length();
-  if (moved) {
-    s_prefs.remove("otapending");
-    s_prefs.remove("otaslot");
-  }
-  bool promote = false;
-  esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, nullptr);
-  for (; it; it = esp_partition_next(it)) {
-    const esp_partition_t *slot = esp_partition_get(it);
-    String key = pendKey(slot->label);
-    if (!s_prefs.isKey(key.c_str())) continue;
-    switch (otaSlotFate(running && !strcmp(slot->label, running->label), confirmed)) {
-      case PENDING_DROP:
-        s_prefs.remove(key.c_str());
-        Serial.printf("[ota] dropped %s's pending image: not running\n", slot->label);
-        break;
-      case PENDING_PROMOTE:
-        promote = true;
-        break;
-      case PENDING_KEEP:
-        break;
-    }
-  }
-  esp_partition_iterator_release(it);
-  prefsEnd();
-  if (promote) {
-    promoteInstalled();
-    Serial.println("[ota] finished an interrupted confirm");
-  }
 }
 
 static String s_ota_path, s_ota_sha;
@@ -1070,12 +1043,11 @@ static void otaOp(const char *js) {
     Serial.println("[ota] bad op");
     return;
   }
-  prefsBegin(true);
-  if (!s_ota_installed.length()) s_ota_installed = s_prefs.getString("otasha", "");
-  prefsEnd();
-  String pending = pendingForRunning();
-  if (otaIsCurrent(sha.c_str(), s_ota_installed.c_str(), pending.c_str())) {
-    Serial.println("[ota] already running this image");
+  // With both hashes cached, a re-posted op is answered here and the stream
+  // stays up. Otherwise otaRun hashes the flash once the stream is closed.
+  bool known;
+  if (otaHere(sha, known)) {
+    Serial.println("[ota] already on the device");
     return;
   }
   // The stream still holds a TLS session and a second handshake does not fit
@@ -1088,8 +1060,14 @@ static void otaOp(const char *js) {
 
 static void otaRun() {
   s_ota_pending = false;
+  imagesHash();
+  bool known;
+  if (otaHere(s_ota_sha, known)) {
+    Serial.println("[ota] already on the device");
+    return;
+  }
   Serial.printf("[ota] %s %u\n", s_ota_path.c_str(), (unsigned)s_ota_want);
-  if (!otaFrom(s_ota_path, s_ota_want, s_ota_sha)) return;  // otaFrom records the hash
+  if (!otaFrom(s_ota_path, s_ota_want, s_ota_sha)) return;
   Serial.println("[ota] written, restarting");
   delay(300);
   ESP.restart();
@@ -1145,12 +1123,11 @@ static void frameShown(uint32_t seq, bool complete) {
   if (complete && !s_healthy) s_confirm_due = true;
 }
 
-// Cancels the rollback and records the image. Runs on the pull task only.
+// Cancels the rollback. Runs on the pull task only.
 static void confirmImage() {
   if (!s_confirm_due || s_healthy) return;
   s_healthy = true;
   esp_ota_mark_app_valid_cancel_rollback();
-  promoteInstalled();
   Serial.println("[ota] image confirmed");
 }
 
@@ -1816,7 +1793,7 @@ void setup() {
   s_boots = bootCounts(esp_reset_reason(), guard) ? s_boots + 1 : 0;
 
   loadConfig();
-  settlePending();
+  forgetOtaRecords();
   if (s_boots >= MAX_PANEL_ATTEMPTS) {
     Serial.printf("[pxt] safe mode: %u failed boots in a row\n", (unsigned)s_boots);
     s_safe = true;

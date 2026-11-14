@@ -29,37 +29,13 @@ inline UdpSwitch udpModeStep(UdpMode &m, bool token, bool alive, bool steady) {
   return UDP_STAY;
 }
 
-// An OTA op for the image already confirmed, or for the one installed and
-// still waiting for its first whole frame, must not reinstall it: that would
-// restart the panel and could overwrite the last good slot before the new
-// image proves itself.
-inline bool otaIsCurrent(const char *sha, const char *installed, const char *pending) {
-  return (installed[0] && !strcasecmp(sha, installed)) || (pending[0] && !strcasecmp(sha, pending));
-}
-
-// Each slot keeps its own pending hash: the image installed there that has not
-// shown a whole frame yet. An install writes only its target slot's record,
-// before it commits, so a failed install never touches the image on trial.
-// At boot, what to do with each record:
-//   Another slot's: that image is not running (a rollback, or an install that
-//   never committed). Drop it.
-//   The running slot's, already confirmed: power was lost between the confirm
-//   and the promotion. Promote it now.
-//   The running slot's, unconfirmed: this is the image on trial. Keep it.
-enum PendingFate { PENDING_KEEP, PENDING_DROP, PENDING_PROMOTE };
-
-inline PendingFate otaSlotFate(bool is_running_slot, bool running_confirmed) {
-  if (!is_running_slot) return PENDING_DROP;
-  return running_confirmed ? PENDING_PROMOTE : PENDING_KEEP;
-}
-
-// Where the old single pending record (otapending, otaslot) belongs. Its slot
-// when it names one. Without a slot, older firmware wrote it for the image it
-// had just installed, which is the one now running if that image is still on
-// trial; once confirmed, the record belongs to nothing.
-inline const char *legacyPendingSlot(const char *legacy_slot, const char *running_slot, bool running_confirmed) {
-  if (legacy_slot[0]) return legacy_slot;
-  return running_confirmed ? "" : running_slot;
+// Whether an ota op's image is already on the device: its SHA-256, which is
+// of the .bin, against the image in the running partition and the one in the
+// boot partition, both hashed from flash. Running covers an image on trial
+// and one whose confirm power cut short; boot covers an install waiting for
+// its restart. Nothing is recorded, so nothing can disagree with the flash.
+inline bool otaImageHere(const char *sha, const char *running_hash, const char *boot_hash) {
+  return (running_hash[0] && !strcasecmp(sha, running_hash)) || (boot_hash[0] && !strcasecmp(sha, boot_hash));
 }
 
 // Why the previous boot ended, as /state and X-Pxt-State report it. The codes

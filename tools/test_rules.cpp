@@ -6,8 +6,6 @@
 // Prints one PASS/FAIL line per check and exits 1 if any fails.
 #include <cstdio>
 #include <cstring>
-#include <map>
-#include <string>
 
 #include "pxt_rules.h"
 
@@ -107,114 +105,25 @@ static void randomWalks() {
   check("2000 random walks never break the invariant", ok);
 }
 
-static void otaCurrent() {
-  const char *a = "aaaa", *b = "BBBB";
-  check("the confirmed image is current", otaIsCurrent("AAAA", a, ""));
-  check("the image waiting for its first frame is current too", otaIsCurrent("bbbb", "", b));
-  check("another image is not current", !otaIsCurrent("cccc", a, b));
-  check("empty records match nothing", !otaIsCurrent("cccc", "", ""));
-}
-
-// The device's OTA records, driven by the same rules as src/main.cpp: one
-// pending hash per slot, written by an install before it commits; the
-// installed hash, written when the running slot's image proves itself.
-struct Records {
-  std::map<std::string, std::string> pend;  // slot -> hash on trial there
-  std::string installed;
-  std::string running = "app0";
-  bool confirmed = true;
-
-  void install(const std::string &slot, const std::string &sha, bool commits) {
-    pend[slot] = sha;  // recorded before the commit
-    (void)commits;     // a failed commit leaves the record; it names a slot that never runs
-  }
-  void boot(const std::string &slot, bool was_confirmed) {
-    running = slot;
-    confirmed = was_confirmed;
-    for (auto it = pend.begin(); it != pend.end();) {
-      PendingFate f = otaSlotFate(it->first == running, confirmed);
-      if (f == PENDING_PROMOTE) installed = it->second;
-      if (f != PENDING_KEEP) it = pend.erase(it);
-      else ++it;
-    }
-  }
-  void firstFrame() {  // confirmImage -> promoteInstalled: the running slot only
-    confirmed = true;
-    auto it = pend.find(running);
-    if (it == pend.end()) return;
-    installed = it->second;
-    pend.erase(it);
-  }
-  bool current(const std::string &sha) {
-    auto it = pend.find(running);
-    return otaIsCurrent(sha.c_str(), installed.c_str(), it == pend.end() ? "" : it->second.c_str());
-  }
-};
-
-static void otaRecords() {
-  {
-    // B installed into app1, on trial; it draws and is promoted.
-    Records r;
-    r.installed = "aaaa";
-    r.install("app1", "bbbb", true);
-    r.boot("app1", false);
-    check("B on trial: an op for B is current", r.current("bbbb"));
-    r.firstFrame();
-    check("B's first frame promotes B", r.installed == "bbbb" && r.pend.empty());
-  }
-  {
-    // A in app0 is running; B is uploaded into app1 and A draws before the restart.
-    Records r;
-    r.installed = "aaaa";
-    r.confirmed = false;
-    r.install("app1", "bbbb", true);
-    r.firstFrame();
-    check("a frame from the old image does not promote the new image", r.installed == "aaaa");
-  }
-  {
-    // Round 2: B in app1 on trial, installed still names A. C is uploaded into
-    // app0 and its commit fails. B then draws.
-    Records r;
-    r.installed = "aaaa";
-    r.install("app1", "bbbb", true);
-    r.boot("app1", false);
-    r.install("app0", "cccc", false);
-    check("a failed install does not make its image current", !r.current("cccc"));
-    r.firstFrame();
-    check("the image on trial still promotes after another install fails", r.installed == "bbbb");
-    r.boot("app1", true);
-    check("the failed install's record is dropped at the next boot", r.pend.empty());
-    check("then an op for A is not current", !r.current("aaaa"));
-  }
-  {
-    // B reset before its first whole frame; the bootloader went back to A.
-    Records r;
-    r.installed = "aaaa";
-    r.install("app1", "bbbb", true);
-    r.boot("app1", false);
-    r.boot("app0", true);
-    check("after a rollback B's record is dropped and an op for B is not current",
-          r.pend.empty() && !r.current("bbbb") && r.installed == "aaaa");
-  }
-  {
-    // Power lost between B's confirm and its promotion.
-    Records r;
-    r.installed = "aaaa";
-    r.install("app1", "bbbb", true);
-    r.boot("app1", false);
-    r.boot("app1", true);
-    check("a confirm cut short is promoted at the next boot", r.installed == "bbbb" && r.pend.empty());
-  }
-}
-
-static void legacyRecord() {
-  // Firmware before per-slot records kept one, otapending, with otaslot from
-  // 45b64e9 on and without it before.
-  check("a legacy record with a slot moves to that slot", !strcmp(legacyPendingSlot("app1", "app0", true), "app1"));
-  check("a slotless legacy record names the image on trial: it moves to the running slot",
-        !strcmp(legacyPendingSlot("", "app1", false), "app1"));
-  check("a slotless legacy record beside a confirmed image belongs to nothing",
-        !strcmp(legacyPendingSlot("", "app0", true), ""));
+// Whether an ota op's image is already on the device: its SHA-256 (of the
+// .bin) against the images in the running and the boot partitions, hashed
+// from flash. No record is kept, so there is nothing to get out of step.
+static void otaImages() {
+  const char *A = "aaaa", *B = "bbbb", *C = "cccc";
+  check("the running image matches (case does not matter)", otaImageHere("AAAA", A, A));
+  check("an image that is neither running nor booting next is not here", !otaImageHere(C, A, A));
+  check("no hashes yet match nothing", !otaImageHere(C, "", ""));
+  // /u wrote B and committed it; the restart has not happened yet. Running is
+  // A, boot is B. A re-posted op for B must not install it again.
+  check("after a /u install, before its restart, an op for the new image is skipped", otaImageHere(B, A, B));
+  check("after a /u install, an op for a third image is not", !otaImageHere(C, A, B));
+  // B ran on trial, reset before its first whole frame, and the bootloader
+  // went back to A: running and boot are both A.
+  check("after a rollback an op for the failed image installs it again", !otaImageHere(B, A, A));
+  check("after a rollback an op for the image now running is skipped", otaImageHere(A, A, A));
+  // B confirmed its first frame, then power was lost before anything else:
+  // the flash still holds B in both.
+  check("after power loss mid-confirm the running image is still known", otaImageHere(B, B, B));
 }
 
 static void resetNames() {
@@ -252,9 +161,7 @@ int main() {
   relayRestartOnUdp();
   reconnectWhileLive();
   randomWalks();
-  otaCurrent();
-  otaRecords();
-  legacyRecord();
+  otaImages();
   resetNames();
   bootCounting();
   printf(failed ? "SOME FAILED\n" : "ALL PASS\n");

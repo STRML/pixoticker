@@ -26,9 +26,9 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCENARIOS = sys.argv[1:] or ["good", "rollback", "crashloop", "blip", "udp"]
 WANT = {"good": 0, "rollback": 3, "crashloop": 3, "blip": 0, "udp": 0}
-# src/pxt_rules.h otaIsCurrent: an op for the image waiting for its first
-# whole frame is skipped, like one for the confirmed image.
-OTA_SKIPS_PENDING = True
+# src/pxt_rules.h otaImageHere: an op for the image in the running (or boot)
+# partition is skipped, confirmed or still on trial.
+OTA_SKIPS_RUNNING = True
 KEY = os.urandom(16).hex()
 
 STUB_PIO = """#!/bin/sh
@@ -137,7 +137,7 @@ class UdpPanel(threading.Thread):
         u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         u.bind(("127.0.0.1", 0))
         u.settimeout(0.05)
-        installed, pending, draw_at = "", "", 0.0
+        running, draw_at = "", 0.0  # the running image's hash, as the flash would give it
         self.connect("old", 1000)
         self.whole = 1
         said = 0.0
@@ -148,8 +148,6 @@ class UdpPanel(threading.Thread):
             try:
                 if u.recv(2048)[:4] == b"PXTS" and time.time() >= draw_at:
                     self.whole += 1
-                    if pending:
-                        installed, pending = pending, ""
             except socket.timeout:
                 pass
             try:
@@ -163,10 +161,10 @@ class UdpPanel(threading.Thread):
                 continue
             self.buf = b""
             sha = m.group(1).decode()
-            if sha == installed or (OTA_SKIPS_PENDING and sha == pending):
+            if OTA_SKIPS_RUNNING and sha == running:
                 continue
             self.installs += 1
-            pending = sha
+            running = sha
             time.sleep(1)
             self.connect("new", 5)
             draw_at = time.time() + 15

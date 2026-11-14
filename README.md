@@ -264,13 +264,14 @@ The script:
 
 The panel closes its stream before it downloads, since a second TLS session
 doesn't fit beside the first. It installs only when the size and SHA-256 match,
-and it ignores an op for the image it already runs, or for the one it just
-installed that has not shown its first whole frame yet, so a re-queued op never
-reinstalls. The pending record names the slot it was written to. If the new
-image resets before its first whole frame and the bootloader goes back to the
-other slot, the old image drops the record at boot, so a retried op installs
-it again. If power is lost between the confirm and the record's promotion, the
-new image finishes the promotion at its next boot.
+and it ignores an op for an image already on it, so a re-queued op never
+reinstalls. It keeps no record of what it installed: it hashes the image in
+the running partition and the one set to boot next, straight from flash. Each
+hash covers the partition up to the image's length, which with the digest the
+build appends is exactly `firmware.bin`, so it matches the op's `sha256`. A
+rollback, a `/u` install or a power cut cannot leave the answer out of date.
+The first op after a boot hashes both images once, after the stream closes
+(about a second, estimated); later ops use the cached hashes.
 
 ### Over the LAN
 
