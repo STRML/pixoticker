@@ -146,7 +146,7 @@ class Board:
         node.watts, node.cpu = r["watts"], r["cpu"]
         node.dec_last, node.pre_last = r["dec_last"], r["pre_last"]
         if r["mem_gb"] is not None and r["mem_total_gb"]:
-            node.mem = 100.0 * r["mem_gb"] / r["mem_total_gb"]
+            node.mem = min(100.0, 100.0 * r["mem_gb"] / r["mem_total_gb"])
         busy = (r["running"] or 0) > 0 or (node.dec or 0) > BUSY_TPS or (node.pre or 0) > BUSY_TPS
         node.state = LIVE if busy else IDLE
         for k in LAST_FIELDS:

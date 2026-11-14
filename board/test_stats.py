@@ -637,6 +637,14 @@ class MemoryTurnsRedAbove90(unittest.TestCase):
             for mem in (90.6, 91.0, 99.0):
                 self.assertIn(layouts.MEM_HOT, self.frame(name, mem), f"{name} at {mem}%")
 
+    def test_a_memory_total_near_zero_reads_as_full_and_every_layout_still_draws(self):
+        b = boardmod.Board(["studio1"], clock=Clock())
+        b.ingest(report(mem_gb=1, mem_total_gb=1e-320))
+        node = b.nodes()[0]
+        self.assertEqual(node.mem, 100.0)
+        for name in layouts.LAYOUTS:
+            self.assertIn(layouts.MEM_HOT, {c for _, c in layouts.render(name, [node]).getcolors(layouts.W * layouts.H)}, name)
+
     def test_the_cluster_bar_follows_the_same_rule_on_the_average(self):
         def colour(mems):
             nodes = [layouts.Node(f"studio{i + 1}", layouts.LIVE, mem=m) for i, m in enumerate(mems)]
