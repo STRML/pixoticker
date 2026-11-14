@@ -6,6 +6,8 @@
 // Prints one PASS/FAIL line per check and exits 1 if any fails.
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <string>
 
 #include "pxt_rules.h"
 
@@ -113,22 +115,96 @@ static void otaCurrent() {
   check("empty records match nothing", !otaIsCurrent("cccc", "", ""));
 }
 
-static void otaPendingAtBoot() {
-  // The pending hash records the slot it was written to. A is in app0, B was
-  // installed into app1.
-  check("B boots unconfirmed from app1: keep its pending hash",
-        otaPendingFate(true, "app1", "app1", false) == PENDING_KEEP);
-  check("B reset before its first whole frame, back on A in app0: drop B's hash",
-        otaPendingFate(true, "app1", "app0", true) == PENDING_DROP);
-  check("a rollback onto an unconfirmed slot still drops the other slot's hash",
-        otaPendingFate(true, "app1", "app0", false) == PENDING_DROP);
-  check("power lost between B's confirm and its promotion: promote B now",
-        otaPendingFate(true, "app1", "app1", true) == PENDING_PROMOTE);
-  check("a hash with no slot (older firmware) beside an unconfirmed image: keep",
-        otaPendingFate(true, "", "app1", false) == PENDING_KEEP);
-  check("a hash with no slot beside a confirmed image: drop", otaPendingFate(true, "", "app0", true) == PENDING_DROP);
-  check("nothing pending: nothing to do", otaPendingFate(false, "", "app0", true) == PENDING_KEEP);
-  check("after a rollback an op for the failed image is not current", !otaIsCurrent("bbbb", "aaaa", ""));
+// The device's OTA records, driven by the same rules as src/main.cpp: one
+// pending hash per slot, written by an install before it commits; the
+// installed hash, written when the running slot's image proves itself.
+struct Records {
+  std::map<std::string, std::string> pend;  // slot -> hash on trial there
+  std::string installed;
+  std::string running = "app0";
+  bool confirmed = true;
+
+  void install(const std::string &slot, const std::string &sha, bool commits) {
+    pend[slot] = sha;  // recorded before the commit
+    (void)commits;     // a failed commit leaves the record; it names a slot that never runs
+  }
+  void boot(const std::string &slot, bool was_confirmed) {
+    running = slot;
+    confirmed = was_confirmed;
+    for (auto it = pend.begin(); it != pend.end();) {
+      PendingFate f = otaSlotFate(it->first == running, confirmed);
+      if (f == PENDING_PROMOTE) installed = it->second;
+      if (f != PENDING_KEEP) it = pend.erase(it);
+      else ++it;
+    }
+  }
+  void firstFrame() {  // confirmImage -> promoteInstalled: the running slot only
+    confirmed = true;
+    auto it = pend.find(running);
+    if (it == pend.end()) return;
+    installed = it->second;
+    pend.erase(it);
+  }
+  bool current(const std::string &sha) {
+    auto it = pend.find(running);
+    return otaIsCurrent(sha.c_str(), installed.c_str(), it == pend.end() ? "" : it->second.c_str());
+  }
+};
+
+static void otaRecords() {
+  {
+    // B installed into app1, on trial; it draws and is promoted.
+    Records r;
+    r.installed = "aaaa";
+    r.install("app1", "bbbb", true);
+    r.boot("app1", false);
+    check("B on trial: an op for B is current", r.current("bbbb"));
+    r.firstFrame();
+    check("B's first frame promotes B", r.installed == "bbbb" && r.pend.empty());
+  }
+  {
+    // A in app0 is running; B is uploaded into app1 and A draws before the restart.
+    Records r;
+    r.installed = "aaaa";
+    r.confirmed = false;
+    r.install("app1", "bbbb", true);
+    r.firstFrame();
+    check("a frame from the old image does not promote the new image", r.installed == "aaaa");
+  }
+  {
+    // Round 2: B in app1 on trial, installed still names A. C is uploaded into
+    // app0 and its commit fails. B then draws.
+    Records r;
+    r.installed = "aaaa";
+    r.install("app1", "bbbb", true);
+    r.boot("app1", false);
+    r.install("app0", "cccc", false);
+    check("a failed install does not make its image current", !r.current("cccc"));
+    r.firstFrame();
+    check("the image on trial still promotes after another install fails", r.installed == "bbbb");
+    r.boot("app1", true);
+    check("the failed install's record is dropped at the next boot", r.pend.empty());
+    check("then an op for A is not current", !r.current("aaaa"));
+  }
+  {
+    // B reset before its first whole frame; the bootloader went back to A.
+    Records r;
+    r.installed = "aaaa";
+    r.install("app1", "bbbb", true);
+    r.boot("app1", false);
+    r.boot("app0", true);
+    check("after a rollback B's record is dropped and an op for B is not current",
+          r.pend.empty() && !r.current("bbbb") && r.installed == "aaaa");
+  }
+  {
+    // Power lost between B's confirm and its promotion.
+    Records r;
+    r.installed = "aaaa";
+    r.install("app1", "bbbb", true);
+    r.boot("app1", false);
+    r.boot("app1", true);
+    check("a confirm cut short is promoted at the next boot", r.installed == "bbbb" && r.pend.empty());
+  }
 }
 
 static void resetNames() {
@@ -140,14 +216,6 @@ static void resetNames() {
   check("reset 9 is brownout", !strcmp(resetName(9), "brownout"));
   check("an unknown reset code names itself unknown",
         !strcmp(resetName(-1), "unknown") && !strcmp(resetName(99), "unknown"));
-}
-
-static void otaPromote() {
-  // A is in app0. B was uploaded into app1 and waits for the reboot; A draws
-  // its first frame in the meantime. That frame proves A, not B.
-  check("a frame from the old image does not promote the new image's hash", !otaMayPromote("app1", "app0"));
-  check("B's own first frame promotes B", otaMayPromote("app1", "app1"));
-  check("a hash with no slot (older firmware) promotes as before", otaMayPromote("", "app0"));
 }
 
 static void bootCounting() {
@@ -173,9 +241,8 @@ int main() {
   reconnectWhileLive();
   randomWalks();
   otaCurrent();
-  otaPendingAtBoot();
+  otaRecords();
   resetNames();
-  otaPromote();
   bootCounting();
   printf(failed ? "SOME FAILED\n" : "ALL PASS\n");
   return failed ? 1 : 0;

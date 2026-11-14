@@ -37,23 +37,19 @@ inline bool otaIsCurrent(const char *sha, const char *installed, const char *pen
   return (installed[0] && !strcasecmp(sha, installed)) || (pending[0] && !strcasecmp(sha, pending));
 }
 
-// At boot, what to do with the pending hash, which names the image waiting for
-// its first whole frame and the slot it was written to.
-//   Another slot is running: that image reset before proving itself and the
-//   bootloader went back. Drop the hash, or it would count as current and be
-//   promoted when this image draws.
-//   Its own slot, already confirmed: power was lost between the confirm and
-//   the promotion. Promote it now.
-//   Its own slot, unconfirmed: this is the image on trial. Keep it.
-// A hash with no slot comes from older firmware; only an unconfirmed image
-// can be its owner.
+// Each slot keeps its own pending hash: the image installed there that has not
+// shown a whole frame yet. An install writes only its target slot's record,
+// before it commits, so a failed install never touches the image on trial.
+// At boot, what to do with each record:
+//   Another slot's: that image is not running (a rollback, or an install that
+//   never committed). Drop it.
+//   The running slot's, already confirmed: power was lost between the confirm
+//   and the promotion. Promote it now.
+//   The running slot's, unconfirmed: this is the image on trial. Keep it.
 enum PendingFate { PENDING_KEEP, PENDING_DROP, PENDING_PROMOTE };
 
-inline PendingFate otaPendingFate(bool has_pending, const char *pending_slot, const char *running_slot,
-                                  bool running_confirmed) {
-  if (!has_pending) return PENDING_KEEP;
-  if (!pending_slot[0]) return running_confirmed ? PENDING_DROP : PENDING_KEEP;
-  if (strcasecmp(pending_slot, running_slot)) return PENDING_DROP;
+inline PendingFate otaSlotFate(bool is_running_slot, bool running_confirmed) {
+  if (!is_running_slot) return PENDING_DROP;
   return running_confirmed ? PENDING_PROMOTE : PENDING_KEEP;
 }
 
@@ -64,14 +60,6 @@ inline const char *resetName(int r) {
                                       "task_wdt", "wdt",    "deepsleep", "brownout", "sdio", "usb",
                                       "jtag",     "efuse",  "pwr_glitch", "cpu_lockup"};
   return (r >= 0 && r < (int)(sizeof(names) / sizeof(names[0]))) ? names[r] : "unknown";
-}
-
-// A first whole frame proves the image that drew it. The pending hash may be
-// promoted only from that image's own slot: an upload records B as pending
-// while A is still running, and A's frame must not promote B. A hash with no
-// slot comes from older firmware and promotes as before.
-inline bool otaMayPromote(const char *pending_slot, const char *running_slot) {
-  return !pending_slot[0] || !strcasecmp(pending_slot, running_slot);
 }
 
 // Whether the boot that just ended counts toward safe mode: a crash, a

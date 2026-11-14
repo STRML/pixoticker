@@ -968,62 +968,87 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
 // version written after a verified install is the one to compare.
 static String s_ota_installed;
 
+// Each slot has its own pending record, "pend" + its label: the image
+// installed there that has not shown a whole frame yet (otaSlotFate).
+static String pendKey(const char *label) { return String("pend") + label; }
+
+static const char *runningSlot() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  return running ? running->label : "";
+}
+
 // Called before Update.end(true) commits the image, so the next update
-// partition is the slot being written. False when the record did not stick:
-// the caller then aborts, because an image installed without its hash would
-// be reinstalled by the next ota op for it. The slot goes first: power lost
-// between the two writes leaves no pending hash, never one with the wrong slot.
+// partition is the slot being written. It touches only that slot's record,
+// never the running image's, so a commit that then fails leaves the image on
+// trial as it was. False when the record did not stick: the caller aborts,
+// because an image installed without its hash would be reinstalled by the
+// next ota op for it.
 static bool rememberInstalled(const String &shaHex) {
   const esp_partition_t *slot = esp_ota_get_next_update_partition(nullptr);
   if (!slot) return false;
   prefsBegin(false);
-  bool ok = s_prefs.putString("otaslot", slot->label) > 0 &&
-            s_prefs.putString("otapending", shaHex) == shaHex.length();  // proven only by the first frame
+  bool ok = s_prefs.putString(pendKey(slot->label).c_str(), shaHex) == shaHex.length();
   prefsEnd();
   return ok;
 }
 
-// Only from the pending image's own slot: an upload or download records the
-// next image as pending before the restart, and a frame the old image draws in
-// that gap proves the old image, not the new one.
+// The running slot's record only: a frame proves the image that drew it.
 static void promoteInstalled() {
-  const esp_partition_t *running = esp_ota_get_running_partition();
+  String key = pendKey(runningSlot());
   prefsBegin(false);
-  String pending = s_prefs.getString("otapending", "");
-  String slot = s_prefs.getString("otaslot", "");
-  if (pending.length() && otaMayPromote(slot.c_str(), running ? running->label : "")) {
+  String pending = s_prefs.getString(key.c_str(), "");
+  if (pending.length()) {
     s_prefs.putString("otasha", pending);
-    s_prefs.remove("otapending");
-    s_prefs.remove("otaslot");
+    s_prefs.remove(key.c_str());
     s_ota_installed = pending;
   }
   prefsEnd();
 }
 
-// At boot, settle the pending hash by the slot it was written to: drop it
-// after a rollback, promote it after a confirm that power cut short.
+static String pendingForRunning() {
+  String key = pendKey(runningSlot());
+  prefsBegin(true);
+  String pending = s_prefs.getString(key.c_str(), "");
+  prefsEnd();
+  return pending;
+}
+
+// At boot, settle every slot's record: drop the ones whose slot is not
+// running, promote the running slot's when a confirm was cut short.
 static void settlePending() {
   const esp_partition_t *running = esp_ota_get_running_partition();
   esp_ota_img_states_t st;
   bool confirmed = running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_VALID;
-  prefsBegin(true);
-  bool has = s_prefs.isKey("otapending");
-  String slot = s_prefs.getString("otaslot", "");
+  prefsBegin(false);
+  // Firmware before this kept one record, in otapending and otaslot. Move it
+  // to its slot's key, so an image that firmware installed is still known.
+  String legacy = s_prefs.getString("otapending", ""), legacy_slot = s_prefs.getString("otaslot", "");
+  if (legacy.length() && legacy_slot.length()) s_prefs.putString(pendKey(legacy_slot.c_str()).c_str(), legacy);
+  s_prefs.remove("otapending");
+  s_prefs.remove("otaslot");
+  bool promote = false;
+  esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, nullptr);
+  for (; it; it = esp_partition_next(it)) {
+    const esp_partition_t *slot = esp_partition_get(it);
+    String key = pendKey(slot->label);
+    if (!s_prefs.isKey(key.c_str())) continue;
+    switch (otaSlotFate(running && !strcmp(slot->label, running->label), confirmed)) {
+      case PENDING_DROP:
+        s_prefs.remove(key.c_str());
+        Serial.printf("[ota] dropped %s's pending image: not running\n", slot->label);
+        break;
+      case PENDING_PROMOTE:
+        promote = true;
+        break;
+      case PENDING_KEEP:
+        break;
+    }
+  }
+  esp_partition_iterator_release(it);
   prefsEnd();
-  switch (otaPendingFate(has, slot.c_str(), running ? running->label : "", confirmed)) {
-    case PENDING_DROP:
-      prefsBegin(false);
-      s_prefs.remove("otapending");
-      s_prefs.remove("otaslot");
-      prefsEnd();
-      Serial.println("[ota] rolled back: dropped the pending image");
-      break;
-    case PENDING_PROMOTE:
-      promoteInstalled();
-      Serial.println("[ota] finished an interrupted confirm");
-      break;
-    case PENDING_KEEP:
-      break;
+  if (promote) {
+    promoteInstalled();
+    Serial.println("[ota] finished an interrupted confirm");
   }
 }
 
@@ -1042,8 +1067,8 @@ static void otaOp(const char *js) {
   }
   prefsBegin(true);
   if (!s_ota_installed.length()) s_ota_installed = s_prefs.getString("otasha", "");
-  String pending = s_prefs.getString("otapending", "");
   prefsEnd();
+  String pending = pendingForRunning();
   if (otaIsCurrent(sha.c_str(), s_ota_installed.c_str(), pending.c_str())) {
     Serial.println("[ota] already running this image");
     return;
