@@ -131,6 +131,17 @@ static void otaPendingAtBoot() {
   check("after a rollback an op for the failed image is not current", !otaIsCurrent("bbbb", "aaaa", ""));
 }
 
+static void resetNames() {
+  // esp_reset_reason_t values; src/main.cpp static_asserts the ones named here.
+  check("reset 1 is poweron", !strcmp(resetName(1), "poweron"));
+  check("reset 3 is sw", !strcmp(resetName(3), "sw"));
+  check("reset 4 is panic", !strcmp(resetName(4), "panic"));
+  check("reset 6 is task_wdt", !strcmp(resetName(6), "task_wdt"));
+  check("reset 9 is brownout", !strcmp(resetName(9), "brownout"));
+  check("an unknown reset code names itself unknown",
+        !strcmp(resetName(-1), "unknown") && !strcmp(resetName(99), "unknown"));
+}
+
 int main() {
   startsOnTcp();
   noTokenEver();
@@ -143,6 +154,7 @@ int main() {
   randomWalks();
   otaCurrent();
   otaPendingAtBoot();
+  resetNames();
   printf(failed ? "SOME FAILED\n" : "ALL PASS\n");
   return failed ? 1 : 0;
 }

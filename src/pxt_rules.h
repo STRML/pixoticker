@@ -56,3 +56,12 @@ inline PendingFate otaPendingFate(bool has_pending, const char *pending_slot, co
   if (strcasecmp(pending_slot, running_slot)) return PENDING_DROP;
   return running_confirmed ? PENDING_PROMOTE : PENDING_KEEP;
 }
+
+// Why the previous boot ended, as /state and X-Pxt-State report it. The codes
+// are esp_reset_reason_t's; src/main.cpp static_asserts them.
+inline const char *resetName(int r) {
+  static const char *const names[] = {"unknown", "poweron", "ext",      "sw",   "panic",     "int_wdt",
+                                      "task_wdt", "wdt",    "deepsleep", "brownout", "sdio", "usb",
+                                      "jtag",     "efuse",  "pwr_glitch", "cpu_lockup"};
+  return (r >= 0 && r < (int)(sizeof(names) / sizeof(names[0]))) ? names[r] : "unknown";
+}

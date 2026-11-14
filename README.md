@@ -40,6 +40,8 @@ tools/
   pixels_demo.py    colour and geometry checks
   mirror.js         mirror a browser canvas of any website onto the panel
   serial_cmd.py     serial helpers
+  serial_port.py    shared by the serial tools: PlatformIO's Python, the one adapter
+  test_serial_port.py  checks for serial_port.py (python3 tools/test_serial_port.py)
   orderbook.js      example: live Deribit BTC-PERPETUAL depth (bun)
   ccusage.py        example: Claude Code spend from ccusage, daily bars
   screen.py         layout helper: chart band over five lines of text
@@ -299,7 +301,7 @@ open, which suits the bench and nothing else.
 
 | Route | Method | Purpose |
 |---|---|---|
-| `/state` | GET | heap, pull counters, TLS mode, panel config |
+| `/state` | GET | heap, pull counters, TLS mode, panel config (fields below) |
 | `/frame` | GET/POST | read the frame as raw RGB565, or post it base64 encoded (RGB565 or RGB888) |
 | `/pixel`, `/pixels` | POST | set one or many pixels |
 | `/brightness` | POST | 0–255 |
@@ -311,6 +313,18 @@ open, which suits the bench and nothing else.
 | `/update` | GET | upload page |
 | `/safe` | POST | boot into safe mode (no panel init) |
 | `/reboot` | POST | restart |
+
+The memory fields in `/state` say whether a TLS handshake has room. The relay's
+`/device` repeats them from `X-Pxt-State`, as of the last stream connect.
+
+| Field | Meaning |
+|---|---|
+| `heap` | free heap now |
+| `maxblock` | largest free block now; a handshake needs one big contiguous block |
+| `minheap` | lowest free heap since boot. A handshake that failed with an allocation error shows here as a low mark |
+| `reset` | why the previous boot ended: `poweron`, `sw` (asked for), `panic`, `task_wdt`, `int_wdt`, `brownout`, ... |
+| `udp_stack` | bytes of the UDP task's stack never used; 0 until UDP starts |
+| `boots` | failed boots in a row; above 2 the panel boots safe |
 
 Frames are 128×64 RGB565, big-endian. The panel is wired with green and blue
 swapped, so a client that packs RGB565 itself has to swap them too:
@@ -452,7 +466,10 @@ The panel never trusts the image it just booted blindly. On first boot after an
 update it waits for one complete frame; if none arrives it resets into the
 previous image. A boot counter plus a one-shot timer catches a panel
 configuration that hangs boot, and `/safe` (or two failed boots in a row) boots
-with the panel disabled so the HTTP API stays reachable.
+with the panel disabled so the HTTP API stays reachable. A boot counts as failed
+until it has stayed up for 60 s, so a crash or a watchdog reset later in boot
+counts too. A restart the firmware asks for (a reboot op, an update, a settings
+change) clears the counter first.
 
 **Dump your own stock firmware before replacing it.** The vendor image is not
 included here and must not be redistributed; a full 4 MB read over the serial
@@ -471,7 +488,13 @@ tools/serial_cmd.py state                # also test, reboot, bright N, wifi SSI
 `flash_serial.py` erases the OTA data partition before it writes. An earlier
 over-the-air update leaves the bootloader pointed at the other app slot, and it
 would keep booting the old image. Serial commands need no key, since they
-assume physical access. All three tools take `--port`.
+assume physical access.
+
+All three tools pick the one `/dev/cu.usbserial-*` adapter plugged in (its
+number follows the USB port), or take `--port`. They need pyserial, which the
+macOS system python3 lacks, so they re-run themselves under PlatformIO's Python
+(`~/.platformio/penv/bin/python`). Opening the port resets the panel even with
+`mon.py --no-reset`: macOS raises DTR and RTS on open, and RTS drives EN.
 
 ## Known limits
 
@@ -499,10 +522,14 @@ assume physical access. All three tools take `--port`.
   it back. The tools here stay at or below about 11 (`mirror.js` about 11,
   `orderbook.js` 8 by default), which has held.
 
-`src/relay_ca.h` pins ISRG Root X1, the Let's Encrypt anchor. A relay on any
-other certificate needs its own root pasted there, or the panel falls back to
-unverified TLS after five rejected certificates, and retries the verified chain
-every 30 minutes.
+`src/relay_ca.h` pins two Let's Encrypt roots: ISRG Root X1 and ISRG Root YE.
+X1 alone verifies any Let's Encrypt chain. YE is there for heap. The relay's
+chain runs leaf, YE2, Root YE, X2, X1. Trusting YE lets the TLS library stop at
+YE2's parent and skip X1's RSA-4096 signature over X2. That check needs more
+heap than the panel has once UDP is running. A relay on any other certificate
+needs its own root pasted there, or the panel falls back to unverified TLS
+after five rejected certificates, and retries the verified chain every 30
+minutes.
 
 ## License
 

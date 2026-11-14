@@ -1,8 +1,15 @@
 #ifndef RELAY_CA_H
 #define RELAY_CA_H
 
-// ISRG Root X1: the anchor a Let's Encrypt chain terminates at, via the
-// cross-signed Root YR the server sends alongside the leaf.
+// Two trust anchors, parsed into one list (mbedtls_x509_crt_parse takes
+// concatenated PEM certificates).
+//   ISRG Root X1 (RSA 4096): the anchor any Let's Encrypt chain can end at.
+//   ISRG Root YE (ECDSA P-384), self-signed: the relay's chain is leaf, YE2,
+//   Root YE cross-signed by X2, X2 cross-signed by X1. With YE trusted, mbedtls
+//   stops at YE2's parent and never checks X1's RSA-4096 signature over X2,
+//   which the handshake had too little heap for.
+//   SPKI SHA-256 b0292ae545978e0fbb98abbd94c861605e5b18bb32ed523f50d5b7b5c71d47bc,
+//   from https://letsencrypt.org/certs/gen-y/root-ye.pem
 static const char RELAY_CA[] PROGMEM = R"CERT(
 -----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
@@ -34,6 +41,18 @@ oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
 4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
 mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIB2TCCAWCgAwIBAgIRAKQCa6LvbHwg1AR+XmWmk4AwCgYIKoZIzj0EAwMwLjEL
+MAkGA1UEBhMCVVMxDTALBgNVBAoTBElTUkcxEDAOBgNVBAMTB1Jvb3QgWUUwHhcN
+MjUwOTAzMDAwMDAwWhcNNDUwOTAyMjM1OTU5WjAuMQswCQYDVQQGEwJVUzENMAsG
+A1UEChMESVNSRzEQMA4GA1UEAxMHUm9vdCBZRTB2MBAGByqGSM49AgEGBSuBBAAi
+A2IABDwS/6vhrcVqcbBo+wgdI3fwn9x7DNJJOY/lTOti0vkwuRN87RhEhTH17E7X
+yFjWsPYhIPt/wzOqxTd2b+4ZJNy9ID04YywF9U5zasDVyGSNErVNtz8uSGh5izW8
+7j77GaNCMEAwDgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0O
+BBYEFKPIJlqOoUzQNWP8myPIOq5W809WMAoGCCqGSM49BAMDA2cAMGQCMHhMr8N9
+LdL1VQKs9BdV81r76eXRB6mtjuNjzk6/lBsPNToWLTDzGYgtQKO1jl63uAIwGV7m
+onyF377c+MM1oqVNs17sgu7F9YKZwgLmVbeOMDbKAXHtKMDLbiGllCcs8f47
 -----END CERTIFICATE-----
 )CERT";
 

@@ -233,7 +233,7 @@ class Handler(BaseHTTPRequestHandler):
             raw = json.loads(state)
             dev = {k: v for k, v in raw.items()
                    if k in ("build", "uptime", "heap", "maxblock", "frames", "errors",
-                            "phase", "rssi", "tls", "ota", "boot", "udp")
+                            "phase", "rssi", "tls", "ota", "boot", "udp", "minheap", "reset")
                    and isinstance(v, (int, str)) and len(str(v)) < 48}
         except Exception:
             return None
