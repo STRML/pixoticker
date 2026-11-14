@@ -265,9 +265,11 @@ The panel closes its stream before it downloads, since a second TLS session
 doesn't fit beside the first. It installs only when the size and SHA-256 match,
 and it ignores an op for the image it already runs, or for the one it just
 installed that has not shown its first whole frame yet, so a re-queued op never
-reinstalls. If that new image resets before its first whole frame and the
-bootloader goes back, the old image forgets the failed one at boot, so a
-retried op installs it again.
+reinstalls. The pending record names the slot it was written to. If the new
+image resets before its first whole frame and the bootloader goes back to the
+other slot, the old image drops the record at boot, so a retried op installs
+it again. If power is lost between the confirm and the record's promotion, the
+new image finishes the promotion at its next boot.
 
 ## Panel API
 

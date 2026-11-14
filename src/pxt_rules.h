@@ -37,10 +37,22 @@ inline bool otaIsCurrent(const char *sha, const char *installed, const char *pen
   return (installed[0] && !strcasecmp(sha, installed)) || (pending[0] && !strcasecmp(sha, pending));
 }
 
-// The pending hash names the image waiting for its first whole frame. If the
-// running image is already confirmed, that image never proved itself and the
-// bootloader went back: the hash is stale and must not count as current, or
-// be promoted when this image draws.
-inline bool otaPendingStale(bool running_confirmed, bool has_pending) {
-  return running_confirmed && has_pending;
+// At boot, what to do with the pending hash, which names the image waiting for
+// its first whole frame and the slot it was written to.
+//   Another slot is running: that image reset before proving itself and the
+//   bootloader went back. Drop the hash, or it would count as current and be
+//   promoted when this image draws.
+//   Its own slot, already confirmed: power was lost between the confirm and
+//   the promotion. Promote it now.
+//   Its own slot, unconfirmed: this is the image on trial. Keep it.
+// A hash with no slot comes from older firmware; only an unconfirmed image
+// can be its owner.
+enum PendingFate { PENDING_KEEP, PENDING_DROP, PENDING_PROMOTE };
+
+inline PendingFate otaPendingFate(bool has_pending, const char *pending_slot, const char *running_slot,
+                                  bool running_confirmed) {
+  if (!has_pending) return PENDING_KEEP;
+  if (!pending_slot[0]) return running_confirmed ? PENDING_DROP : PENDING_KEEP;
+  if (strcasecmp(pending_slot, running_slot)) return PENDING_DROP;
+  return running_confirmed ? PENDING_PROMOTE : PENDING_KEEP;
 }

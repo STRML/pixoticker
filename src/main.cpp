@@ -908,24 +908,14 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
 // version written after a verified install is the one to compare.
 static String s_ota_installed;
 
+// Called after Update.end(true), so the boot partition is the slot just
+// written. The slot goes first: power lost between the two writes leaves no
+// pending hash, never a hash with the wrong slot.
 static void rememberInstalled(const String &shaHex) {
+  const esp_partition_t *slot = esp_ota_get_boot_partition();
   s_prefs.begin("pxt", false);
+  s_prefs.putString("otaslot", slot ? slot->label : "");
   s_prefs.putString("otapending", shaHex);  // proven only by the first frame
-  s_prefs.end();
-}
-
-// At boot: a pending hash beside an image the bootloader already holds as
-// confirmed names an image that reset before its first whole frame and was
-// rolled back. Drop it, so it is neither skipped as current nor promoted.
-static void forgetStalePending() {
-  esp_ota_img_states_t st;
-  bool confirmed = esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK &&
-                   st == ESP_OTA_IMG_VALID;
-  s_prefs.begin("pxt", false);
-  if (otaPendingStale(confirmed, s_prefs.isKey("otapending"))) {
-    s_prefs.remove("otapending");
-    Serial.println("[ota] rolled back: dropped the pending image");
-  }
   s_prefs.end();
 }
 
@@ -935,9 +925,37 @@ static void promoteInstalled() {
   if (pending.length()) {
     s_prefs.putString("otasha", pending);
     s_prefs.remove("otapending");
+    s_prefs.remove("otaslot");
     s_ota_installed = pending;
   }
   s_prefs.end();
+}
+
+// At boot, settle the pending hash by the slot it was written to: drop it
+// after a rollback, promote it after a confirm that power cut short.
+static void settlePending() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  esp_ota_img_states_t st;
+  bool confirmed = running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_VALID;
+  s_prefs.begin("pxt", true);
+  bool has = s_prefs.isKey("otapending");
+  String slot = s_prefs.getString("otaslot", "");
+  s_prefs.end();
+  switch (otaPendingFate(has, slot.c_str(), running ? running->label : "", confirmed)) {
+    case PENDING_DROP:
+      s_prefs.begin("pxt", false);
+      s_prefs.remove("otapending");
+      s_prefs.remove("otaslot");
+      s_prefs.end();
+      Serial.println("[ota] rolled back: dropped the pending image");
+      break;
+    case PENDING_PROMOTE:
+      promoteInstalled();
+      Serial.println("[ota] finished an interrupted confirm");
+      break;
+    case PENDING_KEEP:
+      break;
+  }
 }
 
 static String s_ota_path, s_ota_sha;
@@ -1657,7 +1675,7 @@ void setup() {
   s_boots++;
 
   loadConfig();
-  forgetStalePending();
+  settlePending();
   if (s_boots > MAX_PANEL_ATTEMPTS) {
     Serial.printf("[pxt] safe mode: %u boot attempts\n", (unsigned)s_boots);
     s_safe = true;

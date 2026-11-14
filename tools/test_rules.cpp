@@ -113,12 +113,21 @@ static void otaCurrent() {
   check("empty records match nothing", !otaIsCurrent("cccc", "", ""));
 }
 
-static void otaRollback() {
-  // B was installed over A and reset before its first whole frame; the
-  // bootloader went back to A, which is confirmed. B's pending hash is stale.
-  check("a pending hash beside a confirmed running image is stale", otaPendingStale(true, true));
-  check("a pending hash beside an unconfirmed running image is that image", !otaPendingStale(false, true));
-  check("nothing pending is never stale", !otaPendingStale(true, false));
+static void otaPendingAtBoot() {
+  // The pending hash records the slot it was written to. A is in app0, B was
+  // installed into app1.
+  check("B boots unconfirmed from app1: keep its pending hash",
+        otaPendingFate(true, "app1", "app1", false) == PENDING_KEEP);
+  check("B reset before its first whole frame, back on A in app0: drop B's hash",
+        otaPendingFate(true, "app1", "app0", true) == PENDING_DROP);
+  check("a rollback onto an unconfirmed slot still drops the other slot's hash",
+        otaPendingFate(true, "app1", "app0", false) == PENDING_DROP);
+  check("power lost between B's confirm and its promotion: promote B now",
+        otaPendingFate(true, "app1", "app1", true) == PENDING_PROMOTE);
+  check("a hash with no slot (older firmware) beside an unconfirmed image: keep",
+        otaPendingFate(true, "", "app1", false) == PENDING_KEEP);
+  check("a hash with no slot beside a confirmed image: drop", otaPendingFate(true, "", "app0", true) == PENDING_DROP);
+  check("nothing pending: nothing to do", otaPendingFate(false, "", "app0", true) == PENDING_KEEP);
   check("after a rollback an op for the failed image is not current", !otaIsCurrent("bbbb", "aaaa", ""));
 }
 
@@ -133,7 +142,7 @@ int main() {
   reconnectWhileLive();
   randomWalks();
   otaCurrent();
-  otaRollback();
+  otaPendingAtBoot();
   printf(failed ? "SOME FAILED\n" : "ALL PASS\n");
   return failed ? 1 : 0;
 }
