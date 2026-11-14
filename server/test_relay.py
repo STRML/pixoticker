@@ -7,19 +7,24 @@ the panel and the tools do, and print one PASS/FAIL line per check.
 Stdlib only. Nothing leaves the machine; the key is random per run.
 """
 import hashlib
+import hmac
 import http.client
 import json
 import os
+import random
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 
 RELAY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pxtrelay.py")
 PORT = 18979
+UDP_PORT = 18980
 KEY = os.urandom(16).hex()
 FRAME = 128 * 64 * 2
 results = []
@@ -36,10 +41,10 @@ def req(path, data=None):
     return json.load(urllib.request.urlopen(r, timeout=5))
 
 
-def stream(state):
+def stream(state, query=""):
     """Open a panel-style stream and drain it in the background."""
     s = socket.create_connection(("127.0.0.1", PORT))
-    s.sendall((f"GET /stream?since=0 HTTP/1.1\r\nHost: x\r\nX-Api-Key: {KEY}\r\n"
+    s.sendall((f"GET /stream?since=0{query} HTTP/1.1\r\nHost: x\r\nX-Api-Key: {KEY}\r\n"
                f"X-Pxt-State: {state}\r\nConnection: close\r\n\r\n").encode())
 
     def drain():
@@ -177,6 +182,329 @@ def ota_state():
           req("/device").get("ota") == "ranged 65536/1153312 closed")
 
 
+# ---------------------------------------------------------------- UDP frames
+# The panel says hello on UDP; the relay answers with the newest frame as
+# signed strips. Panel below mirrors the firmware's rules in src/main.cpp
+# (udpFeed and udpSettle) one for one, so these checks cover both ends.
+
+MAC = 16
+ROWS = 64
+ROW_BYTES = 256
+PARTIAL_S = 0.25
+_hello_ts = [0]
+
+
+def sign(data):
+    return hmac.new(KEY.encode(), data, hashlib.sha256).digest()[:MAC]
+
+
+def hello_bytes(boot, newest=0, ts=None):
+    if ts is None:
+        _hello_ts[0] = max(_hello_ts[0] + 1, int(time.time()))
+        ts = _hello_ts[0]
+    d = b"PXTH" + struct.pack(">III", ts, boot, newest)
+    return d + sign(d)
+
+
+def udp_sock(rcvbuf=None):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if rcvbuf:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+    s.bind(("127.0.0.1", 0))
+    return s
+
+
+def say_hello(s, boot, newest=0, ts=None):
+    d = hello_bytes(boot, newest, ts)
+    s.sendto(d, ("127.0.0.1", UDP_PORT))
+    return d
+
+
+def collect(s, quiet=0.3, limit=5.0):
+    """Every datagram until the socket has been quiet for `quiet` seconds."""
+    out = []
+    end = time.time() + limit
+    s.settimeout(quiet)
+    while time.time() < end:
+        try:
+            out.append(s.recv(2048))
+        except socket.timeout:
+            break
+    return out
+
+
+def unrle(body, npx):
+    if len(body) % 3:
+        return None
+    px = bytearray()
+    for i in range(0, len(body), 3):
+        px += bytes(body[i:i + 2]) * body[i + 2]
+    return bytes(px) if len(px) == npx * 2 else None
+
+
+class Panel:
+    def __init__(self):
+        self.fb = bytearray(FRAME)
+        self.cur = 0
+        self.mask = 0
+        self.full = 0
+        self.first = 0.0
+        self.shown = False
+        self.complete = False
+        self.shows = []   # (seq, complete, fb copy)
+        self.bad = 0
+
+    def feed(self, d):
+        if len(d) < 8 + MAC or not hmac.compare_digest(sign(d[:-MAC]), d[-MAC:]):
+            self.bad += 1
+            return
+        if d[:4] != b"PXTS" or len(d) < 13 + MAC:
+            return
+        seq = int.from_bytes(d[4:8], "big")
+        idx, count, row0, nrows, enc = d[8:13]
+        body = d[13:-MAC]
+        if not 0 < count <= 16 or idx >= count or row0 + nrows > ROWS:
+            return
+        if enc == 0:
+            px = body if len(body) == nrows * ROW_BYTES else None
+        else:
+            px = unrle(body, nrows * 128) if enc == 1 else None
+        if px is None or seq < self.cur:
+            return
+        if seq > self.cur:
+            self.cur, self.mask, self.full = seq, 0, (1 << count) - 1
+            self.first, self.shown, self.complete = time.time(), False, False
+        if self.mask & (1 << idx):
+            return
+        self.fb[row0 * ROW_BYTES:(row0 + nrows) * ROW_BYTES] = px
+        self.mask |= 1 << idx
+
+    def settle(self, now=None):
+        now = time.time() if now is None else now
+        if self.mask and self.mask == self.full and not self.complete:
+            self.complete = self.shown = True
+            self.shows.append((self.cur, True, bytes(self.fb)))
+        elif self.mask and not self.shown and now - self.first > PARTIAL_S:
+            self.shown = True
+            self.shows.append((self.cur, False, bytes(self.fb)))
+
+    def take(self, dgrams):
+        for d in dgrams:
+            self.feed(d)
+        self.settle()
+
+
+def post_frame(body):
+    return req("/frame", body)["seq"]
+
+
+def noise():
+    return os.urandom(FRAME)
+
+
+def udp_ack_without_frame():
+    s = udp_sock()
+    say_hello(s, 1)
+    got = collect(s)
+    check("a hello with no frame yet gets a signed ack",
+          len(got) == 1 and got[0][:4] == b"PXTA" and sign(got[0][:-MAC]) == got[0][-MAC:],
+          f"got={[g[:4] for g in got]}")
+    s.close()
+
+
+def udp_hello_auth():
+    s = udp_sock()
+    d = bytearray(hello_bytes(2))
+    d[6] ^= 1
+    s.sendto(bytes(d), ("127.0.0.1", UDP_PORT))
+    check("a hello with a bad HMAC gets no answer", collect(s) == [])
+    say_hello(s, 2, ts=int(time.time()) - 300)
+    check("a hello five minutes old gets no answer", collect(s) == [])
+    good = say_hello(s, 2)
+    collect(s)
+    t = udp_sock()
+    t.sendto(good, ("127.0.0.1", UDP_PORT))
+    check("a replayed hello from another address gets no answer", collect(t) == [])
+    s.close()
+    t.close()
+
+
+def udp_strips():
+    s = udp_sock()
+    say_hello(s, 3)
+    collect(s)
+    for name, frame in (("noise", noise()), ("flat", bytes(FRAME))):
+        seq = post_frame(frame)
+        got = collect(s)
+        p = Panel()
+        p.take(got)
+        biggest = max((len(g) for g in got), default=0)
+        check(f"a posted {name} frame arrives as signed strips of 1400 bytes or less that rebuild it",
+              got and biggest <= 1400 and p.shows and p.shows[-1][:2] == (seq, True)
+              and p.shows[-1][2] == frame, f"n={len(got)} max={biggest}")
+    s.close()
+
+
+def udp_loss_order_tamper():
+    s = udp_sock()
+    say_hello(s, 4)
+    collect(s)
+    frame = noise()
+    seq = post_frame(frame)
+    got = [g for g in collect(s) if g[:4] == b"PXTS"]
+
+    p = Panel()
+    p.take(got[:5] + got[6:])
+    time.sleep(PARTIAL_S + 0.05)
+    p.settle()
+    lost = got[5] if len(got) > 5 else bytes(16)
+    row0, nrows = lost[10], lost[11]
+    keep = bytes(p.fb[:row0 * ROW_BYTES]) + bytes(p.fb[(row0 + nrows) * ROW_BYTES:])
+    want = frame[:row0 * ROW_BYTES] + frame[(row0 + nrows) * ROW_BYTES:]
+    check("a lost strip costs only its rows: the rest shows after the partial timeout",
+          bool(p.shows) and p.shows[-1][:2] == (seq, False) and keep == want)
+    say_hello(s, 4, newest=p.cur)
+    p.take(collect(s))
+    check("the next hello resends the frame and fills the lost strip",
+          bool(p.shows) and p.shows[-1][:2] == (seq, True) and bytes(p.fb) == frame)
+
+    p = Panel()
+    shuffled = list(got)
+    random.shuffle(shuffled)
+    p.take(shuffled)
+    check("strips in any order rebuild the frame", bool(p.shows) and p.shows[-1][1] and bytes(p.fb) == frame)
+
+    p = Panel()
+    bad = bytearray(got[0] if got else bytes(64))
+    bad[20] ^= 0xFF
+    p.take([bytes(bad)])
+    check("a strip with a bad HMAC is dropped", p.bad == 1 and p.mask == 0 and bytes(p.fb) == bytes(FRAME))
+
+    newer = noise()
+    seq2 = post_frame(newer)
+    got2 = [g for g in collect(s) if g[:4] == b"PXTS"]
+    p = Panel()
+    p.take(got2)
+    p.take(got)
+    check("strips of an older frame replayed after a newer one are dropped",
+          p.cur == seq2 and bytes(p.fb) == newer and len(p.shows) == 1 and seq2 > seq)
+    s.close()
+
+
+def udp_slow_panel():
+    # A panel that falls behind must come back to the newest frame, never play
+    # out a backlog. The relay sends only the newest frame it holds.
+    s = udp_sock(rcvbuf=1 << 20)
+    say_hello(s, 5)
+    collect(s)
+    frames = [noise() for _ in range(30)]
+    seqs = [post_frame(f) for f in frames]
+    time.sleep(1.0)
+    backlog = collect(s)
+    order = [int.from_bytes(g[4:8], "big") for g in backlog if g[:4] == b"PXTS"]
+    check("the relay never sends an older frame after a newer one and skips superseded frames",
+          bool(order) and order == sorted(order) and order[-1] == seqs[-1] and len(set(order)) < len(seqs),
+          f"posted={len(seqs)} sent={len(set(order))}")
+    p = Panel()
+    p.take(backlog)
+    say_hello(s, 5, newest=p.cur)
+    p.take(collect(s))
+    check("a slow panel shows the newest frame after it drains, not a backlog",
+          bool(p.shows) and p.shows[-1][0] == seqs[-1] and bytes(p.fb) == frames[-1])
+    s.close()
+
+
+def udp_restart_seq():
+    # The relay's counter restarts from the clock. A panel that saw a higher
+    # seq would drop every new frame as old, so its hello names that seq and
+    # the relay moves past it.
+    s = udp_sock()
+    seq = post_frame(noise())
+    collect(s)
+    say_hello(s, 6, newest=seq + 100000)
+    p = Panel()
+    p.cur = seq + 100000
+    p.take(collect(s))
+    check("after a relay restart the panel's higher seq is passed, so the current frame shows",
+          bool(p.shows) and p.shows[-1][0] > seq + 100000)
+    check("frames after that keep counting up from there", post_frame(noise()) > seq + 100000)
+    s.close()
+
+
+def udp_sent_counter():
+    # _sent counts UDP frames only for the boot that holds the control stream.
+    stream(json.dumps({"build": "udp", "uptime": 2, "boot": 777}), "&frames=0")
+    time.sleep(0.4)
+    s = udp_sock()
+    say_hello(s, 555)
+    collect(s)
+    post_frame(noise())
+    collect(s)
+    dev = req("/device")
+    check("UDP frames sent to another boot's address do not count toward _sent",
+          dev.get("boot") == 777 and dev.get("_sent") == 0 and dev.get("path") == "udp", json.dumps(dev))
+    say_hello(s, 777)
+    collect(s)
+    post_frame(noise())
+    collect(s)
+    sent = req("/device").get("_sent")
+    check("UDP frames sent to the current boot count once each", sent == 2, f"_sent={sent}")
+    s.close()
+
+
+def read_for(s, seconds, until=None):
+    data = b""
+    end = time.time() + seconds
+    s.settimeout(0.3)
+    while time.time() < end and not (until and until in data):
+        try:
+            data += s.recv(65536)
+        except socket.timeout:
+            pass
+    return data
+
+
+def control_stream():
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=3)
+    s.sendall((f"GET /stream?since=0&enc=rle&frames=0 HTTP/1.1\r\nHost: x\r\nX-Api-Key: {KEY}\r\n"
+               f"Connection: close\r\n\r\n").encode())
+    time.sleep(0.2)
+    for _ in range(5):
+        post_frame(noise())
+        time.sleep(0.2)
+    req("/op", json.dumps({"type": "brightness", "value": 40}).encode())
+    body = read_for(s, 1.5).split(b"\r\n\r\n", 1)[-1]
+    s.close()
+    check("a frames=0 stream carries the op and no frames",
+          b"PXTO" in body and b'"brightness"' in body and b"PXTF" not in body and b"PXTR" not in body
+          and len(body) < 400, f"bytes={len(body)}")
+
+
+def old_stream():
+    frame = noise()
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=3)
+    s.sendall((f"GET /stream?since=0 HTTP/1.1\r\nHost: x\r\nX-Api-Key: {KEY}\r\n"
+               f"X-Pxt-State: {json.dumps({'build': 'old', 'uptime': 9})}\r\nConnection: close\r\n\r\n").encode())
+    time.sleep(0.3)
+    seq = post_frame(frame)
+    tag = b"PXTF" + seq.to_bytes(4, "big")
+    data = read_for(s, 2.0, until=frame[-64:])
+    s.close()
+    at = data.find(tag)
+    check("an old-firmware stream (no frames flag) still gets every frame on /stream",
+          at >= 0 and data[at + 8:at + 8 + FRAME] == frame)
+    check("an old-firmware stream registers the device on the tcp path", req("/device").get("path") == "tcp")
+
+
+def op_too_big():
+    try:
+        req("/op", json.dumps({"type": "ota", "path": "x" * 300}).encode())
+        code = 200
+    except urllib.error.HTTPError as e:
+        code = e.code
+    check("an op over 180 bytes is refused with a 413", code == 413, f"code={code}")
+
+
 def main():
     with tempfile.NamedTemporaryFile("w", suffix=".key") as kf, tempfile.NamedTemporaryFile(suffix=".bin") as fwf:
         kf.write(KEY)
@@ -184,7 +512,7 @@ def main():
         fwf.write(FW)
         fwf.flush()
         proc = subprocess.Popen([sys.executable, RELAY, "--port", str(PORT), "--key-file", kf.name,
-                                 "--firmware", fwf.name],
+                                 "--firmware", fwf.name, "--udp-port", str(UDP_PORT)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             for _ in range(50):
@@ -193,11 +521,21 @@ def main():
                     break
                 except OSError:
                     time.sleep(0.1)
+            udp_ack_without_frame()
+            udp_hello_auth()
             device_state()
             sent_counter()
             http11()
             firmware_ranges()
             ota_state()
+            udp_strips()
+            udp_loss_order_tamper()
+            udp_slow_panel()
+            udp_restart_seq()
+            udp_sent_counter()
+            control_stream()
+            old_stream()
+            op_too_big()
         finally:
             proc.terminate()
             proc.wait()

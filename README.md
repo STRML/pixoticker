@@ -2,16 +2,18 @@
 
 Firmware and a small relay server for a 128×64 HUB75 LED panel driven by an
 ESP32 (no PSRAM, 4 MB flash). The panel draws whatever frames a remote relay
-hands it, over a single outbound TLS connection, so it needs no inbound ports,
-no port forwarding and no laptop left running on the same network.
+hands it. It dials out for everything: one TLS connection for ops and
+telemetry, and UDP for frames. It needs no inbound ports, no port forwarding
+and no laptop left running on the same network.
 
 The display is a 128×64 panel built from two 64×64 modules side by side
 (1/32 scan, FM6126A drivers). The module layout is a runtime setting, so other
 HUB75 layouts of up to four modules work too.
 
 ```
-renderer ──POST /frame──▶ relay ──TLS stream──▶ ESP32 ──HUB75──▶ panel
-   ▲                       │
+renderer ──POST /frame──▶ relay ══UDP strips══▶ ESP32 ──HUB75──▶ panel
+   ▲                       │  ◀──UDP hello───
+   │                       └───TLS stream───▶   (ops, keepalives)
    └────── /op, /device ───┘   (brightness, OTA, telemetry)
 ```
 
@@ -173,6 +175,11 @@ curl -H "X-Api-Key: $KEY" -d '{"layout":"rows"}' http://board-host:18101/layout 
    python3 server/pxtrelay.py --port 18100        # binds 127.0.0.1
    ```
 
+   Frames go out on UDP port 18102 (`--udp-port`, 0 turns it off). That port
+   must reach the relay from the internet, so bind it with `--bind 0.0.0.0` or
+   forward it, and open it in the firewall. Without it the panel falls back to
+   frames on the TLS stream.
+
    Put it behind nginx with a Let's Encrypt certificate:
 
    ```nginx
@@ -204,6 +211,7 @@ The relay host, port and key are compile-time settings in `src/secrets.h`
 
 ```
 -DPXT_RELAY_HOST=\"relay.example.com\" -DPXT_RELAY_PORT=443 -DPXT_RELAY_KEY=\"...\"
+-DPXT_RELAY_UDP_PORT=18102
 ```
 
 With no host the firmware still runs: it serves its access point and its HTTP
@@ -312,39 +320,83 @@ and captures right after the page's own draw callback instead. Uploads use
 
 ## Relay protocol
 
-One long-lived chunked stream carries everything. Each chunk starts with a
-four-byte magic, a big-endian sequence number, then the payload:
+Frames travel by UDP. Ops and telemetry travel on one long-lived TLS stream.
+
+A TCP stream queues frames. When the panel's Wi-Fi slows, every proxy between
+the relay and the panel buffers what the relay already wrote, and the panel
+plays it back minutes late. The relay's 32 KB `SO_SNDBUF` only slows the relay
+when its own socket faces the panel. Behind nginx or a Docker port the relay
+writes to a local proxy that never pushes back. UDP has no queue to fill: a
+datagram the link cannot carry is dropped, and the next frame replaces it.
+
+### UDP frames
 
 ```
-PXTF + seq + 16384 bytes     raw frame, 128×64 RGB565
-PXTR + seq + runs            the same frame, run encoded: hi, lo, count
+panel ──PXTH hello every 4 s──▶ relay      from a fixed local port, opens the NAT path
+panel ◀──PXTS strip × 16─────── relay      on every new frame, and the current frame on each hello
+panel ◀──PXTA ack────────────── relay      a hello before the relay holds any frame
+```
+
+| Datagram | Bytes |
+|---|---|
+| `PXTH` hello | magic, panel clock (u32), boot nonce (u32), newest seq shown (u32), MAC |
+| `PXTS` strip | magic, seq (u32), index, count, first row, rows, enc (0 raw, 1 runs), pixels, MAC |
+| `PXTA` ack | magic, relay seq (u32), MAC |
+
+The MAC is the first 16 bytes of HMAC-SHA256 under the relay key, over the
+rest of the datagram. Integers are big-endian.
+
+- A frame is 16 strips of 4 rows. Each strip decodes on its own, so a lost
+  datagram costs 4 rows of one frame. A strip is at most 1053 bytes.
+- Each strip is run encoded (hi, lo, count) when that is smaller. A typical
+  board frame is 5.6 KB run encoded against 16 KB raw.
+- The relay always sends its newest frame. Frames posted while it sends are
+  skipped, never queued.
+- The panel drops a strip with a bad MAC, and a strip older than the newest
+  seq it holds. It shows a frame once all its strips arrive, or after 250 ms
+  with what it has, so a lost strip never freezes the panel.
+- A hello must carry a fresh clock that is newer than the last hello. A
+  captured hello replayed from another address gets nothing.
+- The relay forgets the panel's address after 20 s without a hello.
+- The seq counter starts from the clock when the relay starts. A hello names
+  the newest seq the panel has shown, and the relay moves its counter past it,
+  so a restarted relay is never stuck below the panel.
+
+**Frames are signed, not encrypted.** Anyone on the path can see what the panel
+shows. Nobody without the key can change it. Ops and the key never travel by UDP.
+
+### TLS stream
+
+The panel asks for `GET /stream?enc=rle&frames=0`. With `frames=0` the stream
+carries ops and a keepalive every 15 s, and no frames. Each chunk starts with
+a four-byte magic:
+
+```
 PXTO + n + json              one op: brightness, ota, reboot
+PXTF + seq + 16384 bytes     raw frame, 128×64 RGB565 (no frames=0 only)
+PXTR + seq + runs            the same frame, run encoded (enc=rle, no frames=0 only)
 ```
-
-`PXTR` is only used when the client asks for it (`/stream?enc=rle`) and the
-encoded form is smaller. On a typical chart it is 2.5 KB against 16 KB, which
-matters because a panel's receive window and the round trip cap throughput far
-below its Wi-Fi link speed.
-
-Relay routes: `POST /frame`, `GET /stream?since=N&enc=rle`, `GET /next`, `GET /raw`,
-`GET /latest`, `POST /op`, `GET`/`POST /device`, `GET /fw`, `GET /health`.
-
-Four rules keep the stream current:
 
 - A new stream gets only the ops posted after it connected. Replaying a queued
   `reboot` on every reconnect would restart the panel forever.
 - Each op travels in its own chunk, capped at 180 bytes, because the firmware's
   op buffer is small.
-- The sequence counter starts from the clock. When a client sends a `since`
-  above it (a cursor from before a relay restart), the relay treats it as zero.
-- The stream sends at most 4 frames a second (`STREAM_FPS`) through a 32 KB
-  socket buffer. A slow panel then slows the relay down instead of falling
-  minutes behind a queue of stale frames.
+- When a client sends a `since` above the relay's counter (a cursor from
+  before a relay restart), the relay treats it as zero.
+- The panel reconnects after 45 s without a byte.
 
-Frames are written straight into the display buffer as they arrive, so a
-truncated frame never reaches the panel and a new one is only shown once it is
-complete. `panel_show` copies into the DMA buffer and flips, so updates are
-tear free.
+**Fallback.** When no valid datagram has arrived for 10 s, the panel reconnects
+without `frames=0` and takes frames on the stream, as old firmware does. It
+keeps saying hello. After 30 s of valid datagrams it moves frames back to UDP.
+A blocked UDP port never leaves the panel dark. Old firmware never sends the
+flag and gets frames on the stream as before, at most 4 a second
+(`STREAM_FPS`).
+
+Relay routes: `POST /frame`, `GET /stream?since=N&enc=rle&frames=0`, `GET /next`,
+`GET /raw`, `GET /latest`, `POST /op`, `GET`/`POST /device`, `GET /fw`, `GET /health`.
+
+Frames are written straight into the display buffer as they arrive.
+`panel_show` copies into the DMA buffer and flips, so updates are tear free.
 
 ## Recovery
 
@@ -380,7 +432,9 @@ assume physical access. All three tools take `--port`.
 - The panel reports its state in an `X-Pxt-State` header on the stream request,
   so telemetry costs no second TLS session. A relay that never sees the panel
   reconnect will show a stale `device_age`. The `_sent` field in `/device` does
-  stay current: it counts frames streamed to the panel since that connect.
+  stay current: it counts frames sent to the panel since that connect, by UDP
+  to the same boot (`path: udp`) or on the stream (`path: tcp`). The header's
+  `boot` nonce ties the two channels together.
 - The relay keeps no history: a client that reconnects gets the newest frame.
 - Posting frames straight to the panel's HTTP API at 15 a second wedged its web
   server: it still answered ping, HTTP stopped, and only a power cycle brought

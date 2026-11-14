@@ -19,7 +19,10 @@
 #include <HTTPClient.h>
 #include <esp_ota_ops.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
 #include <esp_timer.h>
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
 
 #include "panel.h"
 #include "relay_ca.h"
@@ -57,6 +60,9 @@ static esp_timer_handle_t s_guard = nullptr;
 #ifndef PXT_RELAY_KEY
 #define PXT_RELAY_KEY ""
 #endif
+#ifndef PXT_RELAY_UDP_PORT
+#define PXT_RELAY_UDP_PORT 18102
+#endif
 static volatile uint32_t s_pull_frames = 0;
 static volatile uint32_t s_pull_errors = 0;
 static volatile uint32_t s_pull_seq = 0;
@@ -71,6 +77,9 @@ static char s_tls_err[64] = "";
 static volatile uint32_t s_ops_applied = 0;
 static char s_pull_dns[24] = "?";
 static char s_pull_phase[24] = "idle";
+static uint32_t s_boot_id = 0;  // random per boot: ties the UDP hello to the stream's X-Pxt-State
+static volatile uint32_t s_udp_good = 0, s_udp_bad = 0;
+static TaskHandle_t s_udp_task = nullptr;
 static void set_phase(const char *p) { snprintf(s_pull_phase, sizeof(s_pull_phase), "%s", p); }
 
 // Hold a freshly flashed image in "pending verify" so the bootloader rolls it
@@ -229,7 +238,11 @@ static String buildStateJson() {
   j += "\"maxblock\":" + String(ESP.getMaxAllocHeap()) + ",";
   j += "\"epoch\":" + String((unsigned long)time(nullptr)) + ",";
   j += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  j += "\"ops\":" + String(s_ops_applied);
+  j += "\"ops\":" + String(s_ops_applied) + ",";
+  j += "\"boot\":" + String(s_boot_id) + ",";
+  j += "\"udp_good\":" + String(s_udp_good) + ",";
+  j += "\"udp_bad\":" + String(s_udp_bad) + ",";
+  j += "\"udp_stack\":" + String(s_udp_task ? uxTaskGetStackHighWaterMark(s_udp_task) : 0);
   j += "}";
   return j;
 }
@@ -258,7 +271,9 @@ static String stateHeader() {
              ",\"errors\":" + String((uint32_t)s_pull_errors) +
              ",\"phase\":\"" + String(s_pull_phase) + "\"" +
              ",\"rssi\":" + String(WiFi.RSSI()) +
-             ",\"tls\":\"" + String(s_tls_insecure ? "insecure" : "verified") + "\"";
+             ",\"tls\":\"" + String(s_tls_insecure ? "insecure" : "verified") + "\"" +
+             ",\"boot\":" + String(s_boot_id) +
+             ",\"udp\":\"" + String((uint32_t)s_udp_good) + "/" + String((uint32_t)s_udp_bad) + "\"";
   if (s_ota_note[0]) j += String(",\"ota\":\"") + s_ota_note + "\"";
   j += "}";
   return j;
@@ -684,8 +699,9 @@ static void startNetwork() {
 }
 
 
-// Panel pulls frames from the relay over the internet: no laptop in the path.
-// One persistent connection carries a chunked stream of "PXTF" + seq + 16384B.
+// Panel pulls from the relay over the internet: no laptop in the path. One
+// persistent TLS connection carries a chunked stream of ops and, when UDP is
+// not getting through, frames ("PXTF" + seq + 16384B, or run encoded).
 static const uint32_t FRAME_MAGIC = 0x50585446u;  // "PXTF"
 static const uint32_t RLE_MAGIC = 0x50585452u;    // "PXTR"
 
@@ -982,10 +998,25 @@ static void applyOp(const char *js) {
   }
 }
 
+// Every drawn frame, from the stream or from UDP, goes through here with
+// panel_lock held. The first complete frame proves a new image and cancels
+// its rollback; NVS writes stay under the one lock.
+static void frameShown(uint32_t seq, bool complete) {
+  panel_show(s_fb);
+  s_pull_frames = s_pull_frames + 1;
+  s_pull_seq = seq;
+  if (complete && !s_healthy) {
+    s_healthy = true;
+    esp_ota_mark_app_valid_cancel_rollback();
+    promoteInstalled();
+    Serial.println("[ota] image confirmed");
+  }
+}
+
 struct FrameSink {
   // Frames are written straight into the display buffer, two bytes per pixel.
   // No staging block, so the TLS handshake is never competing for 16 KB.
-  uint32_t win = 0, seq = 0, frames = 0;
+  uint32_t win = 0, seq = 0;
   uint8_t seqb[4];
   int need_seq = 0;
   size_t got = 0;
@@ -996,14 +1027,7 @@ struct FrameSink {
   uint8_t rphi = 0, rplo = 0, rpphase = 0;
 
   void finish() {
-    panel_show(s_fb);
-    frames++;
-    if (!s_healthy) {
-      s_healthy = true;
-      esp_ota_mark_app_valid_cancel_rollback();
-      promoteInstalled();
-      Serial.println("[ota] image confirmed");
-    }
+    frameShown(seq, true);
     mode = 0;
     win = 0;
   }
@@ -1110,6 +1134,228 @@ struct FrameSink {
   }
 };
 
+// ---------------------------------------------------------------- UDP frames
+// Frames come by UDP so nothing can queue them: a lost datagram is gone, and
+// the next frame replaces it. The panel says hello every few seconds from a
+// fixed port, which opens the NAT path back to it. The relay sends each frame
+// as signed strips that decode on their own. The TLS stream stays up for ops
+// and telemetry, and carries frames again when UDP goes quiet.
+
+static const uint16_t UDP_LOCAL_PORT = 18102;
+static const uint32_t UDP_HELLO_MS = 4000;     // two lost in a row still beat UDP_SILENT_MS
+static const uint32_t UDP_SILENT_MS = 10000;   // no valid datagram this long: the stream carries frames
+static const uint32_t UDP_RETURN_MS = 30000;   // valid datagrams this long: frames move back to UDP
+static const uint32_t UDP_PARTIAL_MS = 250;    // a frame missing strips shows after this
+static const size_t UDP_MAC = 16;
+static const size_t STRIP_HEAD = 13;           // PXTS, seq, index, count, first row, rows, enc
+static const int WIRE_W = 128, WIRE_H = 64;
+
+static uint8_t s_dgram[1472];
+static mbedtls_md_context_t s_mac;
+static volatile uint32_t s_udp_last = 0;       // millis of the last valid datagram
+static volatile uint32_t s_udp_since = 0;      // start of the current run of valid datagrams
+static volatile bool s_udp_draws = true;       // false while the stream carries frames
+static volatile bool s_udp_pause = false;      // a firmware download owns the link
+
+static bool udpAlive() {
+  uint32_t t = s_udp_last;
+  return t && millis() - t < UDP_SILENT_MS;
+}
+
+static bool udpSteady() { return udpAlive() && millis() - s_udp_since >= UDP_RETURN_MS; }
+
+static uint32_t be32(const uint8_t *p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static void put32(uint8_t *p, uint32_t v) {
+  p[0] = v >> 24;
+  p[1] = v >> 16;
+  p[2] = v >> 8;
+  p[3] = v;
+}
+
+static void macOf(const uint8_t *d, size_t n, uint8_t out[32]) {
+  mbedtls_md_hmac_reset(&s_mac);
+  mbedtls_md_hmac_update(&s_mac, d, n);
+  mbedtls_md_hmac_finish(&s_mac, out);
+}
+
+static bool macOk(const uint8_t *d, size_t n) {
+  uint8_t m[32];
+  macOf(d, n - UDP_MAC, m);
+  uint8_t diff = 0;
+  for (size_t i = 0; i < UDP_MAC; i++) diff |= m[i] ^ d[n - UDP_MAC + i];
+  return diff == 0;
+}
+
+// One frame being assembled. Only the UDP task touches it.
+struct UdpFrame {
+  uint32_t seq = 0, first = 0;
+  uint16_t mask = 0, full = 0;
+  bool shown = false, complete = false;
+};
+static UdpFrame s_uf;
+
+// Raw strips carry exactly their rows; run strips must cover exactly their rows.
+static bool stripFits(uint8_t enc, const uint8_t *px, size_t len, uint8_t nrows) {
+  size_t want = (size_t)nrows * WIRE_W;
+  if (enc == 0) return len == want * 2;
+  if (enc != 1 || len % 3) return false;
+  size_t n = 0;
+  for (size_t i = 2; i < len; i += 3) n += px[i];
+  return n == want;
+}
+
+static void stripWrite(uint8_t enc, const uint8_t *px, size_t len, uint8_t row0, uint8_t nrows) {
+  size_t at = (size_t)row0 * WIRE_W, end = at + (size_t)nrows * WIRE_W;
+  if (end > s_fb_px) end = s_fb_px;
+  if (enc == 0) {
+    for (size_t i = 0; at + i < end; i++) s_fb[at + i] = ((uint16_t)px[2 * i] << 8) | px[2 * i + 1];
+    return;
+  }
+  for (size_t i = 0; i < len; i += 3) {
+    uint16_t v = ((uint16_t)px[i] << 8) | px[i + 1];
+    for (uint8_t k = 0; k < px[i + 2] && at < end; k++) s_fb[at++] = v;
+  }
+}
+
+static void udpFeed(const uint8_t *d, size_t n) {
+  if (n < 8 + UDP_MAC || !macOk(d, n)) {
+    s_udp_bad = s_udp_bad + 1;
+    return;
+  }
+  uint32_t now = millis();
+  if (!udpAlive()) s_udp_since = now;
+  s_udp_last = now;
+  s_udp_good = s_udp_good + 1;
+  if (!s_udp_draws || n < STRIP_HEAD + UDP_MAC || memcmp(d, "PXTS", 4) != 0) return;
+  uint32_t seq = be32(d + 4);
+  uint8_t idx = d[8], count = d[9], row0 = d[10], nrows = d[11], enc = d[12];
+  const uint8_t *px = d + STRIP_HEAD;
+  size_t len = n - STRIP_HEAD - UDP_MAC;
+  if (!count || count > 16 || idx >= count || row0 + nrows > WIRE_H) return;
+  if (!stripFits(enc, px, len, nrows) || seq < s_uf.seq) return;
+  if (seq > s_uf.seq) {
+    s_uf = UdpFrame();
+    s_uf.seq = seq;
+    s_uf.first = now;
+    s_uf.full = (uint16_t)((1u << count) - 1);
+  }
+  uint16_t bit = 1u << idx;
+  if (s_uf.mask & bit) return;
+  panel_lock();
+  if (s_fb) stripWrite(enc, px, len, row0, nrows);
+  panel_unlock();
+  s_uf.mask |= bit;
+}
+
+// After the queue is drained: show a whole frame at once, or a partial one
+// once it has waited long enough, so a lost strip never freezes the panel.
+static void udpSettle() {
+  if (!s_udp_draws || !s_uf.mask) return;
+  bool full = s_uf.mask == s_uf.full;
+  if (full && !s_uf.complete) {
+    s_uf.complete = s_uf.shown = true;
+  } else if (!s_uf.shown && millis() - s_uf.first > UDP_PARTIAL_MS) {
+    s_uf.shown = true;
+  } else {
+    return;
+  }
+  panel_lock();
+  if (s_fb) frameShown(s_uf.seq, full);
+  panel_unlock();
+}
+
+// PXTH, clock, boot nonce, newest seq shown, mac. The relay checks the clock
+// so a captured hello cannot be replayed, and moves its counter past the
+// newest seq after a restart.
+static void udpHello(int sock, const sockaddr_in &to) {
+  uint8_t d[16 + UDP_MAC];
+  uint32_t newest = s_pull_seq > s_uf.seq ? (uint32_t)s_pull_seq : s_uf.seq;
+  memcpy(d, "PXTH", 4);
+  put32(d + 4, (uint32_t)time(nullptr));
+  put32(d + 8, s_boot_id);
+  put32(d + 12, newest);
+  uint8_t m[32];
+  macOf(d, 16, m);
+  memcpy(d + 16, m, UDP_MAC);
+  sendto(sock, d, sizeof(d), 0, (const sockaddr *)&to, sizeof(to));
+}
+
+static int udpOpen() {
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0) return -1;
+  sockaddr_in me = {};
+  me.sin_family = AF_INET;
+  me.sin_port = htons(UDP_LOCAL_PORT);
+  me.sin_addr.s_addr = htonl(INADDR_ANY);
+  timeval tv = {0, 50000};
+  if (bind(sock, (const sockaddr *)&me, sizeof(me)) != 0 ||
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+    close(sock);
+    return -1;
+  }
+  return sock;
+}
+
+static bool udpResolve(sockaddr_in &to) {
+  addrinfo hints = {};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  addrinfo *res = nullptr;
+  if (getaddrinfo(PXT_RELAY_HOST, nullptr, &hints, &res) != 0 || !res) return false;
+  to = *(const sockaddr_in *)res->ai_addr;
+  to.sin_port = htons(PXT_RELAY_UDP_PORT);
+  freeaddrinfo(res);
+  return true;
+}
+
+static void udpTask(void *) {
+  mbedtls_md_init(&s_mac);
+  if (mbedtls_md_setup(&s_mac, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1) != 0 ||
+      mbedtls_md_hmac_starts(&s_mac, (const uint8_t *)PXT_RELAY_KEY, strlen(PXT_RELAY_KEY)) != 0) {
+    Serial.println("[udp] no HMAC, frames stay on the stream");
+    vTaskDelete(nullptr);
+    return;
+  }
+  int sock = -1;
+  sockaddr_in relay = {};
+  uint32_t resolved = 0, hello = 0;
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED || !clockReady() || !s_fb || s_udp_pause) {
+      delay(500);
+      continue;
+    }
+    if (sock < 0 && (sock = udpOpen()) < 0) {
+      delay(1000);
+      continue;
+    }
+    uint32_t now = millis();
+    if (!resolved || now - resolved > 300000) {
+      if (!udpResolve(relay)) {
+        delay(1000);
+        continue;
+      }
+      resolved = now;
+    }
+    if (!hello || now - hello >= UDP_HELLO_MS) {
+      udpHello(sock, relay);
+      hello = now;
+    }
+    // Wait briefly for one datagram, then drain the queue before drawing, so
+    // a backlog in lwIP is read through instead of shown frame by frame.
+    int n = recv(sock, s_dgram, sizeof(s_dgram), 0);
+    while (n > 0) {
+      udpFeed(s_dgram, (size_t)n);
+      n = recv(sock, s_dgram, sizeof(s_dgram), MSG_DONTWAIT);
+    }
+    udpSettle();
+  }
+}
+
+static const uint32_t STREAM_IDLE_MS = 45000;  // three keepalives missed
+
 static void pullTask(void *) {
   if (!strlen(PXT_RELAY_KEY) || !strlen(PXT_RELAY_HOST)) {
     Serial.println("[pull] disabled, no relay configured");
@@ -1117,7 +1363,9 @@ static void pullTask(void *) {
     return;
   }
 
-  Serial.printf("[pull] %s /pxt/stream\n", PXT_RELAY_HOST);
+  Serial.printf("[pull] %s /pxt/stream, frames on udp %d\n", PXT_RELAY_HOST, PXT_RELAY_UDP_PORT);
+  bool udp = true;  // frames by UDP; false while the stream carries them
+  uint32_t mode_at = millis();
   for (;;) {
     set_phase("clock");
     if (!clockReady()) {
@@ -1166,8 +1414,9 @@ static void pullTask(void *) {
     s_tls_verified = !s_tls_insecure;
     s_tls_fails = 0;
     set_phase("request");
+    s_udp_draws = udp;
     String req = String("GET /pxt/stream?enc=rle&since=") + String(s_pull_seq) +
-                 " HTTP/1.1\r\nHost: " + PXT_RELAY_HOST + "\r\nX-Api-Key: " PXT_RELAY_KEY +
+                 (udp ? "&frames=0" : "") + " HTTP/1.1\r\nHost: " + PXT_RELAY_HOST + "\r\nX-Api-Key: " PXT_RELAY_KEY +
                  "\r\nX-Pxt-State: " + stateHeader() +
                  "\r\nConnection: close\r\n\r\n";
     c.print(req);
@@ -1184,7 +1433,7 @@ static void pullTask(void *) {
       delay(3000);
       continue;
     }
-    set_phase("stream");
+    set_phase(udp ? "udp" : "stream");
     FrameSink sink;
     // One bulk read per socket wake-up. Reading the chunk headers a byte at a
     // time on a TLS client left the receive window closed and the panel a
@@ -1195,10 +1444,24 @@ static void pullTask(void *) {
     bool in_payload = false;
     uint32_t idle = millis();
     for (;;) {
+      // A blocked UDP port must not leave the panel dark, and one quiet spell
+      // must not leave it on the stream, where frames can queue.
+      if (udp && millis() - mode_at > UDP_SILENT_MS && !udpAlive()) {
+        Serial.println("[pull] udp silent, frames on the stream");
+        udp = s_udp_draws = false;
+        mode_at = millis();
+        break;
+      }
+      if (!udp && udpSteady()) {
+        Serial.println("[pull] udp steady, frames back on udp");
+        udp = s_udp_draws = true;
+        mode_at = millis();
+        break;
+      }
       int r = c.read(s_rx, sizeof(s_rx));
       if (r <= 0) {
         if (!c.connected()) break;
-        if (millis() - idle > 90000) break;
+        if (millis() - idle > STREAM_IDLE_MS) break;
         delay(1);
         continue;
       }
@@ -1229,20 +1492,15 @@ static void pullTask(void *) {
         }
       }
       panel_unlock();
-      if (sink.frames) {
-        s_pull_frames = sink.frames;
-        s_pull_seq = sink.seq;
-      }
       if (s_ota_pending) break;
     }
   stream_end:
-    if (sink.frames) {
-      s_pull_frames = sink.frames;
-      s_pull_seq = sink.seq;
-    }
-
     c.stop();
-    if (s_ota_pending) otaRun();
+    if (s_ota_pending) {
+      s_udp_pause = true;
+      otaRun();
+      s_udp_pause = false;
+    }
     delay(300);
   }
 }
@@ -1270,6 +1528,7 @@ void setup() {
 
   startNetwork();
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  s_boot_id = esp_random() | 1;
 
   if (!s_safe) {
 #ifdef PXT_PANEL_DISABLED
@@ -1294,6 +1553,9 @@ void setup() {
   }
   if (strlen(PXT_RELAY_KEY) && strlen(PXT_RELAY_HOST)) {
     xTaskCreatePinnedToCore(pullTask, "pull", 12288, nullptr, 1, nullptr, 0);
+    // Above the pull task, so a burst of strips is drained before lwIP's
+    // small UDP queue overflows.
+    xTaskCreatePinnedToCore(udpTask, "udp", 6144, nullptr, 2, &s_udp_task, 0);
   }
 
   s_http.on("/", HTTP_GET, handleRoot);

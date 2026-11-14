@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""PixoTicker relay: a keyed queue the panel's pusher can pull from.
-
-The panel is only reachable on its own AP, so this service never talks to it.
-It stores the newest frame plus a short op queue; a puller on the same network
-as the panel fetches with /next and forwards to the device.
+"""PixoTicker relay: holds the newest frame and a short op queue for the panel.
 
   GET  /health                      no auth, no data
   POST /frame?fmt=565|888           raw bytes, becomes the newest frame
-  POST /op                          JSON op, queued (pixel, pixels, brightness)
+  POST /op                          JSON op, queued (brightness, reboot, ota)
   GET  /next?since=N&wait=25        long poll: {seq, frame, fmt, ops}
   GET  /raw?since=N&wait=25         binary frame + X-Seq header, 204 when idle
   GET  /stream?since=N              chunked forever: "PXTF" + seq + 16384B frames
-  GET  /latest                      same, no wait
+  GET  /stream?frames=0             the same stream with ops and keepalives only
+  GET  /latest                      same as /next, no wait
+  UDP  --udp-port                   hello in, signed frame strips out
 
-Auth: X-Api-Key header or ?key=. Constant-time compare.
+Auth: X-Api-Key header or ?key=. Constant-time compare. UDP datagrams carry a
+truncated HMAC-SHA256 under the same key.
 """
 import argparse
 import base64
@@ -23,6 +22,7 @@ import json
 import os
 import re
 import socket
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +37,17 @@ OP_TTL = 900        # an op older than this belongs to nobody
 STREAM_FPS = 4
 FW_PATH = os.path.expanduser("~/firmware/pxt.bin")
 RANGE = re.compile(r"^bytes=(\d+)-(\d*)$")
+KEEPALIVE = 15      # seconds between keepalives on a frames=0 stream
+
+# UDP frame channel. A frame goes out as 16 strips of 4 rows. Each strip
+# decodes on its own, so a lost datagram costs 4 rows of one frame.
+UDP_PORT = 18102
+MAC_BYTES = 16
+STRIP_ROWS = 4
+ROW_BYTES = 128 * 2
+HELLO_TTL = 20      # forget the panel's address after this long without a hello
+HELLO_SKEW = 60     # a hello's clock may be this far from ours
+STRIP_GAP = 0.002   # spacing between strips, so the panel's small UDP queue keeps up
 
 
 def rle565(raw):
@@ -60,11 +71,17 @@ class State:
         # Time-seeded: a client holding a higher `since` from before a restart
         # must not wait forever for a frame that already happened.
         self.seq = int(time.time())
+        self.frame_seq = 0  # seq of the newest frame; ops move seq, not this
         self.frame = None
         self.rle = b""
         self.fmt = "565"
         self.ops = []  # list of (seq, dict, ts)
         self.device = {}
+        self.udp_addr = None
+        self.udp_boot = None
+        self.udp_seen = 0.0
+        self.udp_hello_ts = 0
+        self.udp_kick = False
 
 
 STATE = State()
@@ -140,7 +157,8 @@ class Handler(BaseHTTPRequestHandler):
                     STATE.lock.wait(deadline - time.time())
                 return self._json(200, self._snapshot(since))
         if u.path == "/stream":
-            return self._stream(self._since(q), enc=q.get("enc", ["raw"])[0])
+            return self._stream(self._since(q), enc=q.get("enc", ["raw"])[0],
+                                frames=q.get("frames", ["1"])[0] != "0")
         if u.path == "/raw":
             since = self._since(q)
             wait = min(30, max(0, self._int(q, "wait", 25)))
@@ -200,30 +218,43 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # the panel hung up mid-download; it will ask again from where it stopped
 
-    def _stream(self, last, op_since=0, enc="raw"):
+    def _register(self, frames):
         # The panel reports itself on the request rather than opening a second
         # TLS session it cannot afford: the handshake needs a contiguous block
         # the stream already holds. Display only, so it is capped and only
         # known short scalar fields are kept.
         state = self.headers.get("X-Pxt-State")
-        mine = None
-        if state and len(state) <= 600:
-            try:
-                raw = json.loads(state)
-                dev = {k: v for k, v in raw.items()
-                       if k in ("build", "uptime", "heap", "maxblock", "frames",
-                                "errors", "phase", "rssi", "tls", "ota")
-                       and isinstance(v, (int, str)) and len(str(v)) < 48}
-                dev["_seen"] = int(time.time())
-                # The header is frozen at connect, so its frame count stays at
-                # zero after a reboot. _sent counts frames written to this
-                # stream, which is how publish_fw.sh sees a new build draw.
-                dev["_sent"] = 0
-                with STATE.lock:
-                    STATE.device = dev
-                mine = dev
-            except Exception:
-                pass
+        if not state or len(state) > 600:
+            return None
+        try:
+            raw = json.loads(state)
+            dev = {k: v for k, v in raw.items()
+                   if k in ("build", "uptime", "heap", "maxblock", "frames", "errors",
+                            "phase", "rssi", "tls", "ota", "boot", "udp")
+                   and isinstance(v, (int, str)) and len(str(v)) < 48}
+        except Exception:
+            return None
+        dev["_seen"] = int(time.time())
+        # The header is frozen at connect, so its frame count stays at zero
+        # after a reboot. _sent counts frames sent to this connection's panel,
+        # on this stream (tcp) or by UDP to the same boot (udp), which is how
+        # publish_fw.sh sees a new build draw.
+        dev["_sent"] = 0
+        dev["path"] = "tcp" if frames else "udp"
+        with STATE.lock:
+            STATE.device = dev
+        return dev
+
+    @staticmethod
+    def _take_ops(op_seq):
+        """Ops posted after op_seq, and the cursor past them. Caller holds the lock."""
+        cutoff = time.time() - OP_TTL
+        STATE.ops = [e for e in STATE.ops if e[2] >= cutoff]
+        ops = [o for s, o, t in STATE.ops if s > op_seq]
+        return ops, (STATE.seq if ops else op_seq)
+
+    def _stream(self, last, op_since=0, enc="raw", frames=True):
+        mine = self._register(frames)
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Transfer-Encoding", "chunked")
@@ -239,17 +270,18 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
         except OSError:
             pass
+        wrote = time.time()
         try:
             while True:
                 with STATE.lock:
-                    if STATE.seq <= last:
+                    if frames and STATE.seq <= last:
                         STATE.lock.wait(20)
+                    elif not frames and not self._take_ops(op_seq)[0]:
+                        # Frames travel by UDP: wake for ops, and send a
+                        # keepalive only when the stream has been quiet.
+                        STATE.lock.wait(max(0.1, KEEPALIVE - (time.time() - wrote)))
                     seq, frame, rle = STATE.seq, STATE.frame, STATE.rle
-                    cutoff = time.time() - OP_TTL
-                    STATE.ops = [e for e in STATE.ops if e[2] >= cutoff]
-                    ops = [o for s, o, t in STATE.ops if s > op_seq]
-                    if ops:
-                        op_seq = STATE.seq
+                    ops, op_seq = self._take_ops(op_seq)
                 for op in ops:
                     # One op per message: the firmware buffer is small, and a
                     # batch that overflows would be dropped after /op said ok.
@@ -259,6 +291,13 @@ class Handler(BaseHTTPRequestHandler):
                     payload = b"PXTO" + bytes([len(body)]) + body
                     self.wfile.write(("%X\r\n" % len(payload)).encode() + payload + b"\r\n")
                     self.wfile.flush()
+                    wrote = time.time()
+                if not frames:
+                    if time.time() - wrote >= KEEPALIVE:
+                        self.wfile.write(b"1\r\n \r\n")
+                        self.wfile.flush()
+                        wrote = time.time()
+                    continue
                 if frame and seq > last:
                     # The panel's receive window caps it near 25 KB/s, so the
                     # run-encoded form goes out whenever it is smaller.
@@ -331,6 +370,7 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.rle = rle565(body)
                 STATE.fmt = fmt
                 STATE.seq += 1
+                STATE.frame_seq = STATE.seq
                 STATE.lock.notify_all()
             return self._json(200, {"ok": True, "seq": STATE.seq})
 
@@ -364,6 +404,103 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
 
+def mac(key, data):
+    return hmac.new(key, data, hashlib.sha256).digest()[:MAC_BYTES]
+
+
+def strips(frame, seq, key):
+    """One frame as self-contained datagrams: PXTS, seq u32, index, count,
+    first row, rows, enc (0 raw, 1 runs), pixels, mac."""
+    count = 64 // STRIP_ROWS
+    span = STRIP_ROWS * ROW_BYTES
+    out = []
+    for i in range(count):
+        raw = frame[i * span:(i + 1) * span]
+        runs = rle565(raw)
+        enc, body = (1, runs) if len(runs) < len(raw) else (0, raw)
+        d = b"PXTS" + seq.to_bytes(4, "big") + bytes((i, count, i * STRIP_ROWS, STRIP_ROWS, enc)) + body
+        out.append(d + mac(key, d))
+    return out
+
+
+def udp_hello(data, addr, key):
+    """PXTH, panel clock u32, boot nonce u32, newest seq the panel has shown u32, mac."""
+    if len(data) != 16 + MAC_BYTES or data[:4] != b"PXTH":
+        return
+    if not hmac.compare_digest(mac(key, data[:16]), data[16:]):
+        return
+    ts, boot, newest = struct.unpack(">III", data[4:16])
+    with STATE.lock:
+        # A hello must be fresh and newer than the last one, so a captured
+        # hello replayed from another address cannot steal the frames.
+        if abs(ts - time.time()) > HELLO_SKEW or ts <= STATE.udp_hello_ts:
+            return
+        STATE.udp_hello_ts = ts
+        STATE.udp_addr, STATE.udp_boot, STATE.udp_seen = addr, boot, time.time()
+        if newest > STATE.seq:
+            # The counter restarted from the clock below what the panel has
+            # shown, and the panel drops older seqs. Move past it, and restamp
+            # the frame we hold so it shows now.
+            STATE.seq = newest + 1
+            if STATE.frame:
+                STATE.frame_seq = STATE.seq
+        STATE.udp_kick = True
+        STATE.lock.notify_all()
+
+
+def udp_listen(sock, key):
+    while True:
+        try:
+            data, addr = sock.recvfrom(2048)
+        except OSError:
+            continue
+        udp_hello(data, addr, key)
+
+
+def _udp_next(last):
+    """Wait for something to send: a hello, or a frame newer than `last`. Caller holds the lock."""
+    while True:
+        fresh = STATE.udp_addr and time.time() - STATE.udp_seen < HELLO_TTL
+        if fresh and (STATE.udp_kick or (STATE.frame and STATE.frame_seq != last)):
+            STATE.udp_kick = False
+            return STATE.udp_addr, STATE.udp_boot, STATE.frame, STATE.frame_seq, STATE.seq
+        STATE.lock.wait(1.0)
+
+
+def udp_send(sock, key):
+    # Always the newest frame: frames posted while strips go out are skipped,
+    # so a slow link loses frames instead of queueing them.
+    last = 0
+    counted = None
+    while True:
+        with STATE.lock:
+            addr, boot, frame, seq, now = _udp_next(last)
+        try:
+            if not frame:
+                # Nothing to draw yet, but the panel learns its UDP path works.
+                d = b"PXTA" + now.to_bytes(4, "big")
+                sock.sendto(d + mac(key, d), addr)
+                continue
+            for d in strips(frame, seq, key):
+                sock.sendto(d, addr)
+                time.sleep(STRIP_GAP)
+        except OSError:
+            continue
+        last = seq
+        with STATE.lock:
+            dev = STATE.device
+            if (boot, seq) != counted and dev.get("path") == "udp" and dev.get("boot") == boot:
+                dev["_sent"] += 1
+                counted = (boot, seq)
+
+
+def start_udp(bind, port, key):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((bind, port))
+    for target in (udp_listen, udp_send):
+        threading.Thread(target=target, args=(sock, key.encode()), daemon=True).start()
+
+
 def main():
     global FW_PATH
     ap = argparse.ArgumentParser()
@@ -371,6 +508,7 @@ def main():
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--key-file", default=os.path.expanduser("~/.pxt_relay_key"))
     ap.add_argument("--firmware", default=FW_PATH, help="image served at /fw")
+    ap.add_argument("--udp-port", type=int, default=UDP_PORT, help="UDP frame channel; 0 turns it off")
     args = ap.parse_args()
     FW_PATH = os.path.expanduser(args.firmware)
 
@@ -383,6 +521,8 @@ def main():
     if len(Handler.key) < 16:
         raise SystemExit(f"key in {args.key_file} is shorter than 16 characters")
 
+    if args.udp_port:
+        start_udp(args.bind, args.udp_port, Handler.key)
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     print(f"{VERSION} on {args.bind}:{args.port}", flush=True)
     srv.serve_forever()

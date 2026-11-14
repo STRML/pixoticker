@@ -102,7 +102,7 @@ def run(scenario, port):
             f.write(KEY)
         env = dict(os.environ, HOME=t, FAKE_HOME=t)
         relay = subprocess.Popen([sys.executable, f"{ROOT}/server/pxtrelay.py", "--port", str(port),
-                                  "--key-file", f"{t}/relay.key"], env=env,
+                                  "--key-file", f"{t}/relay.key", "--udp-port", "0"], env=env,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.8)
         req = urllib.request.Request(f"http://127.0.0.1:{port}/frame", data=bytes(16384),
