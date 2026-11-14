@@ -408,9 +408,16 @@ def mac(key, data):
     return hmac.new(key, data, hashlib.sha256).digest()[:MAC_BYTES]
 
 
-def strips(frame, seq, key):
-    """One frame as self-contained datagrams: PXTS, seq u32, index, count,
-    first row, rows, enc (0 raw, 1 runs), pixels, mac."""
+def session(seq, boot, echo):
+    """Every datagram to the panel names its boot and echoes its last hello's
+    clock, so a captured datagram replayed to a rebooted panel, or replayed to
+    fake a live link, is dropped."""
+    return struct.pack(">III", seq, boot, echo)
+
+
+def strips(frame, seq, key, boot, echo):
+    """One frame as self-contained datagrams: PXTS, seq, boot, echo (u32 each),
+    index, count, first row, rows, enc (0 raw, 1 runs), pixels, mac."""
     count = 64 // STRIP_ROWS
     span = STRIP_ROWS * ROW_BYTES
     out = []
@@ -418,18 +425,19 @@ def strips(frame, seq, key):
         raw = frame[i * span:(i + 1) * span]
         runs = rle565(raw)
         enc, body = (1, runs) if len(runs) < len(raw) else (0, raw)
-        d = b"PXTS" + seq.to_bytes(4, "big") + bytes((i, count, i * STRIP_ROWS, STRIP_ROWS, enc)) + body
+        d = b"PXTS" + session(seq, boot, echo) + bytes((i, count, i * STRIP_ROWS, STRIP_ROWS, enc)) + body
         out.append(d + mac(key, d))
     return out
 
 
 def udp_hello(data, addr, key):
-    """PXTH, panel clock u32, boot nonce u32, newest seq the panel has shown u32, mac."""
-    if len(data) != 16 + MAC_BYTES or data[:4] != b"PXTH":
+    """PXTH, then u32 each: panel clock, boot nonce, newest seq shown, whole
+    frames shown since boot. Then the mac."""
+    if len(data) != 20 + MAC_BYTES or data[:4] != b"PXTH":
         return
-    if not hmac.compare_digest(mac(key, data[:16]), data[16:]):
+    if not hmac.compare_digest(mac(key, data[:20]), data[20:]):
         return
-    ts, boot, newest = struct.unpack(">III", data[4:16])
+    ts, boot, newest, whole = struct.unpack(">IIII", data[4:20])
     with STATE.lock:
         # A hello must be fresh and newer than the last one, so a captured
         # hello replayed from another address cannot steal the frames.
@@ -444,6 +452,11 @@ def udp_hello(data, addr, key):
             STATE.seq = newest + 1
             if STATE.frame:
                 STATE.frame_seq = STATE.seq
+        # _sent is what the panel says it showed whole: a datagram the link
+        # dropped never counts toward proving a new build draws.
+        dev = STATE.device
+        if dev.get("path") == "udp" and dev.get("boot") == boot:
+            dev["_sent"] = max(dev.get("_sent", 0), whole)
         STATE.udp_kick = True
         STATE.lock.notify_all()
 
@@ -463,7 +476,8 @@ def _udp_next(last):
         fresh = STATE.udp_addr and time.time() - STATE.udp_seen < HELLO_TTL
         if fresh and (STATE.udp_kick or (STATE.frame and STATE.frame_seq != last)):
             STATE.udp_kick = False
-            return STATE.udp_addr, STATE.udp_boot, STATE.frame, STATE.frame_seq, STATE.seq
+            return (STATE.udp_addr, STATE.udp_boot, STATE.udp_hello_ts,
+                    STATE.frame, STATE.frame_seq, STATE.seq)
         STATE.lock.wait(1.0)
 
 
@@ -471,27 +485,22 @@ def udp_send(sock, key):
     # Always the newest frame: frames posted while strips go out are skipped,
     # so a slow link loses frames instead of queueing them.
     last = 0
-    counted = None
     while True:
         with STATE.lock:
-            addr, boot, frame, seq, now = _udp_next(last)
+            addr, boot, echo, frame, seq, now = _udp_next(last)
         try:
             if not frame:
                 # Nothing to draw yet, but the panel learns its UDP path works.
-                d = b"PXTA" + now.to_bytes(4, "big")
+                d = b"PXTA" + session(now, boot, echo)
                 sock.sendto(d + mac(key, d), addr)
                 continue
-            for d in strips(frame, seq, key):
+            for d in strips(frame, seq, key, boot, echo):
                 sock.sendto(d, addr)
                 time.sleep(STRIP_GAP)
         except OSError:
+            time.sleep(0.5)  # an unreachable address must not spin this loop
             continue
         last = seq
-        with STATE.lock:
-            dev = STATE.device
-            if (boot, seq) != counted and dev.get("path") == "udp" and dev.get("boot") == boot:
-                dev["_sent"] += 1
-                counted = (boot, seq)
 
 
 def start_udp(bind, port, key):

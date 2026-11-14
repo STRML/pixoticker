@@ -250,8 +250,9 @@ The script:
    from `/fw`.
 3. Queues `{"type":"ota","path":"/pxt/fw","size":N,"sha256":"..."}`.
 4. Re-queues the op every 10 s for up to three minutes, until the panel
-   reports a restart (a new build, or uptime going backwards) and the relay has
-   streamed the restarted panel a frame.
+   reports a restart (a new build, or uptime going backwards) and the restarted
+   panel has a frame: one the relay streamed to it, or, on UDP, one the panel
+   reports it showed whole.
 5. Watches the new build for 60 s (`PXT_SETTLE`). A build that crashes drawing
    its first frames is rolled back by the bootloader, so the script exits 0
    only if the same build is still up and has not restarted. A rollback or a
@@ -339,22 +340,26 @@ panel ◀──PXTA ack────────────── relay      a h
 
 | Datagram | Bytes |
 |---|---|
-| `PXTH` hello | magic, panel clock (u32), boot nonce (u32), newest seq shown (u32), MAC |
-| `PXTS` strip | magic, seq (u32), index, count, first row, rows, enc (0 raw, 1 runs), pixels, MAC |
-| `PXTA` ack | magic, relay seq (u32), MAC |
+| `PXTH` hello | magic, panel clock, boot nonce, newest seq shown, whole frames shown (u32 each), MAC |
+| `PXTS` strip | magic, seq, boot nonce, hello echo (u32 each), index, count, first row, rows, enc (0 raw, 1 runs), pixels, MAC |
+| `PXTA` ack | magic, relay seq, boot nonce, hello echo (u32 each), MAC |
 
 The MAC is the first 16 bytes of HMAC-SHA256 under the relay key, over the
 rest of the datagram. Integers are big-endian.
 
 - A frame is 16 strips of 4 rows. Each strip decodes on its own, so a lost
-  datagram costs 4 rows of one frame. A strip is at most 1053 bytes.
+  datagram costs 4 rows of one frame. A strip is at most 1061 bytes.
 - Each strip is run encoded (hi, lo, count) when that is smaller. A typical
   board frame is 5.6 KB run encoded against 16 KB raw.
 - The relay always sends its newest frame. Frames posted while it sends are
   skipped, never queued.
 - The panel drops a strip with a bad MAC, and a strip older than the newest
-  seq it holds. It shows a frame once all its strips arrive, or after 250 ms
-  with what it has, so a lost strip never freezes the panel.
+  seq it holds. It shows a frame once all its strips arrive, or 250 ms after
+  the first strip of a frame it has not shown, so lost strips never freeze it.
+- Each datagram to the panel names its boot nonce and echoes the clock of a
+  hello from the last 10 s. The panel drops any other. A captured datagram
+  replayed after a reboot does not draw, and replays cannot keep a dead link
+  looking alive.
 - A hello must carry a fresh clock that is newer than the last hello. A
   captured hello replayed from another address gets nothing.
 - The relay forgets the panel's address after 20 s without a hello.
@@ -432,9 +437,9 @@ assume physical access. All three tools take `--port`.
 - The panel reports its state in an `X-Pxt-State` header on the stream request,
   so telemetry costs no second TLS session. A relay that never sees the panel
   reconnect will show a stale `device_age`. The `_sent` field in `/device` does
-  stay current: it counts frames sent to the panel since that connect, by UDP
-  to the same boot (`path: udp`) or on the stream (`path: tcp`). The header's
-  `boot` nonce ties the two channels together.
+  stay current. On UDP (`path: udp`) it is the number of whole frames the
+  panel reports in its hello, for the boot named in the header. On the stream
+  (`path: tcp`) it counts frames written to the panel since that connect.
 - The relay keeps no history: a client that reconnects gets the newest frame.
 - Posting frames straight to the panel's HTTP API at 15 a second wedged its web
   server: it still answered ping, HTTP stopped, and only a power cycle brought

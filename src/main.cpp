@@ -79,6 +79,7 @@ static char s_pull_dns[24] = "?";
 static char s_pull_phase[24] = "idle";
 static uint32_t s_boot_id = 0;  // random per boot: ties the UDP hello to the stream's X-Pxt-State
 static volatile uint32_t s_udp_good = 0, s_udp_bad = 0;
+static volatile uint32_t s_whole = 0;  // complete frames shown since boot; the hello reports it
 static TaskHandle_t s_udp_task = nullptr;
 static void set_phase(const char *p) { snprintf(s_pull_phase, sizeof(s_pull_phase), "%s", p); }
 
@@ -1005,6 +1006,7 @@ static void frameShown(uint32_t seq, bool complete) {
   panel_show(s_fb);
   s_pull_frames = s_pull_frames + 1;
   s_pull_seq = seq;
+  if (complete) s_whole = s_whole + 1;
   if (complete && !s_healthy) {
     s_healthy = true;
     esp_ota_mark_app_valid_cancel_rollback();
@@ -1147,7 +1149,9 @@ static const uint32_t UDP_SILENT_MS = 10000;   // no valid datagram this long: t
 static const uint32_t UDP_RETURN_MS = 30000;   // valid datagrams this long: frames move back to UDP
 static const uint32_t UDP_PARTIAL_MS = 250;    // a frame missing strips shows after this
 static const size_t UDP_MAC = 16;
-static const size_t STRIP_HEAD = 13;           // PXTS, seq, index, count, first row, rows, enc
+static const size_t SESSION_HEAD = 16;         // magic, seq, boot, hello echo
+static const size_t STRIP_HEAD = 21;           // then index, count, first row, rows, enc
+static const uint32_t UDP_ECHO_S = 10;         // a datagram must echo a hello this recent
 static const int WIRE_W = 128, WIRE_H = 64;
 
 static uint8_t s_dgram[1472];
@@ -1156,6 +1160,7 @@ static volatile uint32_t s_udp_last = 0;       // millis of the last valid datag
 static volatile uint32_t s_udp_since = 0;      // start of the current run of valid datagrams
 static volatile bool s_udp_draws = true;       // false while the stream carries frames
 static volatile bool s_udp_pause = false;      // a firmware download owns the link
+static uint32_t s_hello_ts = 0;                // clock in the last hello sent
 
 static bool udpAlive() {
   uint32_t t = s_udp_last;
@@ -1220,26 +1225,37 @@ static void stripWrite(uint8_t enc, const uint8_t *px, size_t len, uint8_t row0,
   }
 }
 
+// Every datagram names this boot and echoes a recent hello, so a captured one
+// replayed after a reboot, or to fake a live link, is dropped.
+static bool udpSession(const uint8_t *d) {
+  uint32_t echo = be32(d + 12);
+  return be32(d + 8) == s_boot_id && echo <= s_hello_ts && echo + UDP_ECHO_S >= s_hello_ts;
+}
+
 static void udpFeed(const uint8_t *d, size_t n) {
-  if (n < 8 + UDP_MAC || !macOk(d, n)) {
+  if (n < SESSION_HEAD + UDP_MAC || !macOk(d, n)) {
     s_udp_bad = s_udp_bad + 1;
     return;
   }
+  if (!udpSession(d)) return;
   uint32_t now = millis();
   if (!udpAlive()) s_udp_since = now;
   s_udp_last = now;
   s_udp_good = s_udp_good + 1;
   if (!s_udp_draws || n < STRIP_HEAD + UDP_MAC || memcmp(d, "PXTS", 4) != 0) return;
   uint32_t seq = be32(d + 4);
-  uint8_t idx = d[8], count = d[9], row0 = d[10], nrows = d[11], enc = d[12];
+  uint8_t idx = d[16], count = d[17], row0 = d[18], nrows = d[19], enc = d[20];
   const uint8_t *px = d + STRIP_HEAD;
   size_t len = n - STRIP_HEAD - UDP_MAC;
   if (!count || count > 16 || idx >= count || row0 + nrows > WIRE_H) return;
   if (!stripFits(enc, px, len, nrows) || seq < s_uf.seq) return;
   if (seq > s_uf.seq) {
+    // An unshown frame's deadline carries over, so a run of frames that each
+    // lose a strip still shows instead of resetting the clock forever.
+    uint32_t first = (s_uf.mask && !s_uf.shown) ? s_uf.first : now;
     s_uf = UdpFrame();
     s_uf.seq = seq;
-    s_uf.first = now;
+    s_uf.first = first;
     s_uf.full = (uint16_t)((1u << count) - 1);
   }
   uint16_t bit = 1u << idx;
@@ -1267,19 +1283,24 @@ static void udpSettle() {
   panel_unlock();
 }
 
-// PXTH, clock, boot nonce, newest seq shown, mac. The relay checks the clock
-// so a captured hello cannot be replayed, and moves its counter past the
-// newest seq after a restart.
+// PXTH, clock, boot nonce, newest seq shown, whole frames shown, mac. The
+// relay checks the clock so a captured hello cannot be replayed, moves its
+// counter past the newest seq after a restart, and reports the whole-frame
+// count as _sent.
 static void udpHello(int sock, const sockaddr_in &to) {
-  uint8_t d[16 + UDP_MAC];
+  uint8_t d[20 + UDP_MAC];
   uint32_t newest = s_pull_seq > s_uf.seq ? (uint32_t)s_pull_seq : s_uf.seq;
+  uint32_t ts = (uint32_t)time(nullptr);
+  if (ts <= s_hello_ts) ts = s_hello_ts + 1;  // the relay wants each hello newer than the last
+  s_hello_ts = ts;
   memcpy(d, "PXTH", 4);
-  put32(d + 4, (uint32_t)time(nullptr));
+  put32(d + 4, ts);
   put32(d + 8, s_boot_id);
   put32(d + 12, newest);
+  put32(d + 16, s_whole);
   uint8_t m[32];
-  macOf(d, 16, m);
-  memcpy(d + 16, m, UDP_MAC);
+  macOf(d, 20, m);
+  memcpy(d + 20, m, UDP_MAC);
   sendto(sock, d, sizeof(d), 0, (const sockaddr *)&to, sizeof(to));
 }
 

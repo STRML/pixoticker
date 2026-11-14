@@ -188,6 +188,8 @@ def ota_state():
 # (udpFeed and udpSettle) one for one, so these checks cover both ends.
 
 MAC = 16
+HEAD = 21          # PXTS, seq, boot, hello echo, index, count, first row, rows, enc
+LIVE_S = 10        # an echo older than this many seconds of hellos is not live
 ROWS = 64
 ROW_BYTES = 256
 PARTIAL_S = 0.25
@@ -198,11 +200,11 @@ def sign(data):
     return hmac.new(KEY.encode(), data, hashlib.sha256).digest()[:MAC]
 
 
-def hello_bytes(boot, newest=0, ts=None):
+def hello_bytes(boot, newest=0, whole=0, ts=None):
     if ts is None:
         _hello_ts[0] = max(_hello_ts[0] + 1, int(time.time()))
         ts = _hello_ts[0]
-    d = b"PXTH" + struct.pack(">III", ts, boot, newest)
+    d = b"PXTH" + struct.pack(">IIII", ts, boot, newest, whole)
     return d + sign(d)
 
 
@@ -214,8 +216,8 @@ def udp_sock(rcvbuf=None):
     return s
 
 
-def say_hello(s, boot, newest=0, ts=None):
-    d = hello_bytes(boot, newest, ts)
+def say_hello(s, boot, newest=0, whole=0, ts=None):
+    d = hello_bytes(boot, newest, whole, ts)
     s.sendto(d, ("127.0.0.1", UDP_PORT))
     return d
 
@@ -243,7 +245,10 @@ def unrle(body, npx):
 
 
 class Panel:
-    def __init__(self):
+    def __init__(self, boot, hello_ts=None):
+        self.boot = boot
+        self.hello_ts = hello_ts  # the panel's last hello clock; default: the last one sent
+        self.live = 0
         self.fb = bytearray(FRAME)
         self.cur = 0
         self.mask = 0
@@ -254,15 +259,20 @@ class Panel:
         self.shows = []   # (seq, complete, fb copy)
         self.bad = 0
 
-    def feed(self, d):
-        if len(d) < 8 + MAC or not hmac.compare_digest(sign(d[:-MAC]), d[-MAC:]):
+    def feed(self, d, now=None):
+        now = time.time() if now is None else now
+        if len(d) < 16 + MAC or not hmac.compare_digest(sign(d[:-MAC]), d[-MAC:]):
             self.bad += 1
             return
-        if d[:4] != b"PXTS" or len(d) < 13 + MAC:
+        seq, boot, echo = struct.unpack(">III", d[4:16])
+        sent = _hello_ts[0] if self.hello_ts is None else self.hello_ts
+        if boot != self.boot or not sent - LIVE_S <= echo <= sent:
             return
-        seq = int.from_bytes(d[4:8], "big")
-        idx, count, row0, nrows, enc = d[8:13]
-        body = d[13:-MAC]
+        self.live += 1
+        if d[:4] != b"PXTS" or len(d) < HEAD + MAC:
+            return
+        idx, count, row0, nrows, enc = d[16:HEAD]
+        body = d[HEAD:-MAC]
         if not 0 < count <= 16 or idx >= count or row0 + nrows > ROWS:
             return
         if enc == 0:
@@ -272,8 +282,12 @@ class Panel:
         if px is None or seq < self.cur:
             return
         if seq > self.cur:
+            # An unshown frame's deadline carries over, so frames that each
+            # lose a strip still show.
+            if not self.mask or self.shown:
+                self.first = now
             self.cur, self.mask, self.full = seq, 0, (1 << count) - 1
-            self.first, self.shown, self.complete = time.time(), False, False
+            self.shown, self.complete = False, False
         if self.mask & (1 << idx):
             return
         self.fb[row0 * ROW_BYTES:(row0 + nrows) * ROW_BYTES] = px
@@ -330,13 +344,14 @@ def udp_hello_auth():
 
 
 def udp_strips():
+    BOOT = 3
     s = udp_sock()
-    say_hello(s, 3)
+    say_hello(s, BOOT)
     collect(s)
     for name, frame in (("noise", noise()), ("flat", bytes(FRAME))):
         seq = post_frame(frame)
         got = collect(s)
-        p = Panel()
+        p = Panel(BOOT)
         p.take(got)
         biggest = max((len(g) for g in got), default=0)
         check(f"a posted {name} frame arrives as signed strips of 1400 bytes or less that rebuild it",
@@ -346,44 +361,45 @@ def udp_strips():
 
 
 def udp_loss_order_tamper():
+    BOOT = 4
     s = udp_sock()
-    say_hello(s, 4)
+    say_hello(s, BOOT)
     collect(s)
     frame = noise()
     seq = post_frame(frame)
     got = [g for g in collect(s) if g[:4] == b"PXTS"]
 
-    p = Panel()
+    p = Panel(BOOT)
     p.take(got[:5] + got[6:])
     time.sleep(PARTIAL_S + 0.05)
     p.settle()
-    lost = got[5] if len(got) > 5 else bytes(16)
-    row0, nrows = lost[10], lost[11]
+    lost = got[5] if len(got) > 5 else bytes(32)
+    row0, nrows = lost[18], lost[19]
     keep = bytes(p.fb[:row0 * ROW_BYTES]) + bytes(p.fb[(row0 + nrows) * ROW_BYTES:])
     want = frame[:row0 * ROW_BYTES] + frame[(row0 + nrows) * ROW_BYTES:]
     check("a lost strip costs only its rows: the rest shows after the partial timeout",
           bool(p.shows) and p.shows[-1][:2] == (seq, False) and keep == want)
-    say_hello(s, 4, newest=p.cur)
+    say_hello(s, BOOT, newest=p.cur)
     p.take(collect(s))
     check("the next hello resends the frame and fills the lost strip",
           bool(p.shows) and p.shows[-1][:2] == (seq, True) and bytes(p.fb) == frame)
 
-    p = Panel()
+    p = Panel(BOOT)
     shuffled = list(got)
     random.shuffle(shuffled)
     p.take(shuffled)
     check("strips in any order rebuild the frame", bool(p.shows) and p.shows[-1][1] and bytes(p.fb) == frame)
 
-    p = Panel()
+    p = Panel(BOOT)
     bad = bytearray(got[0] if got else bytes(64))
-    bad[20] ^= 0xFF
+    bad[30] ^= 0xFF
     p.take([bytes(bad)])
     check("a strip with a bad HMAC is dropped", p.bad == 1 and p.mask == 0 and bytes(p.fb) == bytes(FRAME))
 
     newer = noise()
     seq2 = post_frame(newer)
     got2 = [g for g in collect(s) if g[:4] == b"PXTS"]
-    p = Panel()
+    p = Panel(BOOT)
     p.take(got2)
     p.take(got)
     check("strips of an older frame replayed after a newer one are dropped",
@@ -394,8 +410,9 @@ def udp_loss_order_tamper():
 def udp_slow_panel():
     # A panel that falls behind must come back to the newest frame, never play
     # out a backlog. The relay sends only the newest frame it holds.
+    BOOT = 5
     s = udp_sock(rcvbuf=1 << 20)
-    say_hello(s, 5)
+    say_hello(s, BOOT)
     collect(s)
     frames = [noise() for _ in range(30)]
     seqs = [post_frame(f) for f in frames]
@@ -405,9 +422,9 @@ def udp_slow_panel():
     check("the relay never sends an older frame after a newer one and skips superseded frames",
           bool(order) and order == sorted(order) and order[-1] == seqs[-1] and len(set(order)) < len(seqs),
           f"posted={len(seqs)} sent={len(set(order))}")
-    p = Panel()
+    p = Panel(BOOT)
     p.take(backlog)
-    say_hello(s, 5, newest=p.cur)
+    say_hello(s, BOOT, newest=p.cur)
     p.take(collect(s))
     check("a slow panel shows the newest frame after it drains, not a backlog",
           bool(p.shows) and p.shows[-1][0] == seqs[-1] and bytes(p.fb) == frames[-1])
@@ -418,11 +435,12 @@ def udp_restart_seq():
     # The relay's counter restarts from the clock. A panel that saw a higher
     # seq would drop every new frame as old, so its hello names that seq and
     # the relay moves past it.
+    BOOT = 6
     s = udp_sock()
     seq = post_frame(noise())
     collect(s)
-    say_hello(s, 6, newest=seq + 100000)
-    p = Panel()
+    say_hello(s, BOOT, newest=seq + 100000)
+    p = Panel(BOOT)
     p.cur = seq + 100000
     p.take(collect(s))
     check("after a relay restart the panel's higher seq is passed, so the current frame shows",
@@ -432,23 +450,68 @@ def udp_restart_seq():
 
 
 def udp_sent_counter():
-    # _sent counts UDP frames only for the boot that holds the control stream.
+    # _sent is what the panel says it showed whole, and only for the boot that
+    # holds the control stream. A send the link dropped never counts.
     stream(json.dumps({"build": "udp", "uptime": 2, "boot": 777}), "&frames=0")
     time.sleep(0.4)
     s = udp_sock()
-    say_hello(s, 555)
+    say_hello(s, 555, whole=5)
     collect(s)
     post_frame(noise())
     collect(s)
     dev = req("/device")
-    check("UDP frames sent to another boot's address do not count toward _sent",
+    check("frames sent by UDP do not count toward _sent until the panel reports them",
           dev.get("boot") == 777 and dev.get("_sent") == 0 and dev.get("path") == "udp", json.dumps(dev))
-    say_hello(s, 777)
-    collect(s)
-    post_frame(noise())
+    say_hello(s, 777, whole=2)
     collect(s)
     sent = req("/device").get("_sent")
-    check("UDP frames sent to the current boot count once each", sent == 2, f"_sent={sent}")
+    check("_sent takes the whole frames the current boot reports in its hello", sent == 2, f"_sent={sent}")
+    say_hello(s, 777, whole=1)
+    collect(s)
+    sent = req("/device").get("_sent")
+    check("_sent never goes down", sent == 2, f"_sent={sent}")
+    s.close()
+
+
+def udp_session():
+    # A datagram names the boot it was sent to and echoes that panel's hello
+    # clock. A replay to a rebooted panel, or a replay used to fake liveness
+    # after the relay went quiet, is dropped.
+    s = udp_sock()
+    say_hello(s, 8)
+    collect(s)
+    frame = noise()
+    post_frame(frame)
+    got = collect(s)
+    other = Panel(9)
+    other.take(got)
+    check("a datagram for another boot is dropped", other.live == 0 and not other.shows)
+    later = Panel(8, hello_ts=_hello_ts[0] + LIVE_S + 1)
+    later.take(got)
+    check("a datagram that echoes an old hello is dropped and is not live", later.live == 0 and not later.shows)
+    mine = Panel(8)
+    mine.take(got)
+    check("a datagram for this boot and a recent hello shows", mine.live > 0 and bytes(mine.fb) == frame)
+    s.close()
+
+
+def udp_partial_deadline():
+    # Frames closer than the partial timeout that each lose a strip must still
+    # show: the oldest unshown frame's deadline carries over.
+    BOOT = 10
+    s = udp_sock()
+    say_hello(s, BOOT)
+    collect(s)
+    p = Panel(BOOT)
+    for _ in range(12):
+        post_frame(noise())
+        for d in collect(s, quiet=0.08):
+            if d[:4] == b"PXTS" and d[16] == 3:
+                continue
+            p.feed(d)
+        p.settle()
+    check("frames that each lose a strip still show within the partial timeout",
+          len(p.shows) >= 2, f"shows={len(p.shows)}")
     s.close()
 
 
@@ -533,6 +596,8 @@ def main():
             udp_slow_panel()
             udp_restart_seq()
             udp_sent_counter()
+            udp_session()
+            udp_partial_deadline()
             control_stream()
             old_stream()
             op_too_big()
