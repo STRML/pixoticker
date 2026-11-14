@@ -151,7 +151,7 @@ follows a worker, and one whose leader has gone stale shows its own numbers.
 python3 board/preview.py --out sheet.png                       # every layout x busy, prefill, degraded
 python3 board/board.py --port 18101 --ingest-key-file ~/.pxt_ingest_key   # gallery on :18101
 python3 board/agent.py --name studio1 --board http://board-host:18101      # on each Mac
-curl -H "X-Api-Key: $KEY" -d '{"layout":"rows"}' http://board-host:18101/layout   # or "auto"
+curl -H "X-Api-Key: $(cat ~/.pxt_ingest_key)" -d '{"layout":"rows"}' http://board-host:18101/layout   # or "auto"
 ```
 
 `BOARD_NODES` names the slots (default `studio1,studio2,studio3,studio4`), `BOARD_RELAY_URL` and
@@ -204,7 +204,7 @@ curl -H "X-Api-Key: $KEY" -d '{"layout":"rows"}' http://board-host:18101/layout 
    Through the relay, from anywhere (a 128x64 RGB565 file is 16384 bytes):
 
    ```sh
-   curl -H "X-Api-Key: $KEY" --data-binary @frame.565 https://relay.example.com/pxt/frame
+   curl -H "X-Api-Key: $PXT_RELAY_KEY" --data-binary @frame.565 https://relay.example.com/pxt/frame
    ```
 
 ## Configuration
@@ -277,12 +277,12 @@ reaches its address. Darken the LEDs and stop the board first, so the panel is n
 receiver or decoding frames while the image arrives:
 
 ```sh
-curl -H "X-Api-Key: $KEY" -d level=0 http://PANEL/brightness
+curl -H "X-Api-Key: $PXT_RELAY_KEY" -d level=0 http://PANEL/brightness
 ssh nas 'sudo docker stop pxt-board'
-curl -H 'Expect:' -H "X-Api-Key: $KEY" \
+curl -H 'Expect:' -H "X-Api-Key: $PXT_RELAY_KEY" \
   -F 'update=@.pio/build/esp32dev/firmware.bin;type=application/octet-stream' http://PANEL/u
 ssh nas 'sudo docker start pxt-board'
-curl -H "X-Api-Key: $KEY" -d level=128 http://PANEL/brightness
+curl -H "X-Api-Key: $PXT_RELAY_KEY" -d level=128 http://PANEL/brightness
 ```
 
 Retry the upload until it answers `update ok, rebooting`; on 2026-11-14 one try in three got through.
