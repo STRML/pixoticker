@@ -1161,7 +1161,11 @@ static volatile uint32_t s_udp_last = 0;       // millis of the last valid datag
 static volatile uint32_t s_udp_since = 0;      // start of the current run of valid datagrams
 static volatile bool s_udp_draws = true;       // false while the stream carries frames
 static volatile bool s_udp_pause = false;      // a firmware download owns the link
-static uint32_t s_hello_ts = 0;                // clock in the last hello sent
+// The last hellos sent: their clock, which the relay echoes, and when they
+// went out by millis(), which no clock correction can move.
+static const int HELLO_RING = 3;
+static uint32_t s_hello_ts[HELLO_RING] = {}, s_hello_ms[HELLO_RING] = {};
+static int s_hello_at = 0;
 
 static bool udpAlive() {
   uint32_t t = s_udp_last;
@@ -1226,13 +1230,16 @@ static void stripWrite(uint8_t enc, const uint8_t *px, size_t len, uint8_t row0,
   }
 }
 
-// Every datagram names this boot and echoes a hello this panel sent in the
-// last UDP_ECHO_S seconds of wall time, so a captured one replayed after a
-// reboot, or to fake a live link, is dropped.
+// Every datagram names this boot and echoes one of this panel's hellos sent
+// in the last UDP_ECHO_S seconds, timed by millis(). A captured datagram
+// replayed after a reboot, or to fake a live link, is dropped.
 static bool udpSession(const uint8_t *d) {
+  if (be32(d + 8) != s_boot_id) return false;
   uint32_t echo = be32(d + 12);
-  return be32(d + 8) == s_boot_id && echo <= s_hello_ts &&
-         echo + UDP_ECHO_S >= (uint32_t)time(nullptr);
+  for (int i = 0; i < HELLO_RING; i++)
+    if (s_hello_ms[i] && s_hello_ts[i] == echo && millis() - s_hello_ms[i] <= UDP_ECHO_S * 1000)
+      return true;
+  return false;
 }
 
 static void udpFeed(const uint8_t *d, size_t n) {
@@ -1294,7 +1301,9 @@ static void udpHello(int sock, const sockaddr_in &to) {
   uint8_t d[20 + UDP_MAC];
   uint32_t newest = s_pull_seq > s_uf.seq ? (uint32_t)s_pull_seq : s_uf.seq;
   uint32_t ts = (uint32_t)time(nullptr);
-  if (ts > s_hello_ts) s_hello_ts = ts;
+  s_hello_ts[s_hello_at] = ts;
+  s_hello_ms[s_hello_at] = millis() | 1;
+  s_hello_at = (s_hello_at + 1) % HELLO_RING;
   memcpy(d, "PXTH", 4);
   put32(d + 4, ts);
   put32(d + 8, s_boot_id);

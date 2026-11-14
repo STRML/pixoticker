@@ -356,8 +356,9 @@ rest of the datagram. Integers are big-endian.
 - The panel drops a strip with a bad MAC, and a strip older than the newest
   seq it holds. It shows a frame once all its strips arrive, or 250 ms after
   the first strip of a frame it has not shown, so lost strips never freeze it.
-- Each datagram to the panel names its boot nonce and echoes the clock of a
-  hello from the last 10 s. The panel drops any other. A captured datagram
+- Each datagram to the panel names its boot nonce and echoes the clock of one
+  of the panel's last three hellos, sent in the last 10 s by its uptime timer.
+  The panel drops any other, so a clock correction cannot reopen the window. A captured datagram
   replayed after a reboot does not draw, and replays cannot keep a dead link
   looking alive.
 - A hello must carry a fresh clock that is newer than the last hello. A

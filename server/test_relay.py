@@ -194,6 +194,7 @@ ROWS = 64
 ROW_BYTES = 256
 PARTIAL_S = 0.25
 _hello_ts = [0]
+_hellos = {}       # hello clock -> monotonic time it was sent, as the panel keeps them
 
 
 def sign(data):
@@ -204,6 +205,7 @@ def hello_bytes(boot, newest=0, whole=0, ts=None):
     if ts is None:
         _hello_ts[0] = max(_hello_ts[0] + 1, int(time.time()))
         ts = _hello_ts[0]
+    _hellos[ts] = time.monotonic()
     d = b"PXTH" + struct.pack(">IIII", ts, boot, newest, whole)
     return d + sign(d)
 
@@ -247,7 +249,7 @@ def unrle(body, npx):
 class Panel:
     def __init__(self, boot, clock=None):
         self.boot = boot
-        self.clock = clock  # the panel's wall clock; default: now
+        self.clock = clock  # the panel's monotonic clock; default: now
         self.live = 0
         self.fb = bytearray(FRAME)
         self.cur = 0
@@ -265,8 +267,8 @@ class Panel:
             self.bad += 1
             return
         seq, boot, echo = struct.unpack(">III", d[4:16])
-        wall = time.time() if self.clock is None else self.clock
-        if boot != self.boot or echo > _hello_ts[0] or echo + LIVE_S < wall:
+        mono = time.monotonic() if self.clock is None else self.clock
+        if boot != self.boot or echo not in _hellos or mono - _hellos[echo] > LIVE_S:
             return
         self.live += 1
         if d[:4] != b"PXTS" or len(d) < HEAD + MAC:
@@ -486,7 +488,7 @@ def udp_session():
     other = Panel(9)
     other.take(got)
     check("a datagram for another boot is dropped", other.live == 0 and not other.shows)
-    later = Panel(8, clock=time.time() + LIVE_S + 2)
+    later = Panel(8, clock=time.monotonic() + LIVE_S + 2)
     later.take(got)
     check("a datagram that echoes an old hello is dropped and is not live", later.live == 0 and not later.shows)
     mine = Panel(8)
