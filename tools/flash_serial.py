@@ -4,7 +4,7 @@
   tools/flash_serial.py                # newest .pio/build/*/firmware.bin -> 0x10000
   tools/flash_serial.py --env safe     # pick a build env explicitly
   tools/flash_serial.py --dump out.bin # read the whole 4 MB flash
-  tools/flash_serial.py --port /dev/ttyUSB0
+  tools/flash_serial.py --port /dev/ttyUSB0   # default: the one /dev/cu.usbserial-*
 
 Run --dump once before the first write: it is the only way back to the stock
 firmware. The image path is resolved here so the command line carries no binary.
@@ -15,9 +15,10 @@ import os
 import subprocess
 import sys
 
+from serial_port import default_port, ensure_pyserial
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ESPTOOL = os.path.expanduser("~/.platformio/packages/tool-esptoolpy/esptool.py")
-PORT = "/dev/cu.usbserial-210"
 APP_OFFSET = "0x10000"
 OTADATA_OFFSET = "0xe000"
 OTADATA_SIZE = "0x2000"
@@ -37,19 +38,6 @@ def run(port, args):
     return subprocess.call(cmd)
 
 
-PENV_PYTHON = os.path.expanduser("~/.platformio/penv/bin/python")
-
-
-def ensure_pyserial():
-    # esptool needs pyserial, which PlatformIO's interpreter always carries.
-    try:
-        import serial  # noqa: F401
-    except ImportError:
-        if os.path.exists(PENV_PYTHON) and os.path.realpath(sys.executable) != os.path.realpath(PENV_PYTHON):
-            os.execv(PENV_PYTHON, [PENV_PYTHON] + sys.argv)
-        sys.exit("pyserial missing: run with ~/.platformio/penv/bin/python")
-
-
 def main():
     ensure_pyserial()
 
@@ -57,8 +45,9 @@ def main():
     ap.add_argument("--env")
     ap.add_argument("--dump")
     ap.add_argument("--offset", default=APP_OFFSET)
-    ap.add_argument("--port", default=PORT)
+    ap.add_argument("--port")
     args = ap.parse_args()
+    args.port = args.port or default_port()
 
     if args.dump:
         sys.exit(run(args.port, ["read_flash", "0", "0x400000", args.dump]))
