@@ -21,6 +21,7 @@
 #include <mbedtls/sha256.h>
 #include <mbedtls/md.h>
 #include <esp_timer.h>
+#include <esp_random.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 
@@ -1149,9 +1150,10 @@ static const uint32_t UDP_SILENT_MS = 10000;   // no valid datagram this long: t
 static const uint32_t UDP_RETURN_MS = 30000;   // valid datagrams this long: frames move back to UDP
 static const uint32_t UDP_PARTIAL_MS = 250;    // a frame missing strips shows after this
 static const size_t UDP_MAC = 16;
-static const size_t SESSION_HEAD = 16;         // magic, seq, boot, hello echo
-static const size_t STRIP_HEAD = 21;           // then index, count, first row, rows, enc
-static const uint32_t UDP_ECHO_S = 10;         // a datagram must echo a hello this recent
+static const size_t NONCE_BYTES = 8;
+static const size_t SESSION_HEAD = 20;         // magic, seq, boot, hello nonce
+static const size_t STRIP_HEAD = 25;           // then index, count, first row, rows, enc
+static const uint32_t UDP_ECHO_MS = 10000;     // a datagram must answer a hello sent this recently
 static const int UDP_DRAIN_MAX = 24;           // datagrams read per pass before drawing and saying hello
 static const int WIRE_W = 128, WIRE_H = 64;
 
@@ -1161,11 +1163,16 @@ static volatile uint32_t s_udp_last = 0;       // millis of the last valid datag
 static volatile uint32_t s_udp_since = 0;      // start of the current run of valid datagrams
 static volatile bool s_udp_draws = true;       // false while the stream carries frames
 static volatile bool s_udp_pause = false;      // a firmware download owns the link
-// The last hellos sent: their clock, which the relay echoes, and when they
-// went out by millis(), which no clock correction can move.
-static const int HELLO_RING = 3;
-static uint32_t s_hello_ts[HELLO_RING] = {}, s_hello_ms[HELLO_RING] = {};
+// The last hellos sent this boot: a random nonce the relay echoes, and when
+// each went out by millis(). No wall clock feeds any UDP check.
+struct Hello {
+  uint8_t nonce[NONCE_BYTES];
+  uint32_t ms;  // 0: never sent
+};
+static const int HELLO_RING = 4;
+static Hello s_hellos[HELLO_RING] = {};
 static int s_hello_at = 0;
+static uint32_t s_hello_n = 0;  // counts up per hello; the relay drops one that does not
 
 static bool udpAlive() {
   uint32_t t = s_udp_last;
@@ -1230,15 +1237,15 @@ static void stripWrite(uint8_t enc, const uint8_t *px, size_t len, uint8_t row0,
   }
 }
 
-// Every datagram names this boot and echoes one of this panel's hellos sent
-// in the last UDP_ECHO_S seconds, timed by millis(). A captured datagram
-// replayed after a reboot, or to fake a live link, is dropped.
+// Every datagram names this boot and echoes the nonce of one of this panel's
+// last hellos, sent within UDP_ECHO_MS. A captured datagram replayed after a
+// reboot or after later hellos, or to fake a live link, is dropped.
 static bool udpSession(const uint8_t *d) {
   if (be32(d + 8) != s_boot_id) return false;
-  uint32_t echo = be32(d + 12);
-  for (int i = 0; i < HELLO_RING; i++)
-    if (s_hello_ms[i] && s_hello_ts[i] == echo && millis() - s_hello_ms[i] <= UDP_ECHO_S * 1000)
-      return true;
+  for (int i = 0; i < HELLO_RING; i++) {
+    const Hello &h = s_hellos[i];
+    if (h.ms && millis() - h.ms <= UDP_ECHO_MS && memcmp(h.nonce, d + 12, NONCE_BYTES) == 0) return true;
+  }
   return false;
 }
 
@@ -1254,7 +1261,7 @@ static void udpFeed(const uint8_t *d, size_t n) {
   s_udp_good = s_udp_good + 1;
   if (!s_udp_draws || n < STRIP_HEAD + UDP_MAC || memcmp(d, "PXTS", 4) != 0) return;
   uint32_t seq = be32(d + 4);
-  uint8_t idx = d[16], count = d[17], row0 = d[18], nrows = d[19], enc = d[20];
+  uint8_t idx = d[20], count = d[21], row0 = d[22], nrows = d[23], enc = d[24];
   const uint8_t *px = d + STRIP_HEAD;
   size_t len = n - STRIP_HEAD - UDP_MAC;
   if (!count || count > 16 || idx >= count || row0 + nrows > WIRE_H) return;
@@ -1293,25 +1300,29 @@ static void udpSettle() {
   panel_unlock();
 }
 
-// PXTH, clock, boot nonce, newest seq shown, whole frames shown, mac. The
-// relay checks the clock so a captured hello cannot be replayed, moves its
-// counter past the newest seq after a restart, and reports the whole-frame
-// count as _sent.
+// PXTH, nonce, then u32 each: boot nonce, hello counter, newest seq shown,
+// whole frames shown. Then the mac. The relay takes a hello only from the boot
+// that holds the TLS stream, with a counter above the last, echoes the nonce
+// in everything it sends back, moves its seq past the newest after a restart,
+// and reports the whole-frame count as _sent.
 static void udpHello(int sock, const sockaddr_in &to) {
-  uint8_t d[20 + UDP_MAC];
+  uint8_t d[4 + NONCE_BYTES + 16 + UDP_MAC];
   uint32_t newest = s_pull_seq > s_uf.seq ? (uint32_t)s_pull_seq : s_uf.seq;
-  uint32_t ts = (uint32_t)time(nullptr);
-  s_hello_ts[s_hello_at] = ts;
-  s_hello_ms[s_hello_at] = millis() | 1;
+  Hello &h = s_hellos[s_hello_at];
+  esp_fill_random(h.nonce, NONCE_BYTES);
+  h.ms = millis() | 1;
   s_hello_at = (s_hello_at + 1) % HELLO_RING;
+  s_hello_n++;
   memcpy(d, "PXTH", 4);
-  put32(d + 4, ts);
-  put32(d + 8, s_boot_id);
-  put32(d + 12, newest);
-  put32(d + 16, s_whole);
+  memcpy(d + 4, h.nonce, NONCE_BYTES);
+  uint8_t *f = d + 4 + NONCE_BYTES;
+  put32(f, s_boot_id);
+  put32(f + 4, s_hello_n);
+  put32(f + 8, newest);
+  put32(f + 12, s_whole);
   uint8_t m[32];
-  macOf(d, 20, m);
-  memcpy(d + 20, m, UDP_MAC);
+  macOf(d, f + 16 - d, m);
+  memcpy(f + 16, m, UDP_MAC);
   sendto(sock, d, sizeof(d), 0, (const sockaddr *)&to, sizeof(to));
 }
 
@@ -1355,7 +1366,7 @@ static void udpTask(void *) {
   sockaddr_in relay = {};
   uint32_t resolved = 0, hello = 0;
   for (;;) {
-    if (WiFi.status() != WL_CONNECTED || !clockReady() || !s_fb || s_udp_pause) {
+    if (WiFi.status() != WL_CONNECTED || !s_fb || s_udp_pause) {
       delay(500);
       continue;
     }

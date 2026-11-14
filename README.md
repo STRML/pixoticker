@@ -340,15 +340,15 @@ panel ◀──PXTA ack────────────── relay      a h
 
 | Datagram | Bytes |
 |---|---|
-| `PXTH` hello | magic, panel clock, boot nonce, newest seq shown, whole frames shown (u32 each), MAC |
-| `PXTS` strip | magic, seq, boot nonce, hello echo (u32 each), index, count, first row, rows, enc (0 raw, 1 runs), pixels, MAC |
-| `PXTA` ack | magic, relay seq, boot nonce, hello echo (u32 each), MAC |
+| `PXTH` hello | magic, hello nonce (8 random bytes), then u32 each: boot nonce, hello counter, newest seq shown, whole frames shown. MAC |
+| `PXTS` strip | magic, seq, boot nonce (u32 each), hello nonce (8), index, count, first row, rows, enc (0 raw, 1 runs), pixels, MAC |
+| `PXTA` ack | magic, relay seq, boot nonce (u32 each), hello nonce (8), MAC |
 
 The MAC is the first 16 bytes of HMAC-SHA256 under the relay key, over the
 rest of the datagram. Integers are big-endian.
 
 - A frame is 16 strips of 4 rows. Each strip decodes on its own, so a lost
-  datagram costs 4 rows of one frame. A strip is at most 1061 bytes.
+  datagram costs 4 rows of one frame. A strip is at most 1065 bytes.
 - Each strip is run encoded (hi, lo, count) when that is smaller. A typical
   board frame is 5.6 KB run encoded against 16 KB raw.
 - The relay always sends its newest frame. Frames posted while it sends are
@@ -356,13 +356,18 @@ rest of the datagram. Integers are big-endian.
 - The panel drops a strip with a bad MAC, and a strip older than the newest
   seq it holds. It shows a frame once all its strips arrive, or 250 ms after
   the first strip of a frame it has not shown, so lost strips never freeze it.
-- Each datagram to the panel names its boot nonce and echoes the clock of one
-  of the panel's last three hellos, sent in the last 10 s by its uptime timer.
-  The panel drops any other, so a clock correction cannot reopen the window. A captured datagram
-  replayed after a reboot does not draw, and replays cannot keep a dead link
-  looking alive.
-- A hello must carry a fresh clock that is newer than the last hello. A
-  captured hello replayed from another address gets nothing.
+- Every hello carries a fresh random nonce. Every datagram the relay sends
+  back names the panel's boot and echoes the nonce of its latest hello.
+- The panel keeps the nonces of its last four hellos in RAM and drops any
+  datagram that does not echo one sent in the last 10 s, timed by its uptime
+  counter. A reply that arrives after the next hello still counts. A captured
+  datagram replayed later, or after a reboot, does not draw, and cannot keep a
+  dead link looking alive.
+- The relay takes a hello only from the boot that holds the TLS stream, and
+  only when its counter is above the last one. A captured hello, replayed from
+  any address, gets nothing.
+- No wall clock feeds any of these checks, so a clock step cannot reopen a
+  replay window.
 - The relay forgets the panel's address after 20 s without a hello.
 - The seq counter starts from the clock when the relay starts. A hello names
   the newest seq the panel has shown, and the relay moves its counter past it,

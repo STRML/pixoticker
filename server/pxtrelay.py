@@ -46,7 +46,7 @@ MAC_BYTES = 16
 STRIP_ROWS = 4
 ROW_BYTES = 128 * 2
 HELLO_TTL = 20      # forget the panel's address after this long without a hello
-HELLO_SKEW = 60     # a hello's clock may be this far from ours
+NONCE_BYTES = 8
 STRIP_GAP = 0.002   # spacing between strips, so the panel's small UDP queue keeps up
 
 
@@ -79,8 +79,9 @@ class State:
         self.device = {}
         self.udp_addr = None
         self.udp_boot = None
-        self.udp_seen = 0.0
-        self.udp_hello_ts = 0
+        self.udp_seen = 0.0           # time.monotonic() of the last hello
+        self.udp_nonce = b""          # the last hello's nonce, echoed in every reply
+        self.udp_hello_n = 0          # the last hello's counter, for that boot
         self.udp_kick = False
 
 
@@ -408,16 +409,17 @@ def mac(key, data):
     return hmac.new(key, data, hashlib.sha256).digest()[:MAC_BYTES]
 
 
-def session(seq, boot, echo):
-    """Every datagram to the panel names its boot and echoes its last hello's
-    clock, so a captured datagram replayed to a rebooted panel, or replayed to
-    fake a live link, is dropped."""
-    return struct.pack(">III", seq, boot, echo)
+def session(seq, boot, nonce):
+    """Every datagram to the panel names its boot and echoes the nonce of its
+    latest hello. The panel keeps its last few nonces and drops anything else,
+    so a captured datagram replayed later never draws or keeps a dead link
+    looking alive. No clock is involved."""
+    return struct.pack(">II", seq, boot) + nonce
 
 
-def strips(frame, seq, key, boot, echo):
-    """One frame as self-contained datagrams: PXTS, seq, boot, echo (u32 each),
-    index, count, first row, rows, enc (0 raw, 1 runs), pixels, mac."""
+def strips(frame, seq, key, boot, nonce):
+    """One frame as self-contained datagrams: PXTS, seq, boot (u32 each), nonce
+    (8 bytes), index, count, first row, rows, enc (0 raw, 1 runs), pixels, mac."""
     count = 64 // STRIP_ROWS
     span = STRIP_ROWS * ROW_BYTES
     out = []
@@ -425,26 +427,33 @@ def strips(frame, seq, key, boot, echo):
         raw = frame[i * span:(i + 1) * span]
         runs = rle565(raw)
         enc, body = (1, runs) if len(runs) < len(raw) else (0, raw)
-        d = b"PXTS" + session(seq, boot, echo) + bytes((i, count, i * STRIP_ROWS, STRIP_ROWS, enc)) + body
+        d = b"PXTS" + session(seq, boot, nonce) + bytes((i, count, i * STRIP_ROWS, STRIP_ROWS, enc)) + body
         out.append(d + mac(key, d))
     return out
 
 
+HELLO_BYTES = 4 + NONCE_BYTES + 16
+
+
 def udp_hello(data, addr, key):
-    """PXTH, then u32 each: panel clock, boot nonce, newest seq shown, whole
-    frames shown since boot. Then the mac."""
-    if len(data) != 20 + MAC_BYTES or data[:4] != b"PXTH":
+    """PXTH, nonce (8 bytes), then u32 each: boot nonce, hello counter, newest
+    seq shown, whole frames shown since boot. Then the mac."""
+    if len(data) != HELLO_BYTES + MAC_BYTES or data[:4] != b"PXTH":
         return
-    if not hmac.compare_digest(mac(key, data[:20]), data[20:]):
+    if not hmac.compare_digest(mac(key, data[:HELLO_BYTES]), data[HELLO_BYTES:]):
         return
-    ts, boot, newest, whole = struct.unpack(">IIII", data[4:20])
+    nonce = data[4:4 + NONCE_BYTES]
+    boot, n, newest, whole = struct.unpack(">IIII", data[4 + NONCE_BYTES:HELLO_BYTES])
     with STATE.lock:
-        # A hello must be fresh and newer than the last one, so a captured
-        # hello replayed from another address cannot steal the frames.
-        if abs(ts - time.time()) > HELLO_SKEW or ts <= STATE.udp_hello_ts:
+        dev = STATE.device
+        # Only the boot that holds the TLS control stream may say hello. TLS
+        # cannot be replayed, so a hello captured from an earlier boot is dead.
+        # Within the boot the counter must go up, so a replayed hello from
+        # another address cannot steal the frames.
+        if dev.get("boot") != boot or (STATE.udp_boot == boot and n <= STATE.udp_hello_n):
             return
-        STATE.udp_hello_ts = ts
-        STATE.udp_addr, STATE.udp_boot, STATE.udp_seen = addr, boot, time.time()
+        STATE.udp_addr, STATE.udp_boot, STATE.udp_seen = addr, boot, time.monotonic()
+        STATE.udp_nonce, STATE.udp_hello_n = nonce, n
         if newest > STATE.seq:
             # The counter restarted from the clock below what the panel has
             # shown, and the panel drops older seqs. Move past it, and restamp
@@ -454,8 +463,7 @@ def udp_hello(data, addr, key):
                 STATE.frame_seq = STATE.seq
         # _sent is what the panel says it showed whole: a datagram the link
         # dropped never counts toward proving a new build draws.
-        dev = STATE.device
-        if dev.get("path") == "udp" and dev.get("boot") == boot:
+        if dev.get("path") == "udp":
             dev["_sent"] = max(dev.get("_sent", 0), whole)
         STATE.udp_kick = True
         STATE.lock.notify_all()
@@ -473,10 +481,10 @@ def udp_listen(sock, key):
 def _udp_next(last):
     """Wait for something to send: a hello, or a frame newer than `last`. Caller holds the lock."""
     while True:
-        fresh = STATE.udp_addr and time.time() - STATE.udp_seen < HELLO_TTL
+        fresh = STATE.udp_addr and time.monotonic() - STATE.udp_seen < HELLO_TTL
         if fresh and (STATE.udp_kick or (STATE.frame and STATE.frame_seq != last)):
             STATE.udp_kick = False
-            return (STATE.udp_addr, STATE.udp_boot, STATE.udp_hello_ts,
+            return (STATE.udp_addr, STATE.udp_boot, STATE.udp_nonce,
                     STATE.frame, STATE.frame_seq, STATE.seq)
         STATE.lock.wait(1.0)
 
@@ -487,14 +495,14 @@ def udp_send(sock, key):
     last = 0
     while True:
         with STATE.lock:
-            addr, boot, echo, frame, seq, now = _udp_next(last)
+            addr, boot, nonce, frame, seq, now = _udp_next(last)
         try:
             if not frame:
                 # Nothing to draw yet, but the panel learns its UDP path works.
-                d = b"PXTA" + session(now, boot, echo)
+                d = b"PXTA" + session(now, boot, nonce)
                 sock.sendto(d + mac(key, d), addr)
                 continue
-            for d in strips(frame, seq, key, boot, echo):
+            for d in strips(frame, seq, key, boot, nonce):
                 sock.sendto(d, addr)
                 time.sleep(STRIP_GAP)
         except OSError:

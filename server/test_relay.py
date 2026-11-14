@@ -183,31 +183,50 @@ def ota_state():
 
 
 # ---------------------------------------------------------------- UDP frames
-# The panel says hello on UDP; the relay answers with the newest frame as
-# signed strips. Panel below mirrors the firmware's rules in src/main.cpp
-# (udpFeed and udpSettle) one for one, so these checks cover both ends.
+# The panel says hello on UDP with a fresh random nonce. The relay answers with
+# the newest frame as signed strips that echo the nonce. Panel below mirrors
+# the firmware's rules in src/main.cpp (udpSession, udpFeed, udpSettle) one
+# for one. No wall clock is an input on either side: replay checks use the
+# nonces, the hello counter and the boot that holds the TLS stream, and
+# liveness is timed by a monotonic clock.
 
 MAC = 16
-HEAD = 21          # PXTS, seq, boot, hello echo, index, count, first row, rows, enc
-LIVE_S = 10        # an echo of a hello older than this many seconds is not live
+SESSION = 20       # PXTS or PXTA, seq, boot, nonce (8)
+HEAD = 25          # then index, count, first row, rows, enc
+NONCES = 4         # outstanding hello nonces the panel keeps
+LIVE_S = 10        # a reply to a hello older than this is not live
 ROWS = 64
 ROW_BYTES = 256
 PARTIAL_S = 0.25
-_hello_ts = [0]
-_hellos = {}       # hello clock -> monotonic time it was sent, as the panel keeps them
 
 
 def sign(data):
     return hmac.new(KEY.encode(), data, hashlib.sha256).digest()[:MAC]
 
 
-def hello_bytes(boot, newest=0, whole=0, ts=None):
-    if ts is None:
-        _hello_ts[0] = max(_hello_ts[0] + 1, int(time.time()))
-        ts = _hello_ts[0]
-    _hellos[ts] = time.monotonic()
-    d = b"PXTH" + struct.pack(">IIII", ts, boot, newest, whole)
-    return d + sign(d)
+class Boot:
+    """One panel boot: its boot nonce, hello counter, and the hello nonces it
+    has sent with the monotonic time each went out."""
+
+    def __init__(self, boot):
+        self.boot = boot
+        self.n = 0
+        self.sent = []
+
+    def hello(self, s, newest=0, whole=0, n=None):
+        self.n += 1
+        nonce = os.urandom(8)
+        self.sent = (self.sent + [(nonce, time.monotonic())])[-NONCES:]
+        d = b"PXTH" + nonce + struct.pack(">IIII", self.boot, self.n if n is None else n, newest, whole)
+        d += sign(d)
+        s.sendto(d, ("127.0.0.1", UDP_PORT))
+        return d
+
+
+def register(boot):
+    """Open the panel's control stream, which names its boot to the relay."""
+    stream(json.dumps({"build": "udp", "uptime": 1, "boot": boot}), "&frames=0")
+    time.sleep(0.3)
 
 
 def udp_sock(rcvbuf=None):
@@ -216,12 +235,6 @@ def udp_sock(rcvbuf=None):
         s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
     s.bind(("127.0.0.1", 0))
     return s
-
-
-def say_hello(s, boot, newest=0, whole=0, ts=None):
-    d = hello_bytes(boot, newest, whole, ts)
-    s.sendto(d, ("127.0.0.1", UDP_PORT))
-    return d
 
 
 def collect(s, quiet=0.3, limit=5.0):
@@ -247,10 +260,11 @@ def unrle(body, npx):
 
 
 class Panel:
-    def __init__(self, boot, clock=None):
-        self.boot = boot
-        self.clock = clock  # the panel's monotonic clock; default: now
+    def __init__(self, me, clock=None):
+        self.me = me          # the Boot whose nonces this panel holds
+        self.clock = clock    # monotonic clock override; default: now
         self.live = 0
+        self.dropped = 0
         self.fb = bytearray(FRAME)
         self.cur = 0
         self.mask = 0
@@ -261,19 +275,25 @@ class Panel:
         self.shows = []   # (seq, complete, fb copy)
         self.bad = 0
 
+    def session(self, d):
+        seq, boot = struct.unpack(">II", d[4:12])
+        nonce = d[12:SESSION]
+        mono = time.monotonic() if self.clock is None else self.clock
+        return boot == self.me.boot and any(nonce == n and mono - t <= LIVE_S for n, t in self.me.sent)
+
     def feed(self, d, now=None):
         now = time.time() if now is None else now
-        if len(d) < 16 + MAC or not hmac.compare_digest(sign(d[:-MAC]), d[-MAC:]):
+        if len(d) < SESSION + MAC or not hmac.compare_digest(sign(d[:-MAC]), d[-MAC:]):
             self.bad += 1
             return
-        seq, boot, echo = struct.unpack(">III", d[4:16])
-        mono = time.monotonic() if self.clock is None else self.clock
-        if boot != self.boot or echo not in _hellos or mono - _hellos[echo] > LIVE_S:
+        if not self.session(d):
+            self.dropped += 1
             return
         self.live += 1
         if d[:4] != b"PXTS" or len(d) < HEAD + MAC:
             return
-        idx, count, row0, nrows, enc = d[16:HEAD]
+        seq = int.from_bytes(d[4:8], "big")
+        idx, count, row0, nrows, enc = d[SESSION:HEAD]
         body = d[HEAD:-MAC]
         if not 0 < count <= 16 or idx >= count or row0 + nrows > ROWS:
             return
@@ -318,25 +338,37 @@ def noise():
     return os.urandom(FRAME)
 
 
+def strips_of(got):
+    return [g for g in got if g[:4] == b"PXTS"]
+
+
 def udp_ack_without_frame():
+    b = Boot(1)
+    register(1)
     s = udp_sock()
-    say_hello(s, 1)
+    b.hello(s)
     got = collect(s)
-    check("a hello with no frame yet gets a signed ack",
-          len(got) == 1 and got[0][:4] == b"PXTA" and sign(got[0][:-MAC]) == got[0][-MAC:],
-          f"got={[g[:4] for g in got]}")
+    p = Panel(b)
+    p.take(got)
+    check("a hello with no frame yet gets a signed ack that echoes its nonce",
+          len(got) == 1 and got[0][:4] == b"PXTA" and p.live == 1, f"got={[g[:4] for g in got]}")
     s.close()
 
 
 def udp_hello_auth():
+    b = Boot(2)
+    register(2)
     s = udp_sock()
-    d = bytearray(hello_bytes(2))
+    d = bytearray(b.hello(s))
+    collect(s)
     d[6] ^= 1
     s.sendto(bytes(d), ("127.0.0.1", UDP_PORT))
     check("a hello with a bad HMAC gets no answer", collect(s) == [])
-    say_hello(s, 2, ts=int(time.time()) - 300)
-    check("a hello five minutes old gets no answer", collect(s) == [])
-    good = say_hello(s, 2)
+    Boot(3).hello(s)
+    check("a hello from a boot that does not hold the control stream gets no answer", collect(s) == [])
+    b.hello(s, n=1)
+    check("a hello whose counter does not go up gets no answer", collect(s) == [])
+    good = b.hello(s)
     collect(s)
     t = udp_sock()
     t.sendto(good, ("127.0.0.1", UDP_PORT))
@@ -346,14 +378,15 @@ def udp_hello_auth():
 
 
 def udp_strips():
-    BOOT = 3
+    b = Boot(3)
+    register(3)
     s = udp_sock()
-    say_hello(s, BOOT)
+    b.hello(s)
     collect(s)
     for name, frame in (("noise", noise()), ("flat", bytes(FRAME))):
         seq = post_frame(frame)
         got = collect(s)
-        p = Panel(BOOT)
+        p = Panel(b)
         p.take(got)
         biggest = max((len(g) for g in got), default=0)
         check(f"a posted {name} frame arrives as signed strips of 1400 bytes or less that rebuild it",
@@ -363,36 +396,37 @@ def udp_strips():
 
 
 def udp_loss_order_tamper():
-    BOOT = 4
+    b = Boot(4)
+    register(4)
     s = udp_sock()
-    say_hello(s, BOOT)
+    b.hello(s)
     collect(s)
     frame = noise()
     seq = post_frame(frame)
-    got = [g for g in collect(s) if g[:4] == b"PXTS"]
+    got = strips_of(collect(s))
 
-    p = Panel(BOOT)
+    p = Panel(b)
     p.take(got[:5] + got[6:])
     time.sleep(PARTIAL_S + 0.05)
     p.settle()
-    lost = got[5] if len(got) > 5 else bytes(32)
-    row0, nrows = lost[18], lost[19]
+    lost = got[5] if len(got) > 5 else bytes(HEAD)
+    row0, nrows = lost[22], lost[23]
     keep = bytes(p.fb[:row0 * ROW_BYTES]) + bytes(p.fb[(row0 + nrows) * ROW_BYTES:])
     want = frame[:row0 * ROW_BYTES] + frame[(row0 + nrows) * ROW_BYTES:]
     check("a lost strip costs only its rows: the rest shows after the partial timeout",
           bool(p.shows) and p.shows[-1][:2] == (seq, False) and keep == want)
-    say_hello(s, BOOT, newest=p.cur)
+    b.hello(s, newest=p.cur)
     p.take(collect(s))
     check("the next hello resends the frame and fills the lost strip",
           bool(p.shows) and p.shows[-1][:2] == (seq, True) and bytes(p.fb) == frame)
 
-    p = Panel(BOOT)
+    p = Panel(b)
     shuffled = list(got)
     random.shuffle(shuffled)
     p.take(shuffled)
     check("strips in any order rebuild the frame", bool(p.shows) and p.shows[-1][1] and bytes(p.fb) == frame)
 
-    p = Panel(BOOT)
+    p = Panel(b)
     bad = bytearray(got[0] if got else bytes(64))
     bad[30] ^= 0xFF
     p.take([bytes(bad)])
@@ -400,8 +434,8 @@ def udp_loss_order_tamper():
 
     newer = noise()
     seq2 = post_frame(newer)
-    got2 = [g for g in collect(s) if g[:4] == b"PXTS"]
-    p = Panel(BOOT)
+    got2 = strips_of(collect(s))
+    p = Panel(b)
     p.take(got2)
     p.take(got)
     check("strips of an older frame replayed after a newer one are dropped",
@@ -409,24 +443,85 @@ def udp_loss_order_tamper():
     s.close()
 
 
+def udp_replay():
+    # The replay class: a captured reply or strip must never draw or count as
+    # a live link once the panel has moved on, whatever its clocks say.
+    b = Boot(11)
+    register(11)
+    s = udp_sock()
+    post_frame(noise())
+    b.hello(s)
+    captured = collect(s)
+
+    p = Panel(b)
+    p.take(captured)
+    check("a reply to a hello still outstanding is live and draws", p.live > 0 and bool(p.shows))
+
+    b.hello(s)
+    collect(s)
+    p = Panel(b)
+    p.take(captured)
+    check("a reply that arrives after the next hello is still accepted", p.live > 0 and bool(p.shows))
+
+    for _ in range(NONCES):
+        b.hello(s)
+        collect(s)
+    p = Panel(b)
+    p.take(captured)
+    check("a captured reply replayed after later hellos is dropped and is not live",
+          p.live == 0 and not p.shows and p.dropped == len(captured))
+
+    b.hello(s)
+    mine = collect(s)
+    p = Panel(b, clock=time.monotonic() + LIVE_S + 1)
+    p.take(mine)
+    check("a reply to a hello sent more than 10 s ago (monotonic) is not live", p.live == 0)
+
+    after = Boot(12)
+    register(12)
+    after.hello(s)
+    collect(s)
+    p = Panel(after)
+    p.take(captured + mine)
+    check("a reply from before a reboot is dropped by the new boot", p.live == 0 and not p.shows)
+    s.close()
+
+
+def no_wall_clock():
+    # Clock steps, backward or forward, cannot reopen a replay window when no
+    # wall clock feeds the checks at all.
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(RELAY) as f:
+        relay = f.read()
+    with open(os.path.join(here, "..", "src", "main.cpp")) as f:
+        fw = f.read()
+    relay_udp = relay[relay.index("def session("):relay.index("def start_udp(")]
+    fw_udp = fw[fw.index("// ---------------------------------------------------------------- UDP frames"):
+                fw.index("static const uint32_t STREAM_IDLE_MS")]
+    check("the relay's UDP checks read no wall clock", "time.time(" not in relay_udp)
+    check("the panel's UDP checks read no wall clock",
+          "time(nullptr)" not in fw_udp and "clockReady" not in fw_udp)
+
+
 def udp_slow_panel():
     # A panel that falls behind must come back to the newest frame, never play
     # out a backlog. The relay sends only the newest frame it holds.
-    BOOT = 5
+    b = Boot(5)
+    register(5)
     s = udp_sock(rcvbuf=1 << 20)
-    say_hello(s, BOOT)
+    b.hello(s)
     collect(s)
     frames = [noise() for _ in range(30)]
     seqs = [post_frame(f) for f in frames]
     time.sleep(1.0)
     backlog = collect(s)
-    order = [int.from_bytes(g[4:8], "big") for g in backlog if g[:4] == b"PXTS"]
+    order = [int.from_bytes(g[4:8], "big") for g in strips_of(backlog)]
     check("the relay never sends an older frame after a newer one and skips superseded frames",
           bool(order) and order == sorted(order) and order[-1] == seqs[-1] and len(set(order)) < len(seqs),
           f"posted={len(seqs)} sent={len(set(order))}")
-    p = Panel(BOOT)
+    p = Panel(b)
     p.take(backlog)
-    say_hello(s, BOOT, newest=p.cur)
+    b.hello(s, newest=p.cur)
     p.take(collect(s))
     check("a slow panel shows the newest frame after it drains, not a backlog",
           bool(p.shows) and p.shows[-1][0] == seqs[-1] and bytes(p.fb) == frames[-1])
@@ -437,12 +532,13 @@ def udp_restart_seq():
     # The relay's counter restarts from the clock. A panel that saw a higher
     # seq would drop every new frame as old, so its hello names that seq and
     # the relay moves past it.
-    BOOT = 6
+    b = Boot(6)
+    register(6)
     s = udp_sock()
     seq = post_frame(noise())
     collect(s)
-    say_hello(s, BOOT, newest=seq + 100000)
-    p = Panel(BOOT)
+    b.hello(s, newest=seq + 100000)
+    p = Panel(b)
     p.cur = seq + 100000
     p.take(collect(s))
     check("after a relay restart the panel's higher seq is passed, so the current frame shows",
@@ -454,61 +550,40 @@ def udp_restart_seq():
 def udp_sent_counter():
     # _sent is what the panel says it showed whole, and only for the boot that
     # holds the control stream. A send the link dropped never counts.
-    stream(json.dumps({"build": "udp", "uptime": 2, "boot": 777}), "&frames=0")
-    time.sleep(0.4)
+    register(777)
     s = udp_sock()
-    say_hello(s, 555, whole=5)
+    Boot(555).hello(s, whole=5)
     collect(s)
     post_frame(noise())
     collect(s)
     dev = req("/device")
-    check("frames sent by UDP do not count toward _sent until the panel reports them",
+    check("a hello from another boot does not touch _sent",
           dev.get("boot") == 777 and dev.get("_sent") == 0 and dev.get("path") == "udp", json.dumps(dev))
-    say_hello(s, 777, whole=2)
+    b = Boot(777)
+    b.hello(s, whole=2)
     collect(s)
     sent = req("/device").get("_sent")
     check("_sent takes the whole frames the current boot reports in its hello", sent == 2, f"_sent={sent}")
-    say_hello(s, 777, whole=1)
+    b.hello(s, whole=1)
     collect(s)
     sent = req("/device").get("_sent")
     check("_sent never goes down", sent == 2, f"_sent={sent}")
     s.close()
 
 
-def udp_session():
-    # A datagram names the boot it was sent to and echoes that panel's hello
-    # clock. A replay to a rebooted panel, or a replay used to fake liveness
-    # after the relay went quiet, is dropped.
-    s = udp_sock()
-    say_hello(s, 8)
-    collect(s)
-    frame = noise()
-    post_frame(frame)
-    got = collect(s)
-    other = Panel(9)
-    other.take(got)
-    check("a datagram for another boot is dropped", other.live == 0 and not other.shows)
-    later = Panel(8, clock=time.monotonic() + LIVE_S + 2)
-    later.take(got)
-    check("a datagram that echoes an old hello is dropped and is not live", later.live == 0 and not later.shows)
-    mine = Panel(8)
-    mine.take(got)
-    check("a datagram for this boot and a recent hello shows", mine.live > 0 and bytes(mine.fb) == frame)
-    s.close()
-
-
 def udp_partial_deadline():
     # Frames closer than the partial timeout that each lose a strip must still
     # show: the oldest unshown frame's deadline carries over.
-    BOOT = 10
+    b = Boot(10)
+    register(10)
     s = udp_sock()
-    say_hello(s, BOOT)
+    b.hello(s)
     collect(s)
-    p = Panel(BOOT)
+    p = Panel(b)
     for _ in range(12):
         post_frame(noise())
         for d in collect(s, quiet=0.08):
-            if d[:4] == b"PXTS" and d[16] == 3:
+            if d[:4] == b"PXTS" and d[SESSION] == 3:
                 continue
             p.feed(d)
         p.settle()
@@ -598,7 +673,8 @@ def main():
             udp_slow_panel()
             udp_restart_seq()
             udp_sent_counter()
-            udp_session()
+            udp_replay()
+            no_wall_clock()
             udp_partial_deadline()
             control_stream()
             old_stream()
