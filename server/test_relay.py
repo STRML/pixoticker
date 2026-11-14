@@ -205,11 +205,13 @@ def sign(data):
 
 
 class Boot:
-    """One panel boot: its boot nonce, hello counter, and the hello nonces it
-    has sent with the monotonic time each went out."""
+    """One panel boot: its boot nonce, hello counter, the token of its current
+    control stream, and the hello nonces it has sent with the monotonic time
+    each went out."""
 
-    def __init__(self, boot):
+    def __init__(self, boot, token=b"\0" * 8):
         self.boot = boot
+        self.token = token
         self.n = 0
         self.sent = []
 
@@ -217,16 +219,39 @@ class Boot:
         self.n += 1
         nonce = os.urandom(8)
         self.sent = (self.sent + [(nonce, time.monotonic())])[-NONCES:]
-        d = b"PXTH" + nonce + struct.pack(">IIII", self.boot, self.n if n is None else n, newest, whole)
+        d = (b"PXTH" + nonce + self.token
+             + struct.pack(">IIII", self.boot, self.n if n is None else n, newest, whole))
         d += sign(d)
         s.sendto(d, ("127.0.0.1", UDP_PORT))
         return d
 
 
-def register(boot):
-    """Open the panel's control stream, which names its boot to the relay."""
-    stream(json.dumps({"build": "udp", "uptime": 1, "boot": boot}), "&frames=0")
-    time.sleep(0.3)
+def register(boot, me=None):
+    """Open the panel's control stream, which names its boot to the relay, and
+    take the UDP token the relay answers with. Returns the Boot."""
+    state = json.dumps({"build": "udp", "uptime": 1, "boot": boot})
+    c = socket.create_connection(("127.0.0.1", PORT), timeout=3)
+    c.sendall((f"GET /stream?since=0&frames=0 HTTP/1.1\r\nHost: x\r\nX-Api-Key: {KEY}\r\n"
+               f"X-Pxt-State: {state}\r\nConnection: close\r\n\r\n").encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += c.recv(4096)
+    token = b""
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"x-pxt-udp:"):
+            token = bytes.fromhex(line.split(b":", 1)[1].strip().decode())
+
+    def drain():
+        try:
+            while c.recv(65536):
+                pass
+        except OSError:
+            pass
+
+    threading.Thread(target=drain, daemon=True).start()
+    me = me or Boot(boot)
+    me.token = token
+    return me
 
 
 def udp_sock(rcvbuf=None):
@@ -343,8 +368,7 @@ def strips_of(got):
 
 
 def udp_ack_without_frame():
-    b = Boot(1)
-    register(1)
+    b = register(1)
     s = udp_sock()
     b.hello(s)
     got = collect(s)
@@ -356,16 +380,17 @@ def udp_ack_without_frame():
 
 
 def udp_hello_auth():
-    b = Boot(2)
-    register(2)
+    b = register(2)
     s = udp_sock()
     d = bytearray(b.hello(s))
     collect(s)
     d[6] ^= 1
     s.sendto(bytes(d), ("127.0.0.1", UDP_PORT))
     check("a hello with a bad HMAC gets no answer", collect(s) == [])
-    Boot(3).hello(s)
+    Boot(3, b.token).hello(s)
     check("a hello from a boot that does not hold the control stream gets no answer", collect(s) == [])
+    Boot(2, os.urandom(8)).hello(s, n=1000)
+    check("a hello without the control stream's token gets no answer", collect(s) == [])
     b.hello(s, n=1)
     check("a hello whose counter does not go up gets no answer", collect(s) == [])
     good = b.hello(s)
@@ -373,13 +398,19 @@ def udp_hello_auth():
     t = udp_sock()
     t.sendto(good, ("127.0.0.1", UDP_PORT))
     check("a replayed hello from another address gets no answer", collect(t) == [])
+    stale = Boot(2, b.token)
+    stale.n = b.n
+    register(2, b)
+    stale.hello(s)
+    check("after the control stream reconnects, a hello with the old token gets no answer", collect(s) == [])
+    b.hello(s)
+    check("the same boot's next hello, with the new token, is answered", len(collect(s)) > 0)
     s.close()
     t.close()
 
 
 def udp_strips():
-    b = Boot(3)
-    register(3)
+    b = register(3)
     s = udp_sock()
     b.hello(s)
     collect(s)
@@ -396,8 +427,7 @@ def udp_strips():
 
 
 def udp_loss_order_tamper():
-    b = Boot(4)
-    register(4)
+    b = register(4)
     s = udp_sock()
     b.hello(s)
     collect(s)
@@ -446,8 +476,7 @@ def udp_loss_order_tamper():
 def udp_replay():
     # The replay class: a captured reply or strip must never draw or count as
     # a live link once the panel has moved on, whatever its clocks say.
-    b = Boot(11)
-    register(11)
+    b = register(11)
     s = udp_sock()
     post_frame(noise())
     b.hello(s)
@@ -477,8 +506,7 @@ def udp_replay():
     p.take(mine)
     check("a reply to a hello sent more than 10 s ago (monotonic) is not live", p.live == 0)
 
-    after = Boot(12)
-    register(12)
+    after = register(12)
     after.hello(s)
     collect(s)
     p = Panel(after)
@@ -506,8 +534,7 @@ def no_wall_clock():
 def udp_slow_panel():
     # A panel that falls behind must come back to the newest frame, never play
     # out a backlog. The relay sends only the newest frame it holds.
-    b = Boot(5)
-    register(5)
+    b = register(5)
     s = udp_sock(rcvbuf=1 << 20)
     b.hello(s)
     collect(s)
@@ -532,8 +559,7 @@ def udp_restart_seq():
     # The relay's counter restarts from the clock. A panel that saw a higher
     # seq would drop every new frame as old, so its hello names that seq and
     # the relay moves past it.
-    b = Boot(6)
-    register(6)
+    b = register(6)
     s = udp_sock()
     seq = post_frame(noise())
     collect(s)
@@ -550,16 +576,16 @@ def udp_restart_seq():
 def udp_sent_counter():
     # _sent is what the panel says it showed whole, and only for the boot that
     # holds the control stream. A send the link dropped never counts.
-    register(777)
+    tok = register(777).token
     s = udp_sock()
-    Boot(555).hello(s, whole=5)
+    Boot(555, tok).hello(s, whole=5)
     collect(s)
     post_frame(noise())
     collect(s)
     dev = req("/device")
     check("a hello from another boot does not touch _sent",
           dev.get("boot") == 777 and dev.get("_sent") == 0 and dev.get("path") == "udp", json.dumps(dev))
-    b = Boot(777)
+    b = Boot(777, tok)
     b.hello(s, whole=2)
     collect(s)
     sent = req("/device").get("_sent")
@@ -574,8 +600,7 @@ def udp_sent_counter():
 def udp_partial_deadline():
     # Frames closer than the partial timeout that each lose a strip must still
     # show: the oldest unshown frame's deadline carries over.
-    b = Boot(10)
-    register(10)
+    b = register(10)
     s = udp_sock()
     b.hello(s)
     collect(s)
@@ -645,22 +670,62 @@ def op_too_big():
     check("an op over 180 bytes is refused with a 413", code == 413, f"code={code}")
 
 
+RUNNING = []
+
+
+def start_relay(key_file, fw_file):
+    proc = subprocess.Popen([sys.executable, RELAY, "--port", str(PORT), "--key-file", key_file,
+                             "--firmware", fw_file, "--udp-port", str(UDP_PORT)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    RUNNING.append(proc)
+    for _ in range(50):
+        try:
+            socket.create_connection(("127.0.0.1", PORT), timeout=0.2).close()
+            return
+        except OSError:
+            time.sleep(0.1)
+
+
+def stop_relay():
+    proc = RUNNING.pop()
+    proc.terminate()
+    proc.wait()
+
+
+def udp_relay_restart(key_file, fw_file):
+    # A relay restart forgets every hello counter. A hello captured before the
+    # restart, from the same boot, must still get nothing: the new control
+    # stream hands out a new token.
+    b = register(30)
+    s = udp_sock()
+    for _ in range(3):
+        b.hello(s, whole=4)
+        collect(s)
+    captured = b.hello(s, whole=9)
+    collect(s)
+    stop_relay()
+    start_relay(key_file, fw_file)
+    post_frame(noise())
+    register(30, b)
+    t = udp_sock()
+    t.sendto(captured, ("127.0.0.1", UDP_PORT))
+    dev = req("/device")
+    check("after a relay restart, a hello captured before it gets no answer and leaves _sent alone",
+          collect(t) == [] and dev.get("_sent") == 0, json.dumps(dev))
+    b.hello(s)
+    check("after a relay restart, the panel's next hello is answered", len(collect(s)) > 0)
+    s.close()
+    t.close()
+
+
 def main():
     with tempfile.NamedTemporaryFile("w", suffix=".key") as kf, tempfile.NamedTemporaryFile(suffix=".bin") as fwf:
         kf.write(KEY)
         kf.flush()
         fwf.write(FW)
         fwf.flush()
-        proc = subprocess.Popen([sys.executable, RELAY, "--port", str(PORT), "--key-file", kf.name,
-                                 "--firmware", fwf.name, "--udp-port", str(UDP_PORT)],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        start_relay(kf.name, fwf.name)
         try:
-            for _ in range(50):
-                try:
-                    socket.create_connection(("127.0.0.1", PORT), timeout=0.2).close()
-                    break
-                except OSError:
-                    time.sleep(0.1)
             udp_ack_without_frame()
             udp_hello_auth()
             device_state()
@@ -679,9 +744,10 @@ def main():
             control_stream()
             old_stream()
             op_too_big()
+            udp_relay_restart(kf.name, fwf.name)
         finally:
-            proc.terminate()
-            proc.wait()
+            while RUNNING:
+                stop_relay()
     print("ALL PASS" if all(results) else "SOME FAILED")
     sys.exit(0 if all(results) else 1)
 

@@ -340,7 +340,7 @@ panel ◀──PXTA ack────────────── relay      a h
 
 | Datagram | Bytes |
 |---|---|
-| `PXTH` hello | magic, hello nonce (8 random bytes), then u32 each: boot nonce, hello counter, newest seq shown, whole frames shown. MAC |
+| `PXTH` hello | magic, hello nonce (8 random bytes), stream token (8), then u32 each: boot nonce, hello counter, newest seq shown, whole frames shown. MAC |
 | `PXTS` strip | magic, seq, boot nonce (u32 each), hello nonce (8), index, count, first row, rows, enc (0 raw, 1 runs), pixels, MAC |
 | `PXTA` ack | magic, relay seq, boot nonce (u32 each), hello nonce (8), MAC |
 
@@ -363,9 +363,12 @@ rest of the datagram. Integers are big-endian.
   counter. A reply that arrives after the next hello still counts. A captured
   datagram replayed later, or after a reboot, does not draw, and cannot keep a
   dead link looking alive.
-- The relay takes a hello only from the boot that holds the TLS stream, and
-  only when its counter is above the last one. A captured hello, replayed from
-  any address, gets nothing.
+- Each control stream connect gets a fresh random token in the `X-Pxt-Udp`
+  response header. The relay takes a hello only with the current token, from
+  the boot that opened that stream, and only when its counter is above the
+  last one under that token. TLS cannot be replayed, so a hello captured under
+  an earlier stream, boot or relay run gets nothing, and so does one replayed
+  from any address. The panel sends no hello until it holds a token.
 - No wall clock feeds any of these checks, so a clock step cannot reopen a
   replay window.
 - The relay forgets the panel's address after 20 s without a hello.

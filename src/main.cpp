@@ -1173,6 +1173,38 @@ static const int HELLO_RING = 4;
 static Hello s_hellos[HELLO_RING] = {};
 static int s_hello_at = 0;
 static uint32_t s_hello_n = 0;  // counts up per hello; the relay drops one that does not
+// The relay hands a token to each control stream (X-Pxt-Udp). Hellos carry it,
+// so a hello captured under an earlier stream or relay run is dead. Guarded by
+// panel_lock: the pull task writes it, the UDP task reads it.
+static uint8_t s_udp_token[NONCE_BYTES];
+static bool s_udp_token_ok = false;
+
+static int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+static void udpToken(const char *hex) {
+  uint8_t t[NONCE_BYTES];
+  for (size_t i = 0; i < NONCE_BYTES; i++) {
+    int hi = hexNibble(hex[2 * i]);
+    int lo = hi < 0 ? -1 : hexNibble(hex[2 * i + 1]);
+    if (lo < 0) return;
+    t[i] = (uint8_t)(hi << 4 | lo);
+  }
+  panel_lock();
+  memcpy(s_udp_token, t, NONCE_BYTES);
+  s_udp_token_ok = true;
+  panel_unlock();
+}
+
+static void udpTokenDrop() {
+  panel_lock();
+  s_udp_token_ok = false;
+  panel_unlock();
+}
 
 static bool udpAlive() {
   uint32_t t = s_udp_last;
@@ -1300,13 +1332,18 @@ static void udpSettle() {
   panel_unlock();
 }
 
-// PXTH, nonce, then u32 each: boot nonce, hello counter, newest seq shown,
-// whole frames shown. Then the mac. The relay takes a hello only from the boot
-// that holds the TLS stream, with a counter above the last, echoes the nonce
-// in everything it sends back, moves its seq past the newest after a restart,
-// and reports the whole-frame count as _sent.
-static void udpHello(int sock, const sockaddr_in &to) {
-  uint8_t d[4 + NONCE_BYTES + 16 + UDP_MAC];
+// PXTH, nonce, stream token, then u32 each: boot nonce, hello counter, newest
+// seq shown, whole frames shown. Then the mac. The relay takes a hello only
+// with the current stream's token and boot and a counter above the last,
+// echoes the nonce in everything it sends back, moves its seq past the newest
+// after a restart, and reports the whole-frame count as _sent.
+static bool udpHello(int sock, const sockaddr_in &to) {
+  uint8_t d[4 + 2 * NONCE_BYTES + 16 + UDP_MAC];
+  panel_lock();
+  bool ok = s_udp_token_ok;
+  memcpy(d + 4 + NONCE_BYTES, s_udp_token, NONCE_BYTES);
+  panel_unlock();
+  if (!ok) return false;  // no control stream yet: the relay would drop the hello
   uint32_t newest = s_pull_seq > s_uf.seq ? (uint32_t)s_pull_seq : s_uf.seq;
   Hello &h = s_hellos[s_hello_at];
   esp_fill_random(h.nonce, NONCE_BYTES);
@@ -1315,7 +1352,7 @@ static void udpHello(int sock, const sockaddr_in &to) {
   s_hello_n++;
   memcpy(d, "PXTH", 4);
   memcpy(d + 4, h.nonce, NONCE_BYTES);
-  uint8_t *f = d + 4 + NONCE_BYTES;
+  uint8_t *f = d + 4 + 2 * NONCE_BYTES;
   put32(f, s_boot_id);
   put32(f + 4, s_hello_n);
   put32(f + 8, newest);
@@ -1324,6 +1361,7 @@ static void udpHello(int sock, const sockaddr_in &to) {
   macOf(d, f + 16 - d, m);
   memcpy(f + 16, m, UDP_MAC);
   sendto(sock, d, sizeof(d), 0, (const sockaddr *)&to, sizeof(to));
+  return true;
 }
 
 static int udpOpen() {
@@ -1382,10 +1420,7 @@ static void udpTask(void *) {
       }
       resolved = now;
     }
-    if (!hello || now - hello >= UDP_HELLO_MS) {
-      udpHello(sock, relay);
-      hello = now;
-    }
+    if ((!hello || now - hello >= UDP_HELLO_MS) && udpHello(sock, relay)) hello = now;
     // Wait briefly for one datagram, then drain the queue before drawing, so
     // a backlog in lwIP is read through instead of shown frame by frame. The
     // cap keeps a flood from holding off the next hello.
@@ -1467,8 +1502,14 @@ static void pullTask(void *) {
     char line[160];
     int status = 0;
     if (readLine(c, line, sizeof(line), 10000)) sscanf(line, "HTTP/%*s %d", &status);
+    udpTokenDrop();
     while (readLine(c, line, sizeof(line), 10000)) {
       if (!line[0]) break;
+      if (!strncasecmp(line, "X-Pxt-Udp:", 10)) {
+        const char *v = line + 10;
+        while (*v == ' ') v++;
+        udpToken(v);
+      }
     }
     s_pull_code = status;
     if (status != 200) {

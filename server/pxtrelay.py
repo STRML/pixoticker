@@ -81,7 +81,8 @@ class State:
         self.udp_boot = None
         self.udp_seen = 0.0           # time.monotonic() of the last hello
         self.udp_nonce = b""          # the last hello's nonce, echoed in every reply
-        self.udp_hello_n = 0          # the last hello's counter, for that boot
+        self.udp_hello_n = 0          # the last hello's counter under the current token
+        self.udp_token = None         # handed to the panel on its control stream
         self.udp_kick = False
 
 
@@ -244,6 +245,12 @@ class Handler(BaseHTTPRequestHandler):
         dev["path"] = "tcp" if frames else "udp"
         with STATE.lock:
             STATE.device = dev
+            # UDP hellos must carry this token. Every connect, and so every
+            # relay restart, hands out a new one, and a hello captured under an
+            # earlier one is dead.
+            STATE.udp_token = os.urandom(NONCE_BYTES)
+            STATE.udp_hello_n = 0
+            self.udp_token = STATE.udp_token
         return dev
 
     @staticmethod
@@ -255,8 +262,11 @@ class Handler(BaseHTTPRequestHandler):
         return ops, (STATE.seq if ops else op_seq)
 
     def _stream(self, last, op_since=0, enc="raw", frames=True):
+        self.udp_token = None
         mine = self._register(frames)
         self.send_response(200)
+        if self.udp_token:
+            self.send_header("X-Pxt-Udp", self.udp_token.hex())
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Transfer-Encoding", "chunked")
         self.send_header("Cache-Control", "no-store")
@@ -432,25 +442,28 @@ def strips(frame, seq, key, boot, nonce):
     return out
 
 
-HELLO_BYTES = 4 + NONCE_BYTES + 16
+HELLO_BYTES = 4 + 2 * NONCE_BYTES + 16
 
 
 def udp_hello(data, addr, key):
-    """PXTH, nonce (8 bytes), then u32 each: boot nonce, hello counter, newest
-    seq shown, whole frames shown since boot. Then the mac."""
+    """PXTH, nonce (8 bytes), control stream token (8 bytes), then u32 each:
+    boot nonce, hello counter, newest seq shown, whole frames shown since boot.
+    Then the mac."""
     if len(data) != HELLO_BYTES + MAC_BYTES or data[:4] != b"PXTH":
         return
     if not hmac.compare_digest(mac(key, data[:HELLO_BYTES]), data[HELLO_BYTES:]):
         return
     nonce = data[4:4 + NONCE_BYTES]
-    boot, n, newest, whole = struct.unpack(">IIII", data[4 + NONCE_BYTES:HELLO_BYTES])
+    token = data[4 + NONCE_BYTES:4 + 2 * NONCE_BYTES]
+    boot, n, newest, whole = struct.unpack(">IIII", data[4 + 2 * NONCE_BYTES:HELLO_BYTES])
     with STATE.lock:
         dev = STATE.device
-        # Only the boot that holds the TLS control stream may say hello. TLS
-        # cannot be replayed, so a hello captured from an earlier boot is dead.
-        # Within the boot the counter must go up, so a replayed hello from
-        # another address cannot steal the frames.
-        if dev.get("boot") != boot or (STATE.udp_boot == boot and n <= STATE.udp_hello_n):
+        # A hello must carry the token of the current TLS control stream, from
+        # the boot that opened it. TLS cannot be replayed, so a hello captured
+        # under an earlier stream, boot or relay run is dead. Under one token
+        # the counter must go up, so a replay from another address is too.
+        if (STATE.udp_token is None or not hmac.compare_digest(token, STATE.udp_token)
+                or dev.get("boot") != boot or n <= STATE.udp_hello_n):
             return
         STATE.udp_addr, STATE.udp_boot, STATE.udp_seen = addr, boot, time.monotonic()
         STATE.udp_nonce, STATE.udp_hello_n = nonce, n
