@@ -226,11 +226,10 @@ without the key.
 
 ## Shipping firmware
 
-> **Unconfirmed on a panel:** the first version of this download stopped after 64 KB
-> ([issue 2](https://github.com/STRML/pixoticker/issues/2)). The panel now resumes a download that
-> ends early with an HTTP `Range` request and leaves the reason in `/device` (`ota`, for example
-> `closed 65536/1153312`), but no one has run it on hardware yet. Until a run passes, keep a USB
-> cable within reach and flash with `tools/flash_serial.py` if it fails.
+> **On a lossy link this download fails.** It installed two images on 2026-11-09, at night. On
+> 2026-11-14, by day, a dozen tries died after 4 to 49 KB, and the resume never reached the relay
+> (`/device` `ota` read `http -1 8192/1160544`; nginx logged no `Range` request). The cause is the
+> panel's own LEDs, under Known limits. Night dimming, or the LAN upload below, gets an image across.
 
 The panel has no inbound port, so firmware reaches it the same way frames do.
 Set four variables and run `tools/publish_fw.sh`:
@@ -270,6 +269,26 @@ image resets before its first whole frame and the bootloader goes back to the
 other slot, the old image drops the record at boot, so a retried op installs
 it again. If power is lost between the confirm and the record's promotion, the
 new image finishes the promotion at its next boot.
+
+### Over the LAN
+
+When the relay download keeps failing, post the image to the panel's own `/u` from any machine that
+reaches its address. Darken the LEDs and stop the board first, so the panel is not jamming its own
+receiver or decoding frames while the image arrives:
+
+```sh
+curl -H "X-Api-Key: $KEY" -d level=0 http://PANEL/brightness
+ssh nas 'sudo docker stop pxt-board'
+curl -H 'Expect:' -H "X-Api-Key: $KEY" \
+  -F 'update=@.pio/build/esp32dev/firmware.bin;type=application/octet-stream' http://PANEL/u
+ssh nas 'sudo docker start pxt-board'
+curl -H "X-Api-Key: $KEY" -d level=128 http://PANEL/brightness
+```
+
+Retry the upload until it answers `update ok, rebooting`; on 2026-11-14 one try in three got through.
+Brightness is saved, so the new image starts dark until the last line. Do not upload from `/safe`:
+the safe flag is saved too, the new image boots without its panel, never draws the frame that
+confirms it, and the reboot that clears the flag rolls it back.
 
 ## Panel API
 
@@ -460,6 +479,12 @@ assume physical access. All three tools take `--port`.
   device the relay tracks and its UDP token. Only the panel sends that header,
   and it needs the key, so this is the same rule `/device` already follows:
   one panel per relay.
+- The panel's LEDs jam its own Wi-Fi. At brightness 128, 1000-byte pings to it
+  lost 9 to 14%; at brightness 0, 0 to 3%; 200-byte pings lost none. The signal
+  is strong (-43 to -56 dBm) and the access point counts no failures, because
+  the loss is on the panel's receive side. On TCP each loss stalls the stream
+  behind a retransmit timer, which is what UDP frames avoid. Moving the ESP32's
+  antenna away from the modules and their ribbon cable is the hardware fix.
 - One TLS session at a time while starting up: the ESP32 needs a contiguous
   block for the RSA handshake, and two sessions do not fit.
 - The panel reports its state in an `X-Pxt-State` header on the stream request,
