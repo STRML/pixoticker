@@ -621,5 +621,31 @@ class Drawn(unittest.TestCase):
             self.assertEqual(self.changed(name, state=layouts.STALE, **self.WIDEST), [], name)
 
 
+class MemoryTurnsRedAbove90(unittest.TestCase):
+    """Memory is drawn red only when the figure on the panel is above 90%, on every layout and in the cluster bar."""
+
+    def frame(self, name, mem):
+        nodes = [layouts.Node(f"studio{i}", layouts.LIVE, gpu=50.0, mem=mem, dec=100.0, pre=1000.0) for i in range(1, 5)]
+        img = layouts.render(name, nodes)
+        return {colour for _, colour in img.getcolors(layouts.W * layouts.H)}
+
+    def test_every_layout_keeps_memory_violet_up_to_90_and_red_from_91(self):
+        for name in layouts.LAYOUTS:
+            for mem in (86.0, 90.0, 90.4):
+                self.assertNotIn(layouts.MEM_HOT, self.frame(name, mem), f"{name} at {mem}%")
+                self.assertIn(layouts.MEM_C, self.frame(name, mem), f"{name} at {mem}%")
+            for mem in (90.6, 91.0, 99.0):
+                self.assertIn(layouts.MEM_HOT, self.frame(name, mem), f"{name} at {mem}%")
+
+    def test_the_cluster_bar_follows_the_same_rule_on_the_average(self):
+        def colour(mems):
+            nodes = [layouts.Node(f"studio{i + 1}", layouts.LIVE, mem=m) for i, m in enumerate(mems)]
+            return layouts.summary_parts(nodes)[2][1]
+
+        self.assertEqual(colour([90.0, 90.0, 90.0, 90.0]), layouts.MEM_C)
+        self.assertEqual(colour([88.0, 92.0, 90.0, 90.0]), layouts.MEM_C)
+        self.assertEqual(colour([91.0, 91.0, 91.0, 91.0]), layouts.MEM_HOT)
+
+
 if __name__ == "__main__":
     unittest.main()
