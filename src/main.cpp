@@ -986,16 +986,18 @@ static bool imageHash(const esp_partition_t *part, char hex[65]) {
 }
 
 // The cached hash for a partition, or "" when it is not known for the image
-// there now.
-static const char *imageKnown(const ImageHash &h, const esp_partition_t *part) {
-  return (part && h.part == part && h.gen == s_img_gen) ? h.hex : "";
+// there now. The running image cannot change during a boot, so its hash
+// stands; the boot image's stands only until an install begins or commits.
+static const char *imageKnown(const ImageHash &h, const esp_partition_t *part, bool follows_installs) {
+  return (part && h.part == part && (!follows_installs || h.gen == s_img_gen)) ? h.hex : "";
 }
 
-static void imageFill(ImageHash &h, const esp_partition_t *part) {
-  if (!part || imageKnown(h, part)[0]) return;
+static void imageFill(ImageHash &h, const esp_partition_t *part, bool follows_installs) {
+  if (!part || imageKnown(h, part, follows_installs)[0]) return;
   uint32_t gen = s_img_gen;
   char hex[65];
-  if (!imageHash(part, hex) || gen != s_img_gen) return;  // an install moved under us: try again next time
+  if (!imageHash(part, hex)) return;  // unknown: otaDecide waits
+  if (follows_installs && gen != s_img_gen) return;  // an install moved the boot image under us
   memcpy(h.hex, hex, sizeof(hex));
   h.part = part;
   h.gen = gen;
@@ -1006,19 +1008,17 @@ static void imageFill(ImageHash &h, const esp_partition_t *part) {
 // time, a little over a second for two images (estimate).
 static void imagesHash() {
   uint32_t t = millis();
-  imageFill(s_img_running, esp_ota_get_running_partition());
-  imageFill(s_img_boot, esp_ota_get_boot_partition());
+  imageFill(s_img_running, esp_ota_get_running_partition(), false);
+  imageFill(s_img_boot, esp_ota_get_boot_partition(), true);
   Serial.printf("[ota] images hashed in %u ms\n", (unsigned)(millis() - t));
 }
 
-// True when the image is on the device; known reports whether the cache could
-// answer at all.
-static bool otaHere(const String &sha, bool &known) {
+// Skip, install, or wait for a later op when a hash is not known (otaDecide).
+static OtaDecision otaDecision(const String &sha) {
   const esp_partition_t *run = esp_ota_get_running_partition(), *boot = esp_ota_get_boot_partition();
-  const char *r = imageKnown(s_img_running, run);
-  const char *b = boot == run ? r : imageKnown(s_img_boot, boot);
-  known = r[0] && b[0];
-  return otaImageHere(sha.c_str(), r, b);
+  const char *r = imageKnown(s_img_running, run, false);
+  const char *b = boot == run ? r : imageKnown(s_img_boot, boot, true);
+  return otaDecide(sha.c_str(), r, b);
 }
 
 // Firmware before this kept hash records in NVS. Nothing reads them now.
@@ -1043,10 +1043,10 @@ static void otaOp(const char *js) {
     Serial.println("[ota] bad op");
     return;
   }
-  // With both hashes cached, a re-posted op is answered here and the stream
-  // stays up. Otherwise otaRun hashes the flash once the stream is closed.
-  bool known;
-  if (otaHere(sha, known)) {
+  // A cached match answers a re-posted op here, and the stream stays up.
+  // Anything else goes to otaRun, which hashes what is not cached yet once the
+  // stream is closed.
+  if (otaDecision(sha) == OTA_SKIP) {
     Serial.println("[ota] already on the device");
     return;
   }
@@ -1061,10 +1061,15 @@ static void otaOp(const char *js) {
 static void otaRun() {
   s_ota_pending = false;
   imagesHash();
-  bool known;
-  if (otaHere(s_ota_sha, known)) {
-    Serial.println("[ota] already on the device");
-    return;
+  switch (otaDecision(s_ota_sha)) {
+    case OTA_SKIP:
+      Serial.println("[ota] already on the device");
+      return;
+    case OTA_WAIT:
+      Serial.println("[ota] could not hash the images in flash; waiting for the next op");
+      return;
+    case OTA_INSTALL:
+      break;
   }
   Serial.printf("[ota] %s %u\n", s_ota_path.c_str(), (unsigned)s_ota_want);
   if (!otaFrom(s_ota_path, s_ota_want, s_ota_sha)) return;

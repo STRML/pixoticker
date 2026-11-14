@@ -271,7 +271,8 @@ hash covers the partition up to the image's length, which with the digest the
 build appends is exactly `firmware.bin`, so it matches the op's `sha256`. A
 rollback, a `/u` install or a power cut cannot leave the answer out of date.
 The first op after a boot hashes both images once, after the stream closes
-(about a second, estimated); later ops use the cached hashes.
+(about a second, estimated); later ops use the cached hashes. If either
+hash cannot be read, the panel installs nothing and waits for the next op.
 
 ### Over the LAN
 

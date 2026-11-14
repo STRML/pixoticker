@@ -108,6 +108,18 @@ static void randomWalks() {
 // Whether an ota op's image is already on the device: its SHA-256 (of the
 // .bin) against the images in the running and the boot partitions, hashed
 // from flash. No record is kept, so there is nothing to get out of step.
+static void otaDecisions() {
+  // An unknown hash (a flash read failed, or an install changed the boot image
+  // mid-hash) must never read as "not here": that would reinstall the running
+  // image into the other slot, over the last good one.
+  check("both known, neither matches: install", otaDecide("cccc", "aaaa", "aaaa") == OTA_INSTALL);
+  check("the running image matches: skip", otaDecide("aaaa", "aaaa", "") == OTA_SKIP);
+  check("the boot image matches: skip", otaDecide("bbbb", "", "bbbb") == OTA_SKIP);
+  check("the running hash unknown: wait, do not install", otaDecide("bbbb", "", "aaaa") == OTA_WAIT);
+  check("the boot hash unknown: wait, do not install", otaDecide("bbbb", "aaaa", "") == OTA_WAIT);
+  check("nothing known: wait", otaDecide("bbbb", "", "") == OTA_WAIT);
+}
+
 static void otaImages() {
   const char *A = "aaaa", *B = "bbbb", *C = "cccc";
   check("the running image matches (case does not matter)", otaImageHere("AAAA", A, A));
@@ -162,6 +174,7 @@ int main() {
   reconnectWhileLive();
   randomWalks();
   otaImages();
+  otaDecisions();
   resetNames();
   bootCounting();
   printf(failed ? "SOME FAILED\n" : "ALL PASS\n");

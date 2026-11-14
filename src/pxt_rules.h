@@ -38,6 +38,18 @@ inline bool otaImageHere(const char *sha, const char *running_hash, const char *
   return (running_hash[0] && !strcasecmp(sha, running_hash)) || (boot_hash[0] && !strcasecmp(sha, boot_hash));
 }
 
+// What to do with an ota op. A hash that is "" is unknown (a flash read
+// failed, or an install moved the boot image mid-hash), never a mismatch:
+// installing then could put the running image into the other slot, over the
+// last good one. So install only when both hashes are known and neither
+// matches; otherwise wait for the next op.
+enum OtaDecision { OTA_SKIP, OTA_INSTALL, OTA_WAIT };
+
+inline OtaDecision otaDecide(const char *sha, const char *running_hash, const char *boot_hash) {
+  if (otaImageHere(sha, running_hash, boot_hash)) return OTA_SKIP;
+  return (running_hash[0] && boot_hash[0]) ? OTA_INSTALL : OTA_WAIT;
+}
+
 // Why the previous boot ended, as /state and X-Pxt-State report it. The codes
 // are esp_reset_reason_t's; src/main.cpp static_asserts them.
 inline const char *resetName(int r) {
