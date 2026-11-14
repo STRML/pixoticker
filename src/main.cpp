@@ -1022,10 +1022,15 @@ static void settlePending() {
   prefsBegin(false);
   // Firmware before this kept one record, in otapending and otaslot. Move it
   // to its slot's key, so an image that firmware installed is still known.
+  // The old keys go only once the record is safe in its new one.
   String legacy = s_prefs.getString("otapending", ""), legacy_slot = s_prefs.getString("otaslot", "");
-  if (legacy.length() && legacy_slot.length()) s_prefs.putString(pendKey(legacy_slot.c_str()).c_str(), legacy);
-  s_prefs.remove("otapending");
-  s_prefs.remove("otaslot");
+  const char *dest = legacyPendingSlot(legacy_slot.c_str(), running ? running->label : "", confirmed);
+  bool moved = !legacy.length() || !dest[0] ||
+               s_prefs.putString(pendKey(dest).c_str(), legacy) == legacy.length();
+  if (moved) {
+    s_prefs.remove("otapending");
+    s_prefs.remove("otaslot");
+  }
   bool promote = false;
   esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, nullptr);
   for (; it; it = esp_partition_next(it)) {

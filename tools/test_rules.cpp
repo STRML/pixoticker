@@ -207,6 +207,16 @@ static void otaRecords() {
   }
 }
 
+static void legacyRecord() {
+  // Firmware before per-slot records kept one, otapending, with otaslot from
+  // 45b64e9 on and without it before.
+  check("a legacy record with a slot moves to that slot", !strcmp(legacyPendingSlot("app1", "app0", true), "app1"));
+  check("a slotless legacy record names the image on trial: it moves to the running slot",
+        !strcmp(legacyPendingSlot("", "app1", false), "app1"));
+  check("a slotless legacy record beside a confirmed image belongs to nothing",
+        !strcmp(legacyPendingSlot("", "app0", true), ""));
+}
+
 static void resetNames() {
   // esp_reset_reason_t values; src/main.cpp static_asserts the ones named here.
   check("reset 1 is poweron", !strcmp(resetName(1), "poweron"));
@@ -226,6 +236,8 @@ static void bootCounting() {
   check("a brownout counts as a failed boot", bootCounts(9, false));
   check("the panel guard's restart counts as a failed boot", bootCounts(3, true));
   check("power on does not count", !bootCounts(1, false));
+  check("the RTC watchdog (wdt: a hang in the bootloader, as after a slow power-up) does not count",
+        !bootCounts(7, false));
   check("the EN pin (a serial port opening) does not count", !bootCounts(2, false));
   check("a restart the firmware asked for does not count", !bootCounts(3, false));
 }
@@ -242,6 +254,7 @@ int main() {
   randomWalks();
   otaCurrent();
   otaRecords();
+  legacyRecord();
   resetNames();
   bootCounting();
   printf(failed ? "SOME FAILED\n" : "ALL PASS\n");

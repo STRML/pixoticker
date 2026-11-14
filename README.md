@@ -322,7 +322,7 @@ The memory fields in `/state` say whether a TLS handshake has room. The relay's
 | `heap` | free heap now |
 | `maxblock` | largest free block now; a handshake needs one big contiguous block |
 | `minheap` | lowest free heap since boot. A handshake that failed with an allocation error shows here as a low mark |
-| `reset` | why the previous boot ended: `poweron`, `sw` (asked for), `panic`, `task_wdt`, `int_wdt`, `brownout`, ... |
+| `reset` | why the previous boot ended: `poweron`, `sw` (asked for), `panic`, `task_wdt`, `int_wdt` (the app's watchdogs), `brownout`, or `wdt`: the RTC watchdog, which runs only while the bootloader does, so the boot hung before the app started (seen after a slow power-up) |
 | `udp_stack` | bytes of the UDP task's stack never used, as it last measured; 0 until UDP starts |
 | `hsheap`, `hsblock` | free heap and largest block as the last TLS handshake began, with the UDP task stopped. The handshake needs room from here; compare with `minheap` |
 | `boots` | failed boots in a row (crashes, watchdogs, the panel guard); at 2 the panel boots safe |
@@ -468,8 +468,8 @@ update it waits for one complete frame; if none arrives it resets into the
 previous image. A boot counter plus a one-shot timer catches a panel
 configuration that hangs boot, and `/safe` (or two failed boots in a row) boots
 with the panel disabled so the HTTP API stays reachable. A boot counts as failed
-when it ended in a crash, a watchdog, a brownout or the panel guard's restart,
-judged by the reset reason the next boot reads. Power on, the EN pin (every
+when it ended in a crash, the app's interrupt or task watchdog, a brownout or
+the panel guard's restart, judged by the reset reason the next boot reads. Power on, the EN pin (every
 serial tool pulses it) and restarts the firmware asks for do not count. The
 count starts over once a boot stays up for 60 s.
 

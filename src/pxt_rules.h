@@ -53,6 +53,15 @@ inline PendingFate otaSlotFate(bool is_running_slot, bool running_confirmed) {
   return running_confirmed ? PENDING_PROMOTE : PENDING_KEEP;
 }
 
+// Where the old single pending record (otapending, otaslot) belongs. Its slot
+// when it names one. Without a slot, older firmware wrote it for the image it
+// had just installed, which is the one now running if that image is still on
+// trial; once confirmed, the record belongs to nothing.
+inline const char *legacyPendingSlot(const char *legacy_slot, const char *running_slot, bool running_confirmed) {
+  if (legacy_slot[0]) return legacy_slot;
+  return running_confirmed ? "" : running_slot;
+}
+
 // Why the previous boot ended, as /state and X-Pxt-State report it. The codes
 // are esp_reset_reason_t's; src/main.cpp static_asserts them.
 inline const char *resetName(int r) {
@@ -62,16 +71,18 @@ inline const char *resetName(int r) {
   return (r >= 0 && r < (int)(sizeof(names) / sizeof(names[0]))) ? names[r] : "unknown";
 }
 
-// Whether the boot that just ended counts toward safe mode: a crash, a
-// watchdog, a brownout, or the panel guard's restart. Power on, the EN pin
-// (opening the serial port pulses it) and restarts the firmware asked for do
-// not. Codes are esp_reset_reason_t's.
+// Whether the boot that just ended counts toward safe mode: a crash, the
+// app's interrupt or task watchdog, a brownout, or the panel guard's restart.
+// Power on, the EN pin (opening the serial port pulses it) and restarts the
+// firmware asked for do not. Nor does wdt: on the ESP32 that is the RTC
+// watchdog, armed only while the bootloader runs, so it means the boot hung
+// before the app (a slow power-up), which safe mode cannot help. Codes are
+// esp_reset_reason_t's.
 inline bool bootCounts(int reason, bool guard_fired) {
   switch (reason) {
     case 4:  // panic
     case 5:  // int_wdt
     case 6:  // task_wdt
-    case 7:  // wdt
     case 9:  // brownout
     case 15:  // cpu_lockup
       return true;
