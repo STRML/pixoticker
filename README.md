@@ -111,7 +111,7 @@ alone, and per metric. Until 60 such samples have been seen the bars use a defau
 
 **Machine stats.** The agent also reports the machine's GPU temperature, power and CPU load, and the layouts draw them
 where there is room. Every number on the panel is in its metric's colour. A percentage is a letter, two digits and a
-`%` (`G93%` GPU, `M82%` memory, `C12%` CPU; a single digit pads to `C08%` so the figure never jumps, and nothing shows above `99%`). A rate is a letter and
+`%` (`G93%` GPU, `M82%` memory, `C12%` CPU; a single digit pads to `C08%` so the figure never jumps, and nothing shows above `99%`). Memory turns red above `M90%`. A rate is a letter and
 a figure (`D118` decode, `P2.4K` prefill). The machine's own units go after the figure: `58C` temperature, `209W` watts.
 The loads sit together in the order GPU, CPU, memory (`G93% C12% M82%`) and the hardware pair after the tag or beside
 the bars (`58C 209W`).

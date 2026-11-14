@@ -39,7 +39,7 @@ RATE_BAR_W = 60     # the focus view's decode and prefill bars
 ROWS_BAR_W = 88     # rows: GPU and memory bars, leaving the right edge for watts and CPU
 FOCUS_BAR_W = 64    # focus: the same, leaving room for the GPU, CPU and memory percentages
 HIST = 36           # samples a sparkline shows
-MEM_WARN = 85.0
+MEM_WARN = 90   # memory turns red when the figure on the panel is above this
 BAR_X, BAR_W = 34, 8    # spark: the GPU and memory bars beside their numbers
 SUMMARY_X = (1, 22, 43, 64, 85)   # the cluster bar's first five figures, 21 px apart; prefill ends the row at 126
 
@@ -190,14 +190,15 @@ def draw_stats(c, x, y, parts):
     return x
 
 
-def mem_color(node):
-    return MEM_HOT if (node.mem or 0) >= MEM_WARN else MEM_C
+def mem_colour(mem):
+    """Red when the shown figure is above MEM_WARN, so M90% stays violet and M91% is red."""
+    return MEM_HOT if mem is not None and round(mem) > MEM_WARN else MEM_C
 
 
 def bar_colors(node):
     if not node.fresh:
         return DIM, DIM
-    return GPU_C, mem_color(node)
+    return GPU_C, mem_colour(node.mem)
 
 
 def loads(node):
@@ -330,7 +331,7 @@ def summary_parts(nodes):
     live = any(n.fresh for n in nodes[:4])
     gpu, cpu, mem = (average(nodes, key) for key in ("gpu", "cpu", "mem"))
     cpu_part = None if cpu is None else ("C" + pct(cpu), CPU_C)
-    colours = (GPU_C, MEM_HOT if (mem or 0) >= MEM_WARN else MEM_C) if live else (DIM, DIM)
+    colours = (GPU_C, mem_colour(mem)) if live else (DIM, DIM)
     dec_all, pre_all = totals(nodes)
     return [("G" + pct(gpu), colours[0]), cpu_part, ("M" + pct(mem), colours[1]), watts_total(nodes),
             total_text(dec_all, DEC_C), total_text(pre_all, PRE_C)]
