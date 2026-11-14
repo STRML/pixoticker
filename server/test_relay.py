@@ -72,11 +72,13 @@ def device_state():
     check("X-Pxt-State over 600 bytes is ignored", req("/device").get("build") == "b1")
     # The heap low-water mark and why the last boot ended are how a TLS
     # failure on the panel is read from the relay, with no serial cable.
-    stream(json.dumps({"build": "b2", "minheap": 31200, "reset": "panic"}))
+    stream(json.dumps({"build": "b2", "minheap": 31200, "reset": "panic", "hsheap": 52000, "hsblock": 40948}))
     time.sleep(0.5)
     dev = req("/device")
     check("X-Pxt-State keeps the heap low-water mark and the last reset reason",
           dev.get("minheap") == 31200 and dev.get("reset") == "panic", json.dumps(dev))
+    check("X-Pxt-State keeps the heap and largest block at the last handshake's start",
+          dev.get("hsheap") == 52000 and dev.get("hsblock") == 40948, json.dumps(dev))
 
 
 def sent_counter():

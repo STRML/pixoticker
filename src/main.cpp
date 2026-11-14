@@ -37,21 +37,29 @@ static_assert(ESP_RST_POWERON == 1 && ESP_RST_SW == 3 && ESP_RST_PANIC == 4 && E
 RTC_NOINIT_ATTR static uint32_t s_magic;
 RTC_NOINIT_ATTR static uint32_t s_boots;
 RTC_NOINIT_ATTR static uint32_t s_last_rc;  // 1 ok, 2 begin false, 3 guard fired
+RTC_NOINIT_ATTR static uint32_t s_guard_hit;  // GUARD_MAGIC: the panel guard restarted the chip
+static const uint32_t GUARD_MAGIC = 0x47524431;  // "GRD1"
 static const uint32_t BOOT_MAGIC = 0x50585431;  // "PXT1"
-static const uint32_t MAX_PANEL_ATTEMPTS = 2;
+static const uint32_t MAX_PANEL_ATTEMPTS = 2;  // failed boots in a row before safe mode
 // A boot that stays up this long has held, and the boot counter starts over.
-// Until then a crash, a watchdog or the panel guard counts toward safe mode.
 static const uint32_t BOOT_STABLE_MS = 60000;
-
-// Every restart the firmware asks for: it is not a failed boot, so it must not
-// push the panel toward safe mode.
-static void restartOnPurpose() {
-  s_boots = 0;
-  ESP.restart();
-}
 static const char *AP_NAME = "PixoTicker";
 
 static Preferences s_prefs;
+// One Preferences handle serves the web server, the pull task and the serial
+// loop. A second begin() fails while one is open, and its end() would close
+// the other's session, so every session holds this lock.
+static SemaphoreHandle_t s_prefs_mu = xSemaphoreCreateRecursiveMutex();
+
+static void prefsBegin(bool read_only) {
+  xSemaphoreTakeRecursive(s_prefs_mu, portMAX_DELAY);
+  s_prefs.begin("pxt", read_only);
+}
+
+static void prefsEnd() {
+  s_prefs.end();
+  xSemaphoreGiveRecursive(s_prefs_mu);
+}
 static WebServer s_http(80);
 static PanelCfg s_cfg;
 static uint16_t *s_fb = nullptr;
@@ -97,7 +105,9 @@ static char s_pull_phase[24] = "idle";
 static uint32_t s_boot_id = 0;  // random per boot: ties the UDP hello to the stream's X-Pxt-State
 static volatile uint32_t s_udp_good = 0, s_udp_bad = 0;
 static volatile uint32_t s_whole = 0;  // complete frames shown since boot; the hello reports it
-static TaskHandle_t s_udp_task = nullptr;
+static TaskHandle_t volatile s_udp_task = nullptr;  // set while the UDP task runs
+static volatile uint32_t s_udp_stack_free = 0;      // its stack headroom, as it last measured
+static volatile uint32_t s_hs_heap = 0, s_hs_block = 0;  // free heap and largest block as the last handshake began
 static void set_phase(const char *p) { snprintf(s_pull_phase, sizeof(s_pull_phase), "%s", p); }
 
 // Hold a freshly flashed image in "pending verify" so the bootloader rolls it
@@ -108,7 +118,7 @@ extern "C" bool verifyRollbackLater() { return true; }
 // ---------------------------------------------------------------- config
 
 static void loadConfig() {
-  s_prefs.begin("pxt", true);
+  prefsBegin(true);
   s_cfg.across = s_prefs.getUChar("across", 2);
   s_cfg.down = s_prefs.getUChar("down", 1);
   s_cfg.serpentine = s_prefs.getUChar("serp", 0);
@@ -116,17 +126,17 @@ static void loadConfig() {
   s_cfg.modH = s_prefs.getUChar("modh", 64);
   s_safe = s_prefs.getUChar("safe", 0) != 0;
   s_brightness = s_prefs.getUChar("bright", 128);
-  s_prefs.end();
+  prefsEnd();
 }
 
 static void savePanel(const PanelCfg &c) {
-  s_prefs.begin("pxt", false);
+  prefsBegin(false);
   s_prefs.putUChar("across", c.across);
   s_prefs.putUChar("down", c.down);
   s_prefs.putUChar("serp", c.serpentine);
   s_prefs.putUChar("invclk", c.invertClock);
   s_prefs.putUChar("modh", c.modH);
-  s_prefs.end();
+  prefsEnd();
 }
 
 // This panel is wired G/B swapped: a green write lands on the blue LEDs.
@@ -153,9 +163,7 @@ static bool ensureFb(const PanelCfg &c) {
 // ---------------------------------------------------------------- guard
 
 static void guardExpired(void *) {
-  s_boots = (s_magic == BOOT_MAGIC) ? s_boots : 1;
-  s_magic = BOOT_MAGIC;
-  s_boots++;
+  s_guard_hit = GUARD_MAGIC;  // the next boot counts this one as failed (bootCounts)
   s_last_rc = 3;
   esp_restart();
 }
@@ -262,7 +270,9 @@ static String buildStateJson() {
   j += "\"boot\":" + String(s_boot_id) + ",";
   j += "\"udp_good\":" + String(s_udp_good) + ",";
   j += "\"udp_bad\":" + String(s_udp_bad) + ",";
-  j += "\"udp_stack\":" + String(s_udp_task ? uxTaskGetStackHighWaterMark(s_udp_task) : 0);
+  j += "\"udp_stack\":" + String((uint32_t)s_udp_stack_free) + ",";
+  j += "\"hsheap\":" + String((uint32_t)s_hs_heap) + ",";
+  j += "\"hsblock\":" + String((uint32_t)s_hs_block);
   j += "}";
   return j;
 }
@@ -288,6 +298,8 @@ static String stateHeader() {
              ",\"heap\":" + String(ESP.getFreeHeap()) +
              ",\"maxblock\":" + String(ESP.getMaxAllocHeap()) +
              ",\"minheap\":" + String(ESP.getMinFreeHeap()) +
+             ",\"hsheap\":" + String((uint32_t)s_hs_heap) +
+             ",\"hsblock\":" + String((uint32_t)s_hs_block) +
              ",\"reset\":\"" + String(resetName(esp_reset_reason())) + "\"" +
              ",\"frames\":" + String((uint32_t)s_pull_frames) +
              ",\"errors\":" + String((uint32_t)s_pull_errors) +
@@ -456,9 +468,9 @@ static void handleBrightness() {
     return;
   }
   s_brightness = (uint8_t)level;
-  s_prefs.begin("pxt", false);
+  prefsBegin(false);
   s_prefs.putUChar("bright", s_brightness);
-  s_prefs.end();
+  prefsEnd();
   panel_setBrightness(s_brightness);
   s_http.send(200, "application/json", "{\"brightness\":" + String(level) + "}");
 }
@@ -485,7 +497,7 @@ static void handlePanelCfg() {
   s_last_rc = 0;
   s_http.send(200, "application/json", "{\"ok\":true,\"reboot\":true}");
   delay(300);
-  restartOnPurpose();
+  ESP.restart();
 }
 
 static void handleBootsReset() {
@@ -527,12 +539,12 @@ static void handlePanelTry() {
 static void handleSafe() {
   bool on = true;
   if (s_http.hasArg("on")) on = s_http.arg("on").toInt() != 0;
-  s_prefs.begin("pxt", false);
+  prefsBegin(false);
   s_prefs.putUChar("safe", on ? 1 : 0);
-  s_prefs.end();
+  prefsEnd();
   s_http.send(200, "application/json", on ? "{\"safe\":true}" : "{\"safe\":false}");
   delay(200);
-  restartOnPurpose();
+  ESP.restart();
 }
 
 static void handleTest() {
@@ -552,15 +564,10 @@ static bool s_up_mine = false;  // the /u upload in progress holds the token
 static bool s_up_busy = false;  // the /u upload in progress was refused because a download holds it
 // The /u upload hashes what it writes and records the image like a relay
 // install, so a later ota op for the same file is seen as already here.
-static mbedtls_sha256_context *s_up_sha = nullptr;  // only while an upload runs
-static void rememberInstalled(const String &shaHex);
+// Static, so an upload can never succeed without its hash for want of memory.
+static mbedtls_sha256_context s_up_sha;
+static bool rememberInstalled(const String &shaHex);
 
-static void upShaDrop() {
-  if (!s_up_sha) return;
-  mbedtls_sha256_free(s_up_sha);
-  delete s_up_sha;
-  s_up_sha = nullptr;
-}
 
 static bool updTake(uint8_t who) {
   bool got;
@@ -589,7 +596,7 @@ static void handleUpdateDone() {
   }
   s_http.send(200, "text/plain", "update ok, rebooting");
   delay(800);
-  restartOnPurpose();
+  ESP.restart();
 }
 
 static void otaChunk(HTTPUpload &up) {
@@ -609,38 +616,35 @@ static void otaChunk(HTTPUpload &up) {
       updRelease(UPD_UPLOAD);
       return;
     }
-    upShaDrop();
-    s_up_sha = new (std::nothrow) mbedtls_sha256_context;
-    if (s_up_sha) {
-      mbedtls_sha256_init(s_up_sha);
-      mbedtls_sha256_starts(s_up_sha, 0);
-    }
+    mbedtls_sha256_init(&s_up_sha);
+    mbedtls_sha256_starts(&s_up_sha, 0);
     s_up_mine = true;
   } else if (!s_up_mine) {
     return;  // refused or failed to begin: touch nothing in a session that is not ours
   } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (s_up_sha) mbedtls_sha256_update(s_up_sha, up.buf, up.currentSize);
+    mbedtls_sha256_update(&s_up_sha, up.buf, up.currentSize);
     if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_END) {
     // The last chunk came as a WRITE already; at END buf still holds it and
     // totalSize counts it.
     s_ota_written = up.totalSize;
     uint8_t dig[32];
-    bool hashed = s_up_sha != nullptr;
-    if (hashed) mbedtls_sha256_finish(s_up_sha, dig);
-    upShaDrop();
-    s_ota_ok = Update.end(true);
-    if (!s_ota_ok) {
-      Update.printError(Serial);
-    } else if (hashed) {
-      char hex[65];
-      for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", dig[i]);
-      rememberInstalled(hex);
+    mbedtls_sha256_finish(&s_up_sha, dig);
+    mbedtls_sha256_free(&s_up_sha);
+    char hex[65];
+    for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", dig[i]);
+    if (!rememberInstalled(hex)) {
+      Serial.println("[ota] /u: could not record the image hash, not installing");
+      Update.abort();
+      s_ota_ok = false;
+    } else {
+      s_ota_ok = Update.end(true);
+      if (!s_ota_ok) Update.printError(Serial);
     }
     s_up_mine = false;
     updRelease(UPD_UPLOAD);
   } else if (up.status == UPLOAD_FILE_ABORTED) {
-    upShaDrop();
+    mbedtls_sha256_free(&s_up_sha);
     Update.end();
     s_up_mine = false;
     updRelease(UPD_UPLOAD);
@@ -721,22 +725,22 @@ static void handleWifiSave() {
     return;
   }
   String s = s_http.arg("s"), p = s_http.arg("p");
-  s_prefs.begin("pxt", false);
+  prefsBegin(false);
   s_prefs.putString("ssid", s);
   s_prefs.putString("pass", p);
-  s_prefs.end();
+  prefsEnd();
   s_http.send(200, "text/html", "saved, rebooting");
   delay(300);
-  restartOnPurpose();
+  ESP.restart();
 }
 
 // ---------------------------------------------------------------- setup
 
 static void startNetwork() {
-  s_prefs.begin("pxt", true);
+  prefsBegin(true);
   String ssid = s_prefs.getString("ssid", "");
   String pass = s_prefs.getString("pass", "");
-  s_prefs.end();
+  prefsEnd();
 
   // AP comes up before anything can block, on every boot.
   WiFi.mode(WIFI_AP_STA);
@@ -943,6 +947,12 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
     }
     return false;
   }
+  if (!rememberInstalled(shaHex)) {
+    Update.abort();
+    updRelease(UPD_RELAY);
+    otaNote("nvs", total, want);
+    return false;
+  }
   bool ended = Update.end(true);
   updRelease(UPD_RELAY);
   if (!ended) {
@@ -958,27 +968,36 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
 // version written after a verified install is the one to compare.
 static String s_ota_installed;
 
-// Called after Update.end(true), so the boot partition is the slot just
-// written. The slot goes first: power lost between the two writes leaves no
-// pending hash, never a hash with the wrong slot.
-static void rememberInstalled(const String &shaHex) {
-  const esp_partition_t *slot = esp_ota_get_boot_partition();
-  s_prefs.begin("pxt", false);
-  s_prefs.putString("otaslot", slot ? slot->label : "");
-  s_prefs.putString("otapending", shaHex);  // proven only by the first frame
-  s_prefs.end();
+// Called before Update.end(true) commits the image, so the next update
+// partition is the slot being written. False when the record did not stick:
+// the caller then aborts, because an image installed without its hash would
+// be reinstalled by the next ota op for it. The slot goes first: power lost
+// between the two writes leaves no pending hash, never one with the wrong slot.
+static bool rememberInstalled(const String &shaHex) {
+  const esp_partition_t *slot = esp_ota_get_next_update_partition(nullptr);
+  if (!slot) return false;
+  prefsBegin(false);
+  bool ok = s_prefs.putString("otaslot", slot->label) > 0 &&
+            s_prefs.putString("otapending", shaHex) == shaHex.length();  // proven only by the first frame
+  prefsEnd();
+  return ok;
 }
 
+// Only from the pending image's own slot: an upload or download records the
+// next image as pending before the restart, and a frame the old image draws in
+// that gap proves the old image, not the new one.
 static void promoteInstalled() {
-  s_prefs.begin("pxt", false);
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  prefsBegin(false);
   String pending = s_prefs.getString("otapending", "");
-  if (pending.length()) {
+  String slot = s_prefs.getString("otaslot", "");
+  if (pending.length() && otaMayPromote(slot.c_str(), running ? running->label : "")) {
     s_prefs.putString("otasha", pending);
     s_prefs.remove("otapending");
     s_prefs.remove("otaslot");
     s_ota_installed = pending;
   }
-  s_prefs.end();
+  prefsEnd();
 }
 
 // At boot, settle the pending hash by the slot it was written to: drop it
@@ -987,16 +1006,16 @@ static void settlePending() {
   const esp_partition_t *running = esp_ota_get_running_partition();
   esp_ota_img_states_t st;
   bool confirmed = running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_VALID;
-  s_prefs.begin("pxt", true);
+  prefsBegin(true);
   bool has = s_prefs.isKey("otapending");
   String slot = s_prefs.getString("otaslot", "");
-  s_prefs.end();
+  prefsEnd();
   switch (otaPendingFate(has, slot.c_str(), running ? running->label : "", confirmed)) {
     case PENDING_DROP:
-      s_prefs.begin("pxt", false);
+      prefsBegin(false);
       s_prefs.remove("otapending");
       s_prefs.remove("otaslot");
-      s_prefs.end();
+      prefsEnd();
       Serial.println("[ota] rolled back: dropped the pending image");
       break;
     case PENDING_PROMOTE:
@@ -1021,10 +1040,10 @@ static void otaOp(const char *js) {
     Serial.println("[ota] bad op");
     return;
   }
-  s_prefs.begin("pxt", true);
+  prefsBegin(true);
   if (!s_ota_installed.length()) s_ota_installed = s_prefs.getString("otasha", "");
   String pending = s_prefs.getString("otapending", "");
-  s_prefs.end();
+  prefsEnd();
   if (otaIsCurrent(sha.c_str(), s_ota_installed.c_str(), pending.c_str())) {
     Serial.println("[ota] already running this image");
     return;
@@ -1040,11 +1059,10 @@ static void otaOp(const char *js) {
 static void otaRun() {
   s_ota_pending = false;
   Serial.printf("[ota] %s %u\n", s_ota_path.c_str(), (unsigned)s_ota_want);
-  if (!otaFrom(s_ota_path, s_ota_want, s_ota_sha)) return;
-  rememberInstalled(s_ota_sha);
+  if (!otaFrom(s_ota_path, s_ota_want, s_ota_sha)) return;  // otaFrom records the hash
   Serial.println("[ota] written, restarting");
   delay(300);
-  restartOnPurpose();
+  ESP.restart();
 }
 
 static const uint32_t OP_MAGIC = 0x5058544Fu;  // "PXTO"
@@ -1060,7 +1078,7 @@ static void applyOp(const char *js) {
   }
   if (strstr(js, "\"reboot\"")) {
     delay(300);
-    restartOnPurpose();
+    ESP.restart();
     return;
   }
   if (strstr(js, "\"ota\"")) {
@@ -1075,9 +1093,9 @@ static void applyOp(const char *js) {
       if (lvl < 0) lvl = 0;
       if (lvl > 255) lvl = 255;
       s_brightness = (uint8_t)lvl;
-      s_prefs.begin("pxt", false);
+      prefsBegin(false);
       s_prefs.putUChar("bright", s_brightness);
-      s_prefs.end();
+      prefsEnd();
       panel_setBrightness(s_brightness);
     }
   }
@@ -1252,8 +1270,7 @@ static mbedtls_md_context_t s_mac;
 static volatile uint32_t s_udp_last = 0;       // millis of the last valid datagram
 static volatile uint32_t s_udp_since = 0;      // start of the current run of valid datagrams
 static volatile bool s_udp_draws = true;       // false while the stream carries frames
-static volatile bool s_udp_pause = false;      // a TLS handshake or firmware download needs the heap
-static volatile bool s_udp_closed = true;      // the UDP task holds no socket
+static volatile bool s_udp_stop = false;       // a TLS handshake or firmware download needs the heap
 static const uint32_t UDP_RESOLVE_MS = 300000;      // refresh the relay's address this often
 static const uint32_t UDP_RESOLVE_RETRY_MS = 30000; // after a failed refresh, keep the old one this long
 // The last hellos sent this boot: a random nonce the relay echoes, and when
@@ -1499,19 +1516,34 @@ static volatile bool s_udp_dead = false;  // the task could not start; do not st
 
 static void udpTask(void *);
 
-// Started by the first 200 that hands over a token: before that UDP has
-// nothing to do, and the first TLS handshake gets the whole heap.
+// Runs only while it has work: from the first 200 that hands over a token,
+// and never across a TLS handshake or a firmware download. Then the task
+// closes its socket, frees its HMAC context and deletes itself, so its stack,
+// its socket and every strip queued in lwIP go back to the heap.
 static void udpStart() {
-  if (s_udp_task || s_udp_dead) return;
-  xTaskCreatePinnedToCore(udpTask, "udp", UDP_STACK, nullptr, 2, &s_udp_task, 0);
+  s_udp_stop = false;  // also cancels a stop the task has not acted on yet
+  if (s_udp_task || s_udp_dead || !udpHasToken()) return;
+  // FreeRTOS writes the handle before the task can run, and the task, which
+  // outranks this one, may exit at once and clear it again.
+  xTaskCreatePinnedToCore(udpTask, "udp", UDP_STACK, nullptr, 2, (TaskHandle_t *)&s_udp_task, 0);
 }
 
-// Closes the UDP socket and holds the task while a TLS handshake or a firmware
-// download needs the heap. Queued strips sit in lwIP buffers until read.
-static void udpPause(bool on) {
-  s_udp_pause = on;
-  if (!on || !s_udp_task) return;
-  for (int i = 0; i < 40 && !s_udp_closed; i++) delay(25);
+// Returns once the task is gone, or after UDP_STOP_MS if it is stuck in a DNS
+// lookup. The idle task frees a deleted task's stack, so wait a tick after.
+static const uint32_t UDP_STOP_MS = 8000;
+
+static void udpStop() {
+  if (!s_udp_task) return;
+  s_udp_stop = true;
+  for (uint32_t t = millis(); s_udp_task && millis() - t < UDP_STOP_MS;) delay(10);
+  delay(20);
+}
+
+static void udpExit(int sock) {
+  if (sock >= 0) close(sock);
+  mbedtls_md_free(&s_mac);
+  s_udp_task = nullptr;
+  vTaskDelete(nullptr);
 }
 
 static void udpTask(void *) {
@@ -1520,8 +1552,7 @@ static void udpTask(void *) {
       mbedtls_md_hmac_starts(&s_mac, (const uint8_t *)PXT_RELAY_KEY, strlen(PXT_RELAY_KEY)) != 0) {
     Serial.println("[udp] no HMAC, frames stay on the stream");
     s_udp_dead = true;
-    s_udp_task = nullptr;  // /state reads this task's stack; it must not name a deleted one
-    vTaskDelete(nullptr);
+    udpExit(-1);
     return;
   }
   int sock = -1;
@@ -1529,15 +1560,13 @@ static void udpTask(void *) {
   bool known = false;  // relay holds an address
   uint32_t resolved = 0, hello = 0;
   for (;;) {
-    if (s_udp_pause && sock >= 0) {
-      // A firmware download needs the heap its TLS handshake asks for; an open
-      // socket keeps queued datagrams in it.
-      close(sock);
-      sock = -1;
+    s_udp_stack_free = uxTaskGetStackHighWaterMark(nullptr);
+    if (s_udp_stop) {
+      udpExit(sock);
+      return;
     }
-    s_udp_closed = sock < 0;
-    if (WiFi.status() != WL_CONNECTED || !s_fb || s_udp_pause) {
-      delay(s_udp_pause ? 50 : 500);
+    if (WiFi.status() != WL_CONNECTED || !s_fb) {
+      delay(500);
       continue;
     }
     if (sock < 0 && (sock = udpOpen()) < 0) {
@@ -1621,9 +1650,11 @@ static void pullTask(void *) {
     IPAddress rip;
     int drc = WiFi.hostByName(PXT_RELAY_HOST, rip);
     snprintf(s_pull_dns, sizeof(s_pull_dns), "%s", drc == 1 ? rip.toString().c_str() : "fail");
-    udpPause(true);
+    udpStop();
+    s_hs_heap = ESP.getFreeHeap();
+    s_hs_block = ESP.getMaxAllocHeap();
     bool connected = c.connect(PXT_RELAY_HOST, PXT_RELAY_PORT);
-    udpPause(false);
+    udpStart();  // keeps UDP frames coming while TLS is down; a no-op before the first token
     if (!connected) {
       s_pull_errors++;
       s_pull_code = -1;
@@ -1726,9 +1757,9 @@ static void pullTask(void *) {
   stream_end:
     c.stop();
     if (s_ota_pending) {
-      udpPause(true);
+      udpStop();
       otaRun();
-      udpPause(false);
+      udpStart();
     }
     delay(300);
   }
@@ -1746,13 +1777,18 @@ void setup() {
     s_magic = BOOT_MAGIC;
     s_boots = 0;
     s_last_rc = 0;
+    s_guard_hit = 0;
   }
-  s_boots++;
+  // Only a crash, a watchdog, a brownout or the panel guard counts. Power on,
+  // the EN pin (every serial tool pulses it) and asked-for restarts start over.
+  bool guard = s_guard_hit == GUARD_MAGIC;
+  s_guard_hit = 0;
+  s_boots = bootCounts(esp_reset_reason(), guard) ? s_boots + 1 : 0;
 
   loadConfig();
   settlePending();
-  if (s_boots > MAX_PANEL_ATTEMPTS) {
-    Serial.printf("[pxt] safe mode: %u boot attempts\n", (unsigned)s_boots);
+  if (s_boots >= MAX_PANEL_ATTEMPTS) {
+    Serial.printf("[pxt] safe mode: %u failed boots in a row\n", (unsigned)s_boots);
     s_safe = true;
   }
 
@@ -1806,7 +1842,7 @@ void setup() {
   onAuth("/reboot", HTTP_POST, []() {
     s_http.send(200, "text/plain", "rebooting");
     delay(300);
-    restartOnPurpose();
+    ESP.restart();
   });
   s_http.onNotFound([]() {
     if (s_http.method() == HTTP_OPTIONS) {
@@ -1842,13 +1878,13 @@ static void serialLine(String line) {
   } else if (line == "reboot") {
     Serial.println("rebooting");
     delay(200);
-    restartOnPurpose();
+    ESP.restart();
   } else if (line.startsWith("bright ")) {
     int v = line.substring(7).toInt();
     s_brightness = (uint8_t)constrain(v, 0, 255);
-    s_prefs.begin("pxt", false);
+    prefsBegin(false);
     s_prefs.putUChar("bright", s_brightness);
-    s_prefs.end();
+    prefsEnd();
     panel_setBrightness(s_brightness);
     Serial.printf("brightness %u\n", s_brightness);
   } else if (line.startsWith("panel ")) {
@@ -1883,13 +1919,13 @@ static void serialLine(String line) {
       return;
     }
     String ssid = line.substring(5, sp), pass = line.substring(sp + 1);
-    s_prefs.begin("pxt", false);
+    prefsBegin(false);
     s_prefs.putString("ssid", ssid);
     s_prefs.putString("pass", pass);
-    s_prefs.end();
+    prefsEnd();
     Serial.printf("wifi saved for %s, rebooting\n", ssid.c_str());
     delay(200);
-    restartOnPurpose();
+    ESP.restart();
   } else {
     Serial.println("cmds: state | test | bright N | panel A D [serp] [inv] | wifi SSID PASS | reboot");
   }

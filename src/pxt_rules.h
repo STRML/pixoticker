@@ -65,3 +65,29 @@ inline const char *resetName(int r) {
                                       "jtag",     "efuse",  "pwr_glitch", "cpu_lockup"};
   return (r >= 0 && r < (int)(sizeof(names) / sizeof(names[0]))) ? names[r] : "unknown";
 }
+
+// A first whole frame proves the image that drew it. The pending hash may be
+// promoted only from that image's own slot: an upload records B as pending
+// while A is still running, and A's frame must not promote B. A hash with no
+// slot comes from older firmware and promotes as before.
+inline bool otaMayPromote(const char *pending_slot, const char *running_slot) {
+  return !pending_slot[0] || !strcasecmp(pending_slot, running_slot);
+}
+
+// Whether the boot that just ended counts toward safe mode: a crash, a
+// watchdog, a brownout, or the panel guard's restart. Power on, the EN pin
+// (opening the serial port pulses it) and restarts the firmware asked for do
+// not. Codes are esp_reset_reason_t's.
+inline bool bootCounts(int reason, bool guard_fired) {
+  switch (reason) {
+    case 4:  // panic
+    case 5:  // int_wdt
+    case 6:  // task_wdt
+    case 7:  // wdt
+    case 9:  // brownout
+    case 15:  // cpu_lockup
+      return true;
+    default:
+      return guard_fired;
+  }
+}

@@ -142,6 +142,26 @@ static void resetNames() {
         !strcmp(resetName(-1), "unknown") && !strcmp(resetName(99), "unknown"));
 }
 
+static void otaPromote() {
+  // A is in app0. B was uploaded into app1 and waits for the reboot; A draws
+  // its first frame in the meantime. That frame proves A, not B.
+  check("a frame from the old image does not promote the new image's hash", !otaMayPromote("app1", "app0"));
+  check("B's own first frame promotes B", otaMayPromote("app1", "app1"));
+  check("a hash with no slot (older firmware) promotes as before", otaMayPromote("", "app0"));
+}
+
+static void bootCounting() {
+  // Codes are esp_reset_reason_t's (see resetName).
+  check("a panic counts as a failed boot", bootCounts(4, false));
+  check("a task watchdog counts as a failed boot", bootCounts(6, false));
+  check("an interrupt watchdog counts as a failed boot", bootCounts(5, false));
+  check("a brownout counts as a failed boot", bootCounts(9, false));
+  check("the panel guard's restart counts as a failed boot", bootCounts(3, true));
+  check("power on does not count", !bootCounts(1, false));
+  check("the EN pin (a serial port opening) does not count", !bootCounts(2, false));
+  check("a restart the firmware asked for does not count", !bootCounts(3, false));
+}
+
 int main() {
   startsOnTcp();
   noTokenEver();
@@ -155,6 +175,8 @@ int main() {
   otaCurrent();
   otaPendingAtBoot();
   resetNames();
+  otaPromote();
+  bootCounting();
   printf(failed ? "SOME FAILED\n" : "ALL PASS\n");
   return failed ? 1 : 0;
 }

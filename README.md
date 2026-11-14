@@ -323,8 +323,9 @@ The memory fields in `/state` say whether a TLS handshake has room. The relay's
 | `maxblock` | largest free block now; a handshake needs one big contiguous block |
 | `minheap` | lowest free heap since boot. A handshake that failed with an allocation error shows here as a low mark |
 | `reset` | why the previous boot ended: `poweron`, `sw` (asked for), `panic`, `task_wdt`, `int_wdt`, `brownout`, ... |
-| `udp_stack` | bytes of the UDP task's stack never used; 0 until UDP starts |
-| `boots` | failed boots in a row; above 2 the panel boots safe |
+| `udp_stack` | bytes of the UDP task's stack never used, as it last measured; 0 until UDP starts |
+| `hsheap`, `hsblock` | free heap and largest block as the last TLS handshake began, with the UDP task stopped. The handshake needs room from here; compare with `minheap` |
+| `boots` | failed boots in a row (crashes, watchdogs, the panel guard); at 2 the panel boots safe |
 
 Frames are 128×64 RGB565, big-endian. The panel is wired with green and blue
 swapped, so a client that packs RGB565 itself has to swap them too:
@@ -467,9 +468,10 @@ update it waits for one complete frame; if none arrives it resets into the
 previous image. A boot counter plus a one-shot timer catches a panel
 configuration that hangs boot, and `/safe` (or two failed boots in a row) boots
 with the panel disabled so the HTTP API stays reachable. A boot counts as failed
-until it has stayed up for 60 s, so a crash or a watchdog reset later in boot
-counts too. A restart the firmware asks for (a reboot op, an update, a settings
-change) clears the counter first.
+when it ended in a crash, a watchdog, a brownout or the panel guard's restart,
+judged by the reset reason the next boot reads. Power on, the EN pin (every
+serial tool pulses it) and restarts the firmware asks for do not count. The
+count starts over once a boot stays up for 60 s.
 
 **Dump your own stock firmware before replacing it.** The vendor image is not
 included here and must not be redistributed; a full 4 MB read over the serial
@@ -510,6 +512,10 @@ macOS system python3 lacks, so they re-run themselves under PlatformIO's Python
   antenna away from the modules and their ribbon cable is the hardware fix.
 - One TLS session at a time while starting up: the ESP32 needs a contiguous
   block for the RSA handshake, and two sessions do not fit.
+- The UDP task stops for every TLS handshake and firmware download: it closes
+  its socket and deletes itself, so its stack and every strip queued in lwIP
+  go back to the heap first. It starts again once the handshake returns. With
+  it running, handshakes after the first ran out of heap.
 - The panel reports its state in an `X-Pxt-State` header on the stream request,
   so telemetry costs no second TLS session. A relay that never sees the panel
   reconnect will show a stale `device_age`. The `_sent` field in `/device` does
