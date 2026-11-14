@@ -5,38 +5,28 @@
 #include <stdint.h>
 #include <strings.h>
 
-// Which channel carries frames. UDP until it has been silent for `silent_ms`
-// since the panel first held a stream token in this mode; then the stream,
-// until UDP has been steady again. Called from every loop of the pull task,
-// whether or not a stream is open.
+// Which channel carries frames. The panel starts with frames on the TLS
+// stream and moves them to UDP only once it holds a token from its last 200
+// and UDP has been steady. It drops back to the stream the moment either
+// fails. The invariant: it never asks for a frame-free stream without a
+// token and a valid datagram within the silence window. Called on every pass
+// of the pull task, with or without an open stream.
 struct UdpMode {
-  bool udp = true;
-  bool timing = false;    // this mode has held a token
-  uint32_t token_at = 0;  // millis() when it first did
+  bool udp = false;
 };
 
 enum UdpSwitch { UDP_STAY, UDP_TO_STREAM, UDP_TO_UDP };
 
-inline UdpSwitch udpModeStep(UdpMode &m, uint32_t now, bool token, bool alive, bool steady,
-                             uint32_t silent_ms) {
-  if (!m.udp) {
-    if (!steady) return UDP_STAY;
+inline UdpSwitch udpModeStep(UdpMode &m, bool token, bool alive, bool steady) {
+  if (m.udp && !(token && alive)) {
+    m.udp = false;
+    return UDP_TO_STREAM;
+  }
+  if (!m.udp && token && alive && steady) {
     m.udp = true;
-    m.timing = token;
-    m.token_at = now;
     return UDP_TO_UDP;
   }
-  // A relay that hands out no token (an old one) sends frames on the stream
-  // anyway, so there is nothing to fall back from.
-  if (!token) return UDP_STAY;
-  if (!m.timing) {
-    m.timing = true;
-    m.token_at = now;
-  }
-  if (alive || now - m.token_at <= silent_ms) return UDP_STAY;
-  m.udp = false;
-  m.timing = false;
-  return UDP_TO_STREAM;
+  return UDP_STAY;
 }
 
 // An OTA op for the image already confirmed, or for the one installed and
@@ -45,4 +35,12 @@ inline UdpSwitch udpModeStep(UdpMode &m, uint32_t now, bool token, bool alive, b
 // image proves itself.
 inline bool otaIsCurrent(const char *sha, const char *installed, const char *pending) {
   return (installed[0] && !strcasecmp(sha, installed)) || (pending[0] && !strcasecmp(sha, pending));
+}
+
+// The pending hash names the image waiting for its first whole frame. If the
+// running image is already confirmed, that image never proved itself and the
+// bootloader went back: the hash is stale and must not count as current, or
+// be promoted when this image draws.
+inline bool otaPendingStale(bool running_confirmed, bool has_pending) {
+  return running_confirmed && has_pending;
 }

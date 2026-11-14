@@ -95,6 +95,7 @@ class Handler(BaseHTTPRequestHandler):
     # response carries a Content-Length, so keep-alive is safe.
     protocol_version = "HTTP/1.1"
     key = ""
+    udp = False  # the UDP channel is on; only then does a stream get a token
 
     def log_message(self, fmt, *args):
         pass
@@ -265,7 +266,7 @@ class Handler(BaseHTTPRequestHandler):
         self.udp_token = None
         mine = self._register(frames)
         self.send_response(200)
-        if self.udp_token:
+        if self.udp_token and self.udp:
             self.send_header("X-Pxt-Udp", self.udp_token.hex())
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Transfer-Encoding", "chunked")
@@ -558,6 +559,7 @@ def main():
 
     if args.udp_port:
         start_udp(args.bind, args.udp_port, Handler.key)
+        Handler.udp = True
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     print(f"{VERSION} on {args.bind}:{args.port}", flush=True)
     srv.serve_forever()

@@ -180,8 +180,8 @@ curl -H "X-Api-Key: $KEY" -d '{"layout":"rows"}' http://board-host:18101/layout 
 
    Frames go out on UDP port 18102 (`--udp-port`, 0 turns it off). That port
    must reach the relay from the internet, so bind it with `--bind 0.0.0.0` or
-   forward it, and open it in the firewall. Without it the panel falls back to
-   frames on the TLS stream.
+   forward it, and open it in the firewall. Without it the panel keeps frames
+   on the TLS stream. With `--udp-port 0` the relay offers no UDP at all.
 
    Put it behind nginx with a Let's Encrypt certificate:
 
@@ -265,7 +265,9 @@ The panel closes its stream before it downloads, since a second TLS session
 doesn't fit beside the first. It installs only when the size and SHA-256 match,
 and it ignores an op for the image it already runs, or for the one it just
 installed that has not shown its first whole frame yet, so a re-queued op never
-reinstalls.
+reinstalls. If that new image resets before its first whole frame and the
+bootloader goes back, the old image forgets the failed one at boot, so a
+retried op installs it again.
 
 ## Panel API
 
@@ -387,7 +389,7 @@ shows. Nobody without the key can change it. Ops and the key never travel by UDP
 
 ### TLS stream
 
-The panel asks for `GET /stream?enc=rle&frames=0`. With `frames=0` the stream
+In UDP mode the panel asks for `GET /stream?enc=rle&frames=0`. With `frames=0` the stream
 carries ops and a keepalive every 15 s, and no frames. Each chunk starts with
 a four-byte magic:
 
@@ -405,11 +407,15 @@ PXTR + seq + runs            the same frame, run encoded (enc=rle, no frames=0 o
   before a relay restart), the relay treats it as zero.
 - The panel reconnects after 45 s without a byte.
 
-**Fallback.** When no valid datagram has arrived for 10 s since the panel got
-its stream token, the panel reconnects without `frames=0` and takes frames on
-the stream, as old firmware does. It keeps saying hello. After 30 s of valid
-datagrams it moves frames back to UDP, even while the stream cannot connect.
-A blocked UDP port never leaves the panel dark. Old firmware never sends the
+**Start on TCP, upgrade to UDP.** The panel always starts with frames on the
+stream, as old firmware does. It says hello on UDP once a 200 gives it a
+token. After 30 s of valid datagrams it reconnects with `frames=0`. It drops
+back to frames on the stream the moment its last 200 carried no token (a relay
+without UDP, or a proxy that strips the header) or no valid datagram has come
+for 10 s (UDP blocked, relay restarted). A reconnect while UDP is live stays
+on UDP. The rule: the panel never asks for a frame-free stream without a token
+and a valid datagram in the last 10 s, so it is never dark for longer than
+that. Old firmware never sends the
 flag and gets frames on the stream as before, at most 4 a second
 (`STREAM_FPS`).
 

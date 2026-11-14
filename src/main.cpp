@@ -914,6 +914,21 @@ static void rememberInstalled(const String &shaHex) {
   s_prefs.end();
 }
 
+// At boot: a pending hash beside an image the bootloader already holds as
+// confirmed names an image that reset before its first whole frame and was
+// rolled back. Drop it, so it is neither skipped as current nor promoted.
+static void forgetStalePending() {
+  esp_ota_img_states_t st;
+  bool confirmed = esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK &&
+                   st == ESP_OTA_IMG_VALID;
+  s_prefs.begin("pxt", false);
+  if (otaPendingStale(confirmed, s_prefs.isKey("otapending"))) {
+    s_prefs.remove("otapending");
+    Serial.println("[ota] rolled back: dropped the pending image");
+  }
+  s_prefs.end();
+}
+
 static void promoteInstalled() {
   s_prefs.begin("pxt", false);
   String pending = s_prefs.getString("otapending", "");
@@ -1206,12 +1221,13 @@ static bool udpTokenParse(const char *hex, uint8_t t[NONCE_BYTES]) {
   return true;
 }
 
-// Only a 200 hands over a token: a failed connect or an error answer leaves
-// the relay's token as it was, and so the panel's.
-static void udpTokenSet(const uint8_t t[NONCE_BYTES]) {
+// Only a 200 sets the token: a failed connect or an error answer leaves the
+// relay's token as it was, and so the panel's. A 200 without one (null) means
+// this relay, or a proxy on the way, offers no UDP, and clears it.
+static void udpTokenSet(const uint8_t *t) {
   panel_lock();
-  memcpy(s_udp_token, t, NONCE_BYTES);
-  s_udp_token_ok = true;
+  if (t) memcpy(s_udp_token, t, NONCE_BYTES);
+  s_udp_token_ok = t != nullptr;
   panel_unlock();
 }
 
@@ -1471,7 +1487,7 @@ static const uint32_t STREAM_IDLE_MS = 45000;  // three keepalives missed
 // and one quiet spell must not leave it on the stream, where frames can queue.
 // True when frames moved channel.
 static bool modeTick(UdpMode &m) {
-  UdpSwitch sw = udpModeStep(m, millis(), udpHasToken(), udpAlive(), udpSteady(), UDP_SILENT_MS);
+  UdpSwitch sw = udpModeStep(m, udpHasToken(), udpAlive(), udpSteady());
   if (sw == UDP_STAY) return false;
   s_udp_draws = m.udp;
   Serial.println(m.udp ? "[pull] udp steady, frames back on udp" : "[pull] udp silent, frames on the stream");
@@ -1563,7 +1579,7 @@ static void pullTask(void *) {
       delay(3000);
       continue;
     }
-    if (got_token) udpTokenSet(token);
+    udpTokenSet(got_token ? token : nullptr);  // a 200 without one: this relay or path offers no UDP
     set_phase(mode.udp ? "udp" : "stream");
     FrameSink sink;
     // One bulk read per socket wake-up. Reading the chunk headers a byte at a
@@ -1641,6 +1657,7 @@ void setup() {
   s_boots++;
 
   loadConfig();
+  forgetStalePending();
   if (s_boots > MAX_PANEL_ATTEMPTS) {
     Serial.printf("[pxt] safe mode: %u boot attempts\n", (unsigned)s_boots);
     s_safe = true;

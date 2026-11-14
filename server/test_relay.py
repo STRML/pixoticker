@@ -704,9 +704,9 @@ def op_too_big():
 RUNNING = []
 
 
-def start_relay(key_file, fw_file):
+def start_relay(key_file, fw_file, udp_port=UDP_PORT):
     proc = subprocess.Popen([sys.executable, RELAY, "--port", str(PORT), "--key-file", key_file,
-                             "--firmware", fw_file, "--udp-port", str(UDP_PORT)],
+                             "--firmware", fw_file, "--udp-port", str(udp_port)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     RUNNING.append(proc)
     for _ in range(50):
@@ -749,6 +749,15 @@ def udp_relay_restart(key_file, fw_file):
     t.close()
 
 
+def udp_off(key_file, fw_file):
+    # A relay with UDP turned off must not offer it: the panel keeps frames on
+    # the stream when its 200 carries no token.
+    stop_relay()
+    start_relay(key_file, fw_file, udp_port=0)
+    b = register(40)
+    check("a relay with UDP off hands out no token", b.token == b"")
+
+
 def main():
     with tempfile.NamedTemporaryFile("w", suffix=".key") as kf, tempfile.NamedTemporaryFile(suffix=".bin") as fwf:
         kf.write(KEY)
@@ -777,6 +786,7 @@ def main():
             old_stream()
             op_too_big()
             udp_relay_restart(kf.name, fwf.name)
+            udp_off(kf.name, fwf.name)
         finally:
             while RUNNING:
                 stop_relay()
