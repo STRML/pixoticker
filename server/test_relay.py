@@ -570,6 +570,37 @@ def udp_restart_seq():
     check("after a relay restart the panel's higher seq is passed, so the current frame shows",
           bool(p.shows) and p.shows[-1][0] > seq + 100000)
     check("frames after that keep counting up from there", post_frame(noise()) > seq + 100000)
+
+    # Ops can carry the relay's counter past the panel's seq while the frame
+    # it holds stays below it. The frame is what the panel compares.
+    frame = noise()
+    fseq = post_frame(frame)
+    for _ in range(5):
+        req("/op", json.dumps({"type": "brightness", "value": 50}).encode())
+    collect(s)
+    b.hello(s, newest=fseq + 3)
+    p = Panel(b)
+    p.cur = fseq + 3
+    p.take(collect(s))
+    check("a held frame below the panel's seq is restamped even when ops moved the counter past it",
+          bool(p.shows) and p.shows[-1][0] > fseq + 3 and bytes(p.fb) == frame)
+    s.close()
+
+
+def udp_strip_order():
+    # If the panel's small UDP queue drops the tail of every burst, a fixed
+    # order would starve the same rows forever and no frame would ever be
+    # whole. Each frame starts at a different strip.
+    b = register(7)
+    s = udp_sock()
+    b.hello(s)
+    collect(s)
+    firsts = []
+    for _ in range(4):
+        post_frame(noise())
+        got = strips_of(collect(s))
+        firsts.append(got[0][SESSION] if got else None)
+    check("each frame's strips start at a different index", len(set(firsts)) == 4, f"first={firsts}")
     s.close()
 
 
@@ -737,6 +768,7 @@ def main():
             udp_loss_order_tamper()
             udp_slow_panel()
             udp_restart_seq()
+            udp_strip_order()
             udp_sent_counter()
             udp_replay()
             no_wall_clock()

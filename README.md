@@ -24,6 +24,7 @@ src/                firmware (Arduino, ESP32)
   main.cpp          boot, HTTP API, relay pull loop, OTA, Wi-Fi setup page
   panel.cpp/.h      HUB75 setup, drawing, panel configuration
   relay_ca.h        ISRG Root X1, pinned so the relay chain verifies
+  pxt_rules.h       pure decisions (UDP or stream, OTA image already here), host-tested
   secrets.h.example  copy to secrets.h: relay host, port, key
 server/
   pxtrelay.py       relay: frame store, stream, ops, firmware hosting
@@ -45,6 +46,8 @@ tools/
   font46.py         4x6 pixel font (X11 Misc-Fixed, public domain)
   bdf2font.py       turn a BDF font into a table like font46.py
   test_publish_fw.py  loopback checks for publish_fw.sh (no hardware needed)
+  test_rules.cpp    host checks for src/pxt_rules.h:
+                    c++ -std=c++17 -Isrc tools/test_rules.cpp -o /tmp/t && /tmp/t
 board/              cluster status board: node agents post GPU, memory and token rates
   agent.py          per-Mac agent (stdlib, Python 3.9): ioreg GPU %, vm_stat memory %, mlx-serve rates
   board.py          ingest, layout rotation, LED-style preview gallery, pushes frames to the relay
@@ -260,7 +263,8 @@ The script:
 
 The panel closes its stream before it downloads, since a second TLS session
 doesn't fit beside the first. It installs only when the size and SHA-256 match,
-and it ignores an op for the image it already runs, so a re-queued op never
+and it ignores an op for the image it already runs, or for the one it just
+installed that has not shown its first whole frame yet, so a re-queued op never
 reinstalls.
 
 ## Panel API
@@ -353,6 +357,8 @@ rest of the datagram. Integers are big-endian.
   board frame is 5.6 KB run encoded against 16 KB raw.
 - The relay always sends its newest frame. Frames posted while it sends are
   skipped, never queued.
+- Each frame's strips start at a different index, so a panel whose UDP queue
+  drops the end of each burst still gets every row over a few frames.
 - The panel drops a strip with a bad MAC, and a strip older than the newest
   seq it holds. It shows a frame once all its strips arrive, or 250 ms after
   the first strip of a frame it has not shown, so lost strips never freeze it.
@@ -399,9 +405,10 @@ PXTR + seq + runs            the same frame, run encoded (enc=rle, no frames=0 o
   before a relay restart), the relay treats it as zero.
 - The panel reconnects after 45 s without a byte.
 
-**Fallback.** When no valid datagram has arrived for 10 s, the panel reconnects
-without `frames=0` and takes frames on the stream, as old firmware does. It
-keeps saying hello. After 30 s of valid datagrams it moves frames back to UDP.
+**Fallback.** When no valid datagram has arrived for 10 s since the panel got
+its stream token, the panel reconnects without `frames=0` and takes frames on
+the stream, as old firmware does. It keeps saying hello. After 30 s of valid
+datagrams it moves frames back to UDP, even while the stream cannot connect.
 A blocked UDP port never leaves the panel dark. Old firmware never sends the
 flag and gets frames on the stream as before, at most 4 a second
 (`STREAM_FPS`).
@@ -441,6 +448,10 @@ assume physical access. All three tools take `--port`.
 
 ## Known limits
 
+- Any client that opens `/stream` with an `X-Pxt-State` header replaces the
+  device the relay tracks and its UDP token. Only the panel sends that header,
+  and it needs the key, so this is the same rule `/device` already follows:
+  one panel per relay.
 - One TLS session at a time while starting up: the ESP32 needs a contiguous
   block for the RSA handshake, and two sessions do not fit.
 - The panel reports its state in an `X-Pxt-State` header on the stream request,

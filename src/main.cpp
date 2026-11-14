@@ -27,6 +27,7 @@
 
 #include "panel.h"
 #include "relay_ca.h"
+#include "pxt_rules.h"
 
 RTC_NOINIT_ATTR static uint32_t s_magic;
 RTC_NOINIT_ATTR static uint32_t s_boots;
@@ -937,12 +938,11 @@ static void otaOp(const char *js) {
     Serial.println("[ota] bad op");
     return;
   }
-  if (!s_ota_installed.length()) {
-    s_prefs.begin("pxt", true);
-    s_ota_installed = s_prefs.getString("otasha", "");
-    s_prefs.end();
-  }
-  if (sha.equalsIgnoreCase(s_ota_installed)) {
+  s_prefs.begin("pxt", true);
+  if (!s_ota_installed.length()) s_ota_installed = s_prefs.getString("otasha", "");
+  String pending = s_prefs.getString("otapending", "");
+  s_prefs.end();
+  if (otaIsCurrent(sha.c_str(), s_ota_installed.c_str(), pending.c_str())) {
     Serial.println("[ota] already running this image");
     return;
   }
@@ -1000,20 +1000,27 @@ static void applyOp(const char *js) {
   }
 }
 
+// The first complete frame proves a new image. frameShown only flags it: the
+// pull task, with the large stack and the other NVS writers, confirms it.
+static volatile bool s_confirm_due = false;
+
 // Every drawn frame, from the stream or from UDP, goes through here with
-// panel_lock held. The first complete frame proves a new image and cancels
-// its rollback; NVS writes stay under the one lock.
+// panel_lock held.
 static void frameShown(uint32_t seq, bool complete) {
   panel_show(s_fb);
   s_pull_frames = s_pull_frames + 1;
   s_pull_seq = seq;
   if (complete) s_whole = s_whole + 1;
-  if (complete && !s_healthy) {
-    s_healthy = true;
-    esp_ota_mark_app_valid_cancel_rollback();
-    promoteInstalled();
-    Serial.println("[ota] image confirmed");
-  }
+  if (complete && !s_healthy) s_confirm_due = true;
+}
+
+// Cancels the rollback and records the image. Runs on the pull task only.
+static void confirmImage() {
+  if (!s_confirm_due || s_healthy) return;
+  s_healthy = true;
+  esp_ota_mark_app_valid_cancel_rollback();
+  promoteInstalled();
+  Serial.println("[ota] image confirmed");
 }
 
 struct FrameSink {
@@ -1163,6 +1170,9 @@ static volatile uint32_t s_udp_last = 0;       // millis of the last valid datag
 static volatile uint32_t s_udp_since = 0;      // start of the current run of valid datagrams
 static volatile bool s_udp_draws = true;       // false while the stream carries frames
 static volatile bool s_udp_pause = false;      // a firmware download owns the link
+static volatile bool s_udp_closed = true;      // the UDP task holds no socket
+static const uint32_t UDP_RESOLVE_MS = 300000;      // refresh the relay's address this often
+static const uint32_t UDP_RESOLVE_RETRY_MS = 30000; // after a failed refresh, keep the old one this long
 // The last hellos sent this boot: a random nonce the relay echoes, and when
 // each went out by millis(). No wall clock feeds any UDP check.
 struct Hello {
@@ -1186,24 +1196,30 @@ static int hexNibble(char c) {
   return -1;
 }
 
-static void udpToken(const char *hex) {
-  uint8_t t[NONCE_BYTES];
+static bool udpTokenParse(const char *hex, uint8_t t[NONCE_BYTES]) {
   for (size_t i = 0; i < NONCE_BYTES; i++) {
     int hi = hexNibble(hex[2 * i]);
     int lo = hi < 0 ? -1 : hexNibble(hex[2 * i + 1]);
-    if (lo < 0) return;
+    if (lo < 0) return false;
     t[i] = (uint8_t)(hi << 4 | lo);
   }
+  return true;
+}
+
+// Only a 200 hands over a token: a failed connect or an error answer leaves
+// the relay's token as it was, and so the panel's.
+static void udpTokenSet(const uint8_t t[NONCE_BYTES]) {
   panel_lock();
   memcpy(s_udp_token, t, NONCE_BYTES);
   s_udp_token_ok = true;
   panel_unlock();
 }
 
-static void udpTokenDrop() {
+static bool udpHasToken() {
   panel_lock();
-  s_udp_token_ok = false;
+  bool ok = s_udp_token_ok;
   panel_unlock();
+  return ok;
 }
 
 static bool udpAlive() {
@@ -1344,7 +1360,9 @@ static bool udpHello(int sock, const sockaddr_in &to) {
   memcpy(d + 4 + NONCE_BYTES, s_udp_token, NONCE_BYTES);
   panel_unlock();
   if (!ok) return false;  // no control stream yet: the relay would drop the hello
-  uint32_t newest = s_pull_seq > s_uf.seq ? (uint32_t)s_pull_seq : s_uf.seq;
+  // The seq below which this panel drops a strip. The relay restamps a held
+  // frame that sits below it.
+  uint32_t newest = s_uf.seq;
   Hello &h = s_hellos[s_hello_at];
   esp_fill_random(h.nonce, NONCE_BYTES);
   h.ms = millis() | 1;
@@ -1402,10 +1420,18 @@ static void udpTask(void *) {
   }
   int sock = -1;
   sockaddr_in relay = {};
+  bool known = false;  // relay holds an address
   uint32_t resolved = 0, hello = 0;
   for (;;) {
+    if (s_udp_pause && sock >= 0) {
+      // A firmware download needs the heap its TLS handshake asks for; an open
+      // socket keeps queued datagrams in it.
+      close(sock);
+      sock = -1;
+    }
+    s_udp_closed = sock < 0;
     if (WiFi.status() != WL_CONNECTED || !s_fb || s_udp_pause) {
-      delay(500);
+      delay(s_udp_pause ? 50 : 500);
       continue;
     }
     if (sock < 0 && (sock = udpOpen()) < 0) {
@@ -1413,12 +1439,17 @@ static void udpTask(void *) {
       continue;
     }
     uint32_t now = millis();
-    if (!resolved || now - resolved > 300000) {
-      if (!udpResolve(relay)) {
+    if (!known || now - resolved > UDP_RESOLVE_MS) {
+      // A failed refresh keeps the last address and tries again later.
+      if (udpResolve(relay)) {
+        known = true;
+        resolved = now;
+      } else if (known) {
+        resolved = now - UDP_RESOLVE_MS + UDP_RESOLVE_RETRY_MS;
+      } else {
         delay(1000);
         continue;
       }
-      resolved = now;
     }
     if ((!hello || now - hello >= UDP_HELLO_MS) && udpHello(sock, relay)) hello = now;
     // Wait briefly for one datagram, then drain the queue before drawing, so
@@ -1435,6 +1466,18 @@ static void udpTask(void *) {
 
 static const uint32_t STREAM_IDLE_MS = 45000;  // three keepalives missed
 
+// Which channel carries frames, checked on every pass of the pull task, with
+// or without an open stream: a blocked UDP port must not leave the panel dark,
+// and one quiet spell must not leave it on the stream, where frames can queue.
+// True when frames moved channel.
+static bool modeTick(UdpMode &m) {
+  UdpSwitch sw = udpModeStep(m, millis(), udpHasToken(), udpAlive(), udpSteady(), UDP_SILENT_MS);
+  if (sw == UDP_STAY) return false;
+  s_udp_draws = m.udp;
+  Serial.println(m.udp ? "[pull] udp steady, frames back on udp" : "[pull] udp silent, frames on the stream");
+  return true;
+}
+
 static void pullTask(void *) {
   if (!strlen(PXT_RELAY_KEY) || !strlen(PXT_RELAY_HOST)) {
     Serial.println("[pull] disabled, no relay configured");
@@ -1443,9 +1486,10 @@ static void pullTask(void *) {
   }
 
   Serial.printf("[pull] %s /pxt/stream, frames on udp %d\n", PXT_RELAY_HOST, PXT_RELAY_UDP_PORT);
-  bool udp = true;  // frames by UDP; false while the stream carries them
-  uint32_t mode_at = millis();
+  UdpMode mode;
   for (;;) {
+    confirmImage();
+    modeTick(mode);
     set_phase("clock");
     if (!clockReady()) {
       delay(500);
@@ -1493,22 +1537,23 @@ static void pullTask(void *) {
     s_tls_verified = !s_tls_insecure;
     s_tls_fails = 0;
     set_phase("request");
-    s_udp_draws = udp;
+    s_udp_draws = mode.udp;
     String req = String("GET /pxt/stream?enc=rle&since=") + String(s_pull_seq) +
-                 (udp ? "&frames=0" : "") + " HTTP/1.1\r\nHost: " + PXT_RELAY_HOST + "\r\nX-Api-Key: " PXT_RELAY_KEY +
-                 "\r\nX-Pxt-State: " + stateHeader() +
+                 (mode.udp ? "&frames=0" : "") + " HTTP/1.1\r\nHost: " + PXT_RELAY_HOST +
+                 "\r\nX-Api-Key: " PXT_RELAY_KEY + "\r\nX-Pxt-State: " + stateHeader() +
                  "\r\nConnection: close\r\n\r\n";
     c.print(req);
     char line[160];
     int status = 0;
+    uint8_t token[NONCE_BYTES];
+    bool got_token = false;
     if (readLine(c, line, sizeof(line), 10000)) sscanf(line, "HTTP/%*s %d", &status);
-    udpTokenDrop();
     while (readLine(c, line, sizeof(line), 10000)) {
       if (!line[0]) break;
       if (!strncasecmp(line, "X-Pxt-Udp:", 10)) {
         const char *v = line + 10;
         while (*v == ' ') v++;
-        udpToken(v);
+        got_token = udpTokenParse(v, token);
       }
     }
     s_pull_code = status;
@@ -1518,7 +1563,8 @@ static void pullTask(void *) {
       delay(3000);
       continue;
     }
-    set_phase(udp ? "udp" : "stream");
+    if (got_token) udpTokenSet(token);
+    set_phase(mode.udp ? "udp" : "stream");
     FrameSink sink;
     // One bulk read per socket wake-up. Reading the chunk headers a byte at a
     // time on a TLS client left the receive window closed and the panel a
@@ -1529,20 +1575,8 @@ static void pullTask(void *) {
     bool in_payload = false;
     uint32_t idle = millis();
     for (;;) {
-      // A blocked UDP port must not leave the panel dark, and one quiet spell
-      // must not leave it on the stream, where frames can queue.
-      if (udp && millis() - mode_at > UDP_SILENT_MS && !udpAlive()) {
-        Serial.println("[pull] udp silent, frames on the stream");
-        udp = s_udp_draws = false;
-        mode_at = millis();
-        break;
-      }
-      if (!udp && udpSteady()) {
-        Serial.println("[pull] udp steady, frames back on udp");
-        udp = s_udp_draws = true;
-        mode_at = millis();
-        break;
-      }
+      confirmImage();
+      if (modeTick(mode)) break;  // reconnect asking for the other channel
       int r = c.read(s_rx, sizeof(s_rx));
       if (r <= 0) {
         if (!c.connected()) break;
@@ -1583,6 +1617,7 @@ static void pullTask(void *) {
     c.stop();
     if (s_ota_pending) {
       s_udp_pause = true;
+      for (int i = 0; i < 40 && !s_udp_closed; i++) delay(25);  // let the UDP task close its socket
       otaRun();
       s_udp_pause = false;
     }

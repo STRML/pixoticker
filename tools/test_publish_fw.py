@@ -2,26 +2,33 @@
 """Loopback checks for tools/publish_fw.sh: a real relay, a fake panel, stub
 pio/ssh, and one run of the script per scenario (about 40 s, in parallel).
 
-    python3 tools/test_publish_fw.py [scenario ...]   # good rollback crashloop blip
+    python3 tools/test_publish_fw.py [scenario ...]   # good rollback crashloop blip udp
 
 Copies the script into a temp tree, stubs pio/ssh, runs the real relay with
 HOME pointed at the temp tree, and plays a panel that takes the ota op and then
 behaves per scenario. Prints the script's exit code and last line per scenario.
 """
+import hashlib
+import hmac
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import struct
 import tempfile
 import threading
 import time
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCENARIOS = sys.argv[1:] or ["good", "rollback", "crashloop", "blip"]
-WANT = {"good": 0, "rollback": 3, "crashloop": 3, "blip": 0}
+SCENARIOS = sys.argv[1:] or ["good", "rollback", "crashloop", "blip", "udp"]
+WANT = {"good": 0, "rollback": 3, "crashloop": 3, "blip": 0, "udp": 0}
+# src/pxt_rules.h otaIsCurrent: an op for the image waiting for its first
+# whole frame is skipped, like one for the confirmed image.
+OTA_SKIPS_PENDING = True
 KEY = os.urandom(16).hex()
 
 STUB_PIO = """#!/bin/sh
@@ -88,6 +95,83 @@ class Panel(threading.Thread):
             return
 
 
+class UdpPanel(threading.Thread):
+    """A panel on the new firmware: a frames=0 control stream, frames by UDP,
+    and whole frames reported in the hello. After the ota op it reboots into
+    the new build, which takes 15 s to show its first whole frame, so
+    publish_fw.sh re-posts the op meanwhile. The op must not reinstall."""
+
+    def __init__(self, port, udp_port):
+        super().__init__(daemon=True)
+        self.port, self.udp_port = port, udp_port
+        self.sock = None
+        self.done = False
+        self.installs = 0
+
+    def connect(self, build, uptime):
+        if self.sock:
+            self.sock.close()
+        self.boot = int.from_bytes(os.urandom(4), "big")
+        self.n = 0
+        self.whole = 0
+        state = json.dumps({"build": build, "uptime": uptime, "frames": 0, "tls": "verified",
+                            "boot": self.boot})
+        s = socket.create_connection(("127.0.0.1", self.port))
+        s.sendall((f"GET /stream?since=0&frames=0 HTTP/1.1\r\nHost: x\r\nX-Api-Key: {KEY}\r\n"
+                   f"X-Pxt-State: {state}\r\nConnection: close\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            head += s.recv(4096)
+        head, self.buf = head.split(b"\r\n\r\n", 1)
+        self.token = next(bytes.fromhex(line.split(b":", 1)[1].strip().decode())
+                          for line in head.split(b"\r\n") if line.lower().startswith(b"x-pxt-udp:"))
+        s.settimeout(0.2)
+        self.sock = s
+
+    def hello(self, u):
+        self.n += 1
+        d = b"PXTH" + os.urandom(8) + self.token + struct.pack(">IIII", self.boot, self.n, 0, self.whole)
+        u.sendto(d + hmac.new(KEY.encode(), d, hashlib.sha256).digest()[:16], ("127.0.0.1", self.udp_port))
+
+    def run(self):
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.bind(("127.0.0.1", 0))
+        u.settimeout(0.05)
+        installed, pending, draw_at = "", "", 0.0
+        self.connect("old", 1000)
+        self.whole = 1
+        said = 0.0
+        while not self.done:
+            if time.time() - said > 1:
+                self.hello(u)
+                said = time.time()
+            try:
+                if u.recv(2048)[:4] == b"PXTS" and time.time() >= draw_at:
+                    self.whole += 1
+                    if pending:
+                        installed, pending = pending, ""
+            except socket.timeout:
+                pass
+            try:
+                self.buf += self.sock.recv(65536)
+            except socket.timeout:
+                pass
+            except OSError:
+                return
+            m = re.search(rb'"type":"ota"[^}]*"sha256":"([0-9a-f]+)"', self.buf)
+            if not m:
+                continue
+            self.buf = b""
+            sha = m.group(1).decode()
+            if sha == installed or (OTA_SKIPS_PENDING and sha == pending):
+                continue
+            self.installs += 1
+            pending = sha
+            time.sleep(1)
+            self.connect("new", 5)
+            draw_at = time.time() + 15
+
+
 def run(scenario, port):
     t = tempfile.mkdtemp(prefix="pubfw-")
     try:
@@ -101,14 +185,15 @@ def run(scenario, port):
         with open(f"{t}/relay.key", "w") as f:
             f.write(KEY)
         env = dict(os.environ, HOME=t, FAKE_HOME=t)
+        udp_port = port + 100 if scenario == "udp" else 0
         relay = subprocess.Popen([sys.executable, f"{ROOT}/server/pxtrelay.py", "--port", str(port),
-                                  "--key-file", f"{t}/relay.key", "--udp-port", "0"], env=env,
+                                  "--key-file", f"{t}/relay.key", "--udp-port", str(udp_port)], env=env,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.8)
         req = urllib.request.Request(f"http://127.0.0.1:{port}/frame", data=bytes(16384),
                                      headers={"X-Api-Key": KEY})
         urllib.request.urlopen(req, timeout=5).read()
-        panel = Panel(port, scenario)
+        panel = UdpPanel(port, udp_port) if scenario == "udp" else Panel(port, scenario)
         panel.start()
         time.sleep(0.5)
         env.update(PATH=f"{t}/bin:" + os.environ["PATH"], PXT_RELAY_URL=f"http://127.0.0.1:{port}",
@@ -120,6 +205,9 @@ def run(scenario, port):
         relay.terminate()
         last = (p.stdout.strip().splitlines() or [""])[-1]
         ok = p.returncode == WANT[scenario]
+        if scenario == "udp":
+            last += f" (installs={panel.installs})"
+            ok = ok and panel.installs == 1
         print(f"{'PASS' if ok else 'FAIL'}  {scenario:9} exit={p.returncode} want={WANT[scenario]}  {last}")
         return ok
     finally:

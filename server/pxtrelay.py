@@ -433,7 +433,11 @@ def strips(frame, seq, key, boot, nonce):
     count = 64 // STRIP_ROWS
     span = STRIP_ROWS * ROW_BYTES
     out = []
-    for i in range(count):
+    # Each frame starts at a different strip. If the panel's small UDP queue
+    # drops the tail of a burst, a fixed order would starve the same rows of
+    # every frame, and no frame would ever arrive whole.
+    for k in range(count):
+        i = (seq + k) % count
         raw = frame[i * span:(i + 1) * span]
         runs = rle565(raw)
         enc, body = (1, runs) if len(runs) < len(raw) else (0, raw)
@@ -467,13 +471,14 @@ def udp_hello(data, addr, key):
             return
         STATE.udp_addr, STATE.udp_boot, STATE.udp_seen = addr, boot, time.monotonic()
         STATE.udp_nonce, STATE.udp_hello_n = nonce, n
-        if newest > STATE.seq:
-            # The counter restarted from the clock below what the panel has
-            # shown, and the panel drops older seqs. Move past it, and restamp
-            # the frame we hold so it shows now.
-            STATE.seq = newest + 1
-            if STATE.frame:
-                STATE.frame_seq = STATE.seq
+        # The counter restarted from the clock below what the panel has shown,
+        # and the panel drops a frame older than that. Move past it, and
+        # restamp the frame we hold when it sits below, even if ops have since
+        # carried the counter above the panel's seq.
+        STATE.seq = max(STATE.seq, newest)
+        if STATE.frame and newest > STATE.frame_seq:
+            STATE.seq += 1
+            STATE.frame_seq = STATE.seq
         # _sent is what the panel says it showed whole: a datagram the link
         # dropped never counts toward proving a new build draws.
         if dev.get("path") == "udp":
