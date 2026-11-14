@@ -189,7 +189,7 @@ def ota_state():
 
 MAC = 16
 HEAD = 21          # PXTS, seq, boot, hello echo, index, count, first row, rows, enc
-LIVE_S = 10        # an echo older than this many seconds of hellos is not live
+LIVE_S = 10        # an echo of a hello older than this many seconds is not live
 ROWS = 64
 ROW_BYTES = 256
 PARTIAL_S = 0.25
@@ -245,9 +245,9 @@ def unrle(body, npx):
 
 
 class Panel:
-    def __init__(self, boot, hello_ts=None):
+    def __init__(self, boot, clock=None):
         self.boot = boot
-        self.hello_ts = hello_ts  # the panel's last hello clock; default: the last one sent
+        self.clock = clock  # the panel's wall clock; default: now
         self.live = 0
         self.fb = bytearray(FRAME)
         self.cur = 0
@@ -265,8 +265,8 @@ class Panel:
             self.bad += 1
             return
         seq, boot, echo = struct.unpack(">III", d[4:16])
-        sent = _hello_ts[0] if self.hello_ts is None else self.hello_ts
-        if boot != self.boot or not sent - LIVE_S <= echo <= sent:
+        wall = time.time() if self.clock is None else self.clock
+        if boot != self.boot or echo > _hello_ts[0] or echo + LIVE_S < wall:
             return
         self.live += 1
         if d[:4] != b"PXTS" or len(d) < HEAD + MAC:
@@ -486,7 +486,7 @@ def udp_session():
     other = Panel(9)
     other.take(got)
     check("a datagram for another boot is dropped", other.live == 0 and not other.shows)
-    later = Panel(8, hello_ts=_hello_ts[0] + LIVE_S + 1)
+    later = Panel(8, clock=time.time() + LIVE_S + 2)
     later.take(got)
     check("a datagram that echoes an old hello is dropped and is not live", later.live == 0 and not later.shows)
     mine = Panel(8)

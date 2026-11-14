@@ -1152,6 +1152,7 @@ static const size_t UDP_MAC = 16;
 static const size_t SESSION_HEAD = 16;         // magic, seq, boot, hello echo
 static const size_t STRIP_HEAD = 21;           // then index, count, first row, rows, enc
 static const uint32_t UDP_ECHO_S = 10;         // a datagram must echo a hello this recent
+static const int UDP_DRAIN_MAX = 24;           // datagrams read per pass before drawing and saying hello
 static const int WIRE_W = 128, WIRE_H = 64;
 
 static uint8_t s_dgram[1472];
@@ -1225,11 +1226,13 @@ static void stripWrite(uint8_t enc, const uint8_t *px, size_t len, uint8_t row0,
   }
 }
 
-// Every datagram names this boot and echoes a recent hello, so a captured one
-// replayed after a reboot, or to fake a live link, is dropped.
+// Every datagram names this boot and echoes a hello this panel sent in the
+// last UDP_ECHO_S seconds of wall time, so a captured one replayed after a
+// reboot, or to fake a live link, is dropped.
 static bool udpSession(const uint8_t *d) {
   uint32_t echo = be32(d + 12);
-  return be32(d + 8) == s_boot_id && echo <= s_hello_ts && echo + UDP_ECHO_S >= s_hello_ts;
+  return be32(d + 8) == s_boot_id && echo <= s_hello_ts &&
+         echo + UDP_ECHO_S >= (uint32_t)time(nullptr);
 }
 
 static void udpFeed(const uint8_t *d, size_t n) {
@@ -1291,8 +1294,7 @@ static void udpHello(int sock, const sockaddr_in &to) {
   uint8_t d[20 + UDP_MAC];
   uint32_t newest = s_pull_seq > s_uf.seq ? (uint32_t)s_pull_seq : s_uf.seq;
   uint32_t ts = (uint32_t)time(nullptr);
-  if (ts <= s_hello_ts) ts = s_hello_ts + 1;  // the relay wants each hello newer than the last
-  s_hello_ts = ts;
+  if (ts > s_hello_ts) s_hello_ts = ts;
   memcpy(d, "PXTH", 4);
   put32(d + 4, ts);
   put32(d + 8, s_boot_id);
@@ -1365,11 +1367,12 @@ static void udpTask(void *) {
       hello = now;
     }
     // Wait briefly for one datagram, then drain the queue before drawing, so
-    // a backlog in lwIP is read through instead of shown frame by frame.
-    int n = recv(sock, s_dgram, sizeof(s_dgram), 0);
-    while (n > 0) {
+    // a backlog in lwIP is read through instead of shown frame by frame. The
+    // cap keeps a flood from holding off the next hello.
+    for (int k = 0; k < UDP_DRAIN_MAX; k++) {
+      int n = recv(sock, s_dgram, sizeof(s_dgram), k ? MSG_DONTWAIT : 0);
+      if (n <= 0) break;
       udpFeed(s_dgram, (size_t)n);
-      n = recv(sock, s_dgram, sizeof(s_dgram), MSG_DONTWAIT);
     }
     udpSettle();
   }
