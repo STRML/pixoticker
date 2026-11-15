@@ -105,30 +105,62 @@ static void randomWalks() {
   check("2000 random walks never break the invariant", ok);
 }
 
-static void otaCurrent() {
-  const char *a = "aaaa", *b = "BBBB";
-  check("the confirmed image is current", otaIsCurrent("AAAA", a, ""));
-  check("the image waiting for its first frame is current too", otaIsCurrent("bbbb", "", b));
-  check("another image is not current", !otaIsCurrent("cccc", a, b));
-  check("empty records match nothing", !otaIsCurrent("cccc", "", ""));
+// Whether an ota op's image is already on the device: its SHA-256 (of the
+// .bin) against the images in the running and the boot partitions, hashed
+// from flash. No record is kept, so there is nothing to get out of step.
+static void otaDecisions() {
+  // An unknown hash (a flash read failed, or an install changed the boot image
+  // mid-hash) must never read as "not here": that would reinstall the running
+  // image into the other slot, over the last good one.
+  check("both known, neither matches: install", otaDecide("cccc", "aaaa", "aaaa") == OTA_INSTALL);
+  check("the running image matches: skip", otaDecide("aaaa", "aaaa", "") == OTA_SKIP);
+  check("the boot image matches: skip", otaDecide("bbbb", "", "bbbb") == OTA_SKIP);
+  check("the running hash unknown: wait, do not install", otaDecide("bbbb", "", "aaaa") == OTA_WAIT);
+  check("the boot hash unknown: wait, do not install", otaDecide("bbbb", "aaaa", "") == OTA_WAIT);
+  check("nothing known: wait", otaDecide("bbbb", "", "") == OTA_WAIT);
 }
 
-static void otaPendingAtBoot() {
-  // The pending hash records the slot it was written to. A is in app0, B was
-  // installed into app1.
-  check("B boots unconfirmed from app1: keep its pending hash",
-        otaPendingFate(true, "app1", "app1", false) == PENDING_KEEP);
-  check("B reset before its first whole frame, back on A in app0: drop B's hash",
-        otaPendingFate(true, "app1", "app0", true) == PENDING_DROP);
-  check("a rollback onto an unconfirmed slot still drops the other slot's hash",
-        otaPendingFate(true, "app1", "app0", false) == PENDING_DROP);
-  check("power lost between B's confirm and its promotion: promote B now",
-        otaPendingFate(true, "app1", "app1", true) == PENDING_PROMOTE);
-  check("a hash with no slot (older firmware) beside an unconfirmed image: keep",
-        otaPendingFate(true, "", "app1", false) == PENDING_KEEP);
-  check("a hash with no slot beside a confirmed image: drop", otaPendingFate(true, "", "app0", true) == PENDING_DROP);
-  check("nothing pending: nothing to do", otaPendingFate(false, "", "app0", true) == PENDING_KEEP);
-  check("after a rollback an op for the failed image is not current", !otaIsCurrent("bbbb", "aaaa", ""));
+static void otaImages() {
+  const char *A = "aaaa", *B = "bbbb", *C = "cccc";
+  check("the running image matches (case does not matter)", otaImageHere("AAAA", A, A));
+  check("an image that is neither running nor booting next is not here", !otaImageHere(C, A, A));
+  check("no hashes yet match nothing", !otaImageHere(C, "", ""));
+  // /u wrote B and committed it; the restart has not happened yet. Running is
+  // A, boot is B. A re-posted op for B must not install it again.
+  check("after a /u install, before its restart, an op for the new image is skipped", otaImageHere(B, A, B));
+  check("after a /u install, an op for a third image is not", !otaImageHere(C, A, B));
+  // B ran on trial, reset before its first whole frame, and the bootloader
+  // went back to A: running and boot are both A.
+  check("after a rollback an op for the failed image installs it again", !otaImageHere(B, A, A));
+  check("after a rollback an op for the image now running is skipped", otaImageHere(A, A, A));
+  // B confirmed its first frame, then power was lost before anything else:
+  // the flash still holds B in both.
+  check("after power loss mid-confirm the running image is still known", otaImageHere(B, B, B));
+}
+
+static void resetNames() {
+  // esp_reset_reason_t values; src/main.cpp static_asserts the ones named here.
+  check("reset 1 is poweron", !strcmp(resetName(1), "poweron"));
+  check("reset 3 is sw", !strcmp(resetName(3), "sw"));
+  check("reset 4 is panic", !strcmp(resetName(4), "panic"));
+  check("reset 6 is task_wdt", !strcmp(resetName(6), "task_wdt"));
+  check("reset 9 is brownout", !strcmp(resetName(9), "brownout"));
+  check("an unknown reset code names itself unknown",
+        !strcmp(resetName(-1), "unknown") && !strcmp(resetName(99), "unknown"));
+}
+
+static void bootCounting() {
+  // Codes are esp_reset_reason_t's (see resetName).
+  check("a panic counts as a failed boot", bootCounts(4, false));
+  check("a task watchdog counts as a failed boot", bootCounts(6, false));
+  check("an interrupt watchdog counts as a failed boot", bootCounts(5, false));
+  check("a brownout counts as a failed boot", bootCounts(9, false));
+  check("the panel guard's restart counts as a failed boot", bootCounts(3, true));
+  check("power on does not count", !bootCounts(1, false));
+  check("the RTC watchdog (wdt: a hang in the bootloader, as after a slow power-up) does not count",
+        !bootCounts(7, false));
+  check("the EN pin (a serial port opening) does not count", !bootCounts(2, false));
+  check("a restart the firmware asked for does not count", !bootCounts(3, false));
 }
 
 int main() {
@@ -141,8 +173,10 @@ int main() {
   relayRestartOnUdp();
   reconnectWhileLive();
   randomWalks();
-  otaCurrent();
-  otaPendingAtBoot();
+  otaImages();
+  otaDecisions();
+  resetNames();
+  bootCounting();
   printf(failed ? "SOME FAILED\n" : "ALL PASS\n");
   return failed ? 1 : 0;
 }

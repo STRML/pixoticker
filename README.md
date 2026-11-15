@@ -40,6 +40,8 @@ tools/
   pixels_demo.py    colour and geometry checks
   mirror.js         mirror a browser canvas of any website onto the panel
   serial_cmd.py     serial helpers
+  serial_port.py    shared by the serial tools: PlatformIO's Python, the one adapter
+  test_serial_port.py  checks for serial_port.py (python3 tools/test_serial_port.py)
   orderbook.js      example: live Deribit BTC-PERPETUAL depth (bun)
   ccusage.py        example: Claude Code spend from ccusage, daily bars
   screen.py         layout helper: chart band over five lines of text
@@ -262,13 +264,15 @@ The script:
 
 The panel closes its stream before it downloads, since a second TLS session
 doesn't fit beside the first. It installs only when the size and SHA-256 match,
-and it ignores an op for the image it already runs, or for the one it just
-installed that has not shown its first whole frame yet, so a re-queued op never
-reinstalls. The pending record names the slot it was written to. If the new
-image resets before its first whole frame and the bootloader goes back to the
-other slot, the old image drops the record at boot, so a retried op installs
-it again. If power is lost between the confirm and the record's promotion, the
-new image finishes the promotion at its next boot.
+and it ignores an op for an image already on it, so a re-queued op never
+reinstalls. It keeps no record of what it installed: it hashes the image in
+the running partition and the one set to boot next, straight from flash. Each
+hash covers the partition up to the image's length, which with the digest the
+build appends is exactly `firmware.bin`, so it matches the op's `sha256`. A
+rollback, a `/u` install or a power cut cannot leave the answer out of date.
+The first op after a boot hashes both images once, after the stream closes
+(about a second, estimated); later ops use the cached hashes. If either
+hash cannot be read, the panel installs nothing and waits for the next op.
 
 ### Over the LAN
 
@@ -299,7 +303,7 @@ open, which suits the bench and nothing else.
 
 | Route | Method | Purpose |
 |---|---|---|
-| `/state` | GET | heap, pull counters, TLS mode, panel config |
+| `/state` | GET | heap, pull counters, TLS mode, panel config (fields below) |
 | `/frame` | GET/POST | read the frame as raw RGB565, or post it base64 encoded (RGB565 or RGB888) |
 | `/pixel`, `/pixels` | POST | set one or many pixels |
 | `/brightness` | POST | 0–255 |
@@ -311,6 +315,19 @@ open, which suits the bench and nothing else.
 | `/update` | GET | upload page |
 | `/safe` | POST | boot into safe mode (no panel init) |
 | `/reboot` | POST | restart |
+
+The memory fields in `/state` say whether a TLS handshake has room. The relay's
+`/device` repeats them from `X-Pxt-State`, as of the last stream connect.
+
+| Field | Meaning |
+|---|---|
+| `heap` | free heap now |
+| `maxblock` | largest free block now; a handshake needs one big contiguous block |
+| `minheap` | lowest free heap since boot. A handshake that failed with an allocation error shows here as a low mark |
+| `reset` | why the previous boot ended: `poweron`, `sw` (asked for), `panic`, `task_wdt`, `int_wdt` (the app's watchdogs), `brownout`, or `wdt`: the RTC watchdog, which runs only while the bootloader does, so the boot hung before the app started (seen after a slow power-up) |
+| `udp_stack` | bytes of the UDP task's stack never used, as it last measured; 0 until UDP starts |
+| `hsheap`, `hsblock` | free heap and largest block as the last TLS handshake began, with the UDP task stopped. The handshake needs room from here; compare with `minheap` |
+| `boots` | failed boots in a row (crashes, watchdogs, the panel guard); at 2 the panel boots safe |
 
 Frames are 128×64 RGB565, big-endian. The panel is wired with green and blue
 swapped, so a client that packs RGB565 itself has to swap them too:
@@ -452,7 +469,11 @@ The panel never trusts the image it just booted blindly. On first boot after an
 update it waits for one complete frame; if none arrives it resets into the
 previous image. A boot counter plus a one-shot timer catches a panel
 configuration that hangs boot, and `/safe` (or two failed boots in a row) boots
-with the panel disabled so the HTTP API stays reachable.
+with the panel disabled so the HTTP API stays reachable. A boot counts as failed
+when it ended in a crash, the app's interrupt or task watchdog, a brownout or
+the panel guard's restart, judged by the reset reason the next boot reads. Power on, the EN pin (every
+serial tool pulses it) and restarts the firmware asks for do not count. The
+count starts over once a boot stays up for 60 s.
 
 **Dump your own stock firmware before replacing it.** The vendor image is not
 included here and must not be redistributed; a full 4 MB read over the serial
@@ -471,7 +492,13 @@ tools/serial_cmd.py state                # also test, reboot, bright N, wifi SSI
 `flash_serial.py` erases the OTA data partition before it writes. An earlier
 over-the-air update leaves the bootloader pointed at the other app slot, and it
 would keep booting the old image. Serial commands need no key, since they
-assume physical access. All three tools take `--port`.
+assume physical access.
+
+All three tools pick the one `/dev/cu.usbserial-*` adapter plugged in (its
+number follows the USB port), or take `--port`. They need pyserial, which the
+macOS system python3 lacks, so they re-run themselves under PlatformIO's Python
+(`~/.platformio/penv/bin/python`). Opening the port resets the panel even with
+`mon.py --no-reset`: macOS raises DTR and RTS on open, and RTS drives EN.
 
 ## Known limits
 
@@ -487,6 +514,10 @@ assume physical access. All three tools take `--port`.
   antenna away from the modules and their ribbon cable is the hardware fix.
 - One TLS session at a time while starting up: the ESP32 needs a contiguous
   block for the RSA handshake, and two sessions do not fit.
+- The UDP task stops for every TLS handshake and firmware download: it closes
+  its socket and deletes itself, so its stack and every strip queued in lwIP
+  go back to the heap first. It starts again once the handshake returns. With
+  it running, handshakes after the first ran out of heap.
 - The panel reports its state in an `X-Pxt-State` header on the stream request,
   so telemetry costs no second TLS session. A relay that never sees the panel
   reconnect will show a stale `device_age`. The `_sent` field in `/device` does
@@ -499,10 +530,14 @@ assume physical access. All three tools take `--port`.
   it back. The tools here stay at or below about 11 (`mirror.js` about 11,
   `orderbook.js` 8 by default), which has held.
 
-`src/relay_ca.h` pins ISRG Root X1, the Let's Encrypt anchor. A relay on any
-other certificate needs its own root pasted there, or the panel falls back to
-unverified TLS after five rejected certificates, and retries the verified chain
-every 30 minutes.
+`src/relay_ca.h` pins two Let's Encrypt roots: ISRG Root X1 and ISRG Root YE.
+X1 alone verifies any Let's Encrypt chain. YE is there for heap. The relay's
+chain runs leaf, YE2, Root YE, X2, X1. Trusting YE lets the TLS library stop at
+YE2's parent and skip X1's RSA-4096 signature over X2. That check needs more
+heap than the panel has once UDP is running. A relay on any other certificate
+needs its own root pasted there, or the panel falls back to unverified TLS
+after five rejected certificates, and retries the verified chain every 30
+minutes.
 
 ## License
 

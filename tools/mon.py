@@ -3,24 +3,32 @@
 
   tools/mon.py                 # reset and print 8 s of log
   tools/mon.py --seconds 20
-  tools/mon.py --no-reset      # listen without resetting the chip
+  tools/mon.py --no-reset      # skip the extra reset pulse (see below)
+
+Runs under PlatformIO's Python when the system python3 has no pyserial, and
+picks the one /dev/cu.usbserial-* adapter unless --port names another.
+
+Opening the port resets the panel's adapter even with --no-reset: macOS raises
+DTR and RTS on open, before this script can drop them, and RTS drives EN.
+--no-reset only skips the second pulse. Every run is a reboot.
 """
 import argparse
 import time
 
-PORT = "/dev/cu.usbserial-210"
+from serial_port import default_port, ensure_pyserial
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=8)
     ap.add_argument("--no-reset", action="store_true")
-    ap.add_argument("--port", default=PORT)
+    ap.add_argument("--port")
     args = ap.parse_args()
 
+    ensure_pyserial()
     import serial
 
-    s = serial.Serial(args.port, 115200, timeout=0.2)
+    s = serial.Serial(args.port or default_port(), 115200, timeout=0.2)
     # Opening a port asserts DTR/RTS; RTS is wired to EN on this adapter.
     # Release both so the chip is not held in reset while we listen.
     s.setDTR(False)

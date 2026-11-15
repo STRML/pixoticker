@@ -18,6 +18,7 @@
 #include <Update.h>
 #include <HTTPClient.h>
 #include <esp_ota_ops.h>
+#include <esp_image_format.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/md.h>
 #include <esp_timer.h>
@@ -29,14 +30,37 @@
 #include "relay_ca.h"
 #include "pxt_rules.h"
 
+// resetName in pxt_rules.h maps these by number.
+static_assert(ESP_RST_POWERON == 1 && ESP_RST_SW == 3 && ESP_RST_PANIC == 4 && ESP_RST_TASK_WDT == 6 &&
+                  ESP_RST_BROWNOUT == 9,
+              "esp_reset_reason_t moved; update resetName");
+
 RTC_NOINIT_ATTR static uint32_t s_magic;
 RTC_NOINIT_ATTR static uint32_t s_boots;
 RTC_NOINIT_ATTR static uint32_t s_last_rc;  // 1 ok, 2 begin false, 3 guard fired
+RTC_NOINIT_ATTR static uint32_t s_guard_hit;  // GUARD_MAGIC: the panel guard restarted the chip
+static const uint32_t GUARD_MAGIC = 0x47524431;  // "GRD1"
 static const uint32_t BOOT_MAGIC = 0x50585431;  // "PXT1"
-static const uint32_t MAX_PANEL_ATTEMPTS = 2;
+static const uint32_t MAX_PANEL_ATTEMPTS = 2;  // failed boots in a row before safe mode
+// A boot that stays up this long has held, and the boot counter starts over.
+static const uint32_t BOOT_STABLE_MS = 60000;
 static const char *AP_NAME = "PixoTicker";
 
 static Preferences s_prefs;
+// One Preferences handle serves the web server, the pull task and the serial
+// loop. A second begin() fails while one is open, and its end() would close
+// the other's session, so every session holds this lock.
+static SemaphoreHandle_t s_prefs_mu = xSemaphoreCreateRecursiveMutex();
+
+static void prefsBegin(bool read_only) {
+  xSemaphoreTakeRecursive(s_prefs_mu, portMAX_DELAY);
+  s_prefs.begin("pxt", read_only);
+}
+
+static void prefsEnd() {
+  s_prefs.end();
+  xSemaphoreGiveRecursive(s_prefs_mu);
+}
 static WebServer s_http(80);
 static PanelCfg s_cfg;
 static uint16_t *s_fb = nullptr;
@@ -82,7 +106,9 @@ static char s_pull_phase[24] = "idle";
 static uint32_t s_boot_id = 0;  // random per boot: ties the UDP hello to the stream's X-Pxt-State
 static volatile uint32_t s_udp_good = 0, s_udp_bad = 0;
 static volatile uint32_t s_whole = 0;  // complete frames shown since boot; the hello reports it
-static TaskHandle_t s_udp_task = nullptr;
+static TaskHandle_t volatile s_udp_task = nullptr;  // set while the UDP task runs
+static volatile uint32_t s_udp_stack_free = 0;      // its stack headroom, as it last measured
+static volatile uint32_t s_hs_heap = 0, s_hs_block = 0;  // free heap and largest block as the last handshake began
 static void set_phase(const char *p) { snprintf(s_pull_phase, sizeof(s_pull_phase), "%s", p); }
 
 // Hold a freshly flashed image in "pending verify" so the bootloader rolls it
@@ -93,7 +119,7 @@ extern "C" bool verifyRollbackLater() { return true; }
 // ---------------------------------------------------------------- config
 
 static void loadConfig() {
-  s_prefs.begin("pxt", true);
+  prefsBegin(true);
   s_cfg.across = s_prefs.getUChar("across", 2);
   s_cfg.down = s_prefs.getUChar("down", 1);
   s_cfg.serpentine = s_prefs.getUChar("serp", 0);
@@ -101,17 +127,17 @@ static void loadConfig() {
   s_cfg.modH = s_prefs.getUChar("modh", 64);
   s_safe = s_prefs.getUChar("safe", 0) != 0;
   s_brightness = s_prefs.getUChar("bright", 128);
-  s_prefs.end();
+  prefsEnd();
 }
 
 static void savePanel(const PanelCfg &c) {
-  s_prefs.begin("pxt", false);
+  prefsBegin(false);
   s_prefs.putUChar("across", c.across);
   s_prefs.putUChar("down", c.down);
   s_prefs.putUChar("serp", c.serpentine);
   s_prefs.putUChar("invclk", c.invertClock);
   s_prefs.putUChar("modh", c.modH);
-  s_prefs.end();
+  prefsEnd();
 }
 
 // This panel is wired G/B swapped: a green write lands on the blue LEDs.
@@ -138,9 +164,7 @@ static bool ensureFb(const PanelCfg &c) {
 // ---------------------------------------------------------------- guard
 
 static void guardExpired(void *) {
-  s_boots = (s_magic == BOOT_MAGIC) ? s_boots : 1;
-  s_magic = BOOT_MAGIC;
-  s_boots++;
+  s_guard_hit = GUARD_MAGIC;  // the next boot counts this one as failed (bootCounts)
   s_last_rc = 3;
   esp_restart();
 }
@@ -239,13 +263,17 @@ static String buildStateJson() {
   j += "\"tls_fails\":" + String(s_tls_fails) + ",";
   j += "\"tls_mode\":\"" + String(s_tls_insecure ? "insecure" : "verified") + "\",";
   j += "\"maxblock\":" + String(ESP.getMaxAllocHeap()) + ",";
+  j += "\"minheap\":" + String(ESP.getMinFreeHeap()) + ",";
+  j += "\"reset\":\"" + String(resetName(esp_reset_reason())) + "\",";
   j += "\"epoch\":" + String((unsigned long)time(nullptr)) + ",";
   j += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   j += "\"ops\":" + String(s_ops_applied) + ",";
   j += "\"boot\":" + String(s_boot_id) + ",";
   j += "\"udp_good\":" + String(s_udp_good) + ",";
   j += "\"udp_bad\":" + String(s_udp_bad) + ",";
-  j += "\"udp_stack\":" + String(s_udp_task ? uxTaskGetStackHighWaterMark(s_udp_task) : 0);
+  j += "\"udp_stack\":" + String((uint32_t)s_udp_stack_free) + ",";
+  j += "\"hsheap\":" + String((uint32_t)s_hs_heap) + ",";
+  j += "\"hsblock\":" + String((uint32_t)s_hs_block);
   j += "}";
   return j;
 }
@@ -270,6 +298,10 @@ static String stateHeader() {
              "\",\"uptime\":" + String(millis() / 1000) +
              ",\"heap\":" + String(ESP.getFreeHeap()) +
              ",\"maxblock\":" + String(ESP.getMaxAllocHeap()) +
+             ",\"minheap\":" + String(ESP.getMinFreeHeap()) +
+             ",\"hsheap\":" + String((uint32_t)s_hs_heap) +
+             ",\"hsblock\":" + String((uint32_t)s_hs_block) +
+             ",\"reset\":\"" + String(resetName(esp_reset_reason())) + "\"" +
              ",\"frames\":" + String((uint32_t)s_pull_frames) +
              ",\"errors\":" + String((uint32_t)s_pull_errors) +
              ",\"phase\":\"" + String(s_pull_phase) + "\"" +
@@ -437,9 +469,9 @@ static void handleBrightness() {
     return;
   }
   s_brightness = (uint8_t)level;
-  s_prefs.begin("pxt", false);
+  prefsBegin(false);
   s_prefs.putUChar("bright", s_brightness);
-  s_prefs.end();
+  prefsEnd();
   panel_setBrightness(s_brightness);
   s_http.send(200, "application/json", "{\"brightness\":" + String(level) + "}");
 }
@@ -508,9 +540,9 @@ static void handlePanelTry() {
 static void handleSafe() {
   bool on = true;
   if (s_http.hasArg("on")) on = s_http.arg("on").toInt() != 0;
-  s_prefs.begin("pxt", false);
+  prefsBegin(false);
   s_prefs.putUChar("safe", on ? 1 : 0);
-  s_prefs.end();
+  prefsEnd();
   s_http.send(200, "application/json", on ? "{\"safe\":true}" : "{\"safe\":false}");
   delay(200);
   ESP.restart();
@@ -531,6 +563,11 @@ static volatile uint8_t s_upd_owner = UPD_NONE;
 static portMUX_TYPE s_upd_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_up_mine = false;  // the /u upload in progress holds the token
 static bool s_up_busy = false;  // the /u upload in progress was refused because a download holds it
+// Bumped whenever an install starts or commits, so a cached hash of the boot
+// image is never trusted across one (see imagesHash).
+static volatile uint32_t s_img_gen = 0;
+static void imagesChanged() { s_img_gen = s_img_gen + 1; }
+
 
 static bool updTake(uint8_t who) {
   bool got;
@@ -574,6 +611,7 @@ static void otaChunk(HTTPUpload &up) {
       Serial.println("[ota] /u refused: a download owns the updater");
       return;
     }
+    imagesChanged();
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(Serial);
       updRelease(UPD_UPLOAD);
@@ -585,8 +623,11 @@ static void otaChunk(HTTPUpload &up) {
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_END) {
-    s_ota_written = up.totalSize + up.currentSize;
+    // The last chunk came as a WRITE already; at END buf still holds it and
+    // totalSize counts it.
+    s_ota_written = up.totalSize;
     s_ota_ok = Update.end(true);
+    imagesChanged();
     if (!s_ota_ok) Update.printError(Serial);
     s_up_mine = false;
     updRelease(UPD_UPLOAD);
@@ -671,10 +712,10 @@ static void handleWifiSave() {
     return;
   }
   String s = s_http.arg("s"), p = s_http.arg("p");
-  s_prefs.begin("pxt", false);
+  prefsBegin(false);
   s_prefs.putString("ssid", s);
   s_prefs.putString("pass", p);
-  s_prefs.end();
+  prefsEnd();
   s_http.send(200, "text/html", "saved, rebooting");
   delay(300);
   ESP.restart();
@@ -683,10 +724,10 @@ static void handleWifiSave() {
 // ---------------------------------------------------------------- setup
 
 static void startNetwork() {
-  s_prefs.begin("pxt", true);
+  prefsBegin(true);
   String ssid = s_prefs.getString("ssid", "");
   String pass = s_prefs.getString("pass", "");
-  s_prefs.end();
+  prefsEnd();
 
   // AP comes up before anything can block, on every boot.
   WiFi.mode(WIFI_AP_STA);
@@ -812,6 +853,7 @@ static OtaStop otaPull(const String &path, size_t want, const String &shaHex, si
       http.end();
       return OTA_FATAL;
     }
+    imagesChanged();
     if (!Update.begin(want)) {
       updRelease(UPD_RELAY);
       why = "begin failed";
@@ -894,6 +936,7 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
     return false;
   }
   bool ended = Update.end(true);
+  imagesChanged();
   updRelease(UPD_RELAY);
   if (!ended) {
     otaNote("end failed", total, want);
@@ -903,59 +946,88 @@ static bool otaFrom(const String &path, size_t want, const String &shaHex) {
   return true;
 }
 
-// Re-queued ops must not reinstall the image that is already running: that
-// would reboot the panel on every reconnect. NVS survives an app flash, so the
-// version written after a verified install is the one to compare.
-static String s_ota_installed;
+// Re-queued ops must not reinstall an image already on the device: that would
+// restart the panel on every reconnect. The answer comes from the flash, not
+// from a record: the SHA-256 of the image in the running partition and in the
+// boot partition, each over the partition's bytes up to the image length.
+// With the digest the build appends, that is the whole .bin, so it equals the
+// hash in the ota op (sha256 of firmware.bin).
+struct ImageHash {
+  const esp_partition_t *part = nullptr;
+  uint32_t gen = 0;
+  char hex[65] = "";
+};
+static ImageHash s_img_running, s_img_boot;
 
-// Called after Update.end(true), so the boot partition is the slot just
-// written. The slot goes first: power lost between the two writes leaves no
-// pending hash, never a hash with the wrong slot.
-static void rememberInstalled(const String &shaHex) {
-  const esp_partition_t *slot = esp_ota_get_boot_partition();
-  s_prefs.begin("pxt", false);
-  s_prefs.putString("otaslot", slot ? slot->label : "");
-  s_prefs.putString("otapending", shaHex);  // proven only by the first frame
-  s_prefs.end();
+// Reads in s_rx-sized chunks and yields every 64 KB, so the idle task (and
+// with it the task watchdog) keeps running. Uses s_rx: call only while the
+// stream is closed.
+static bool imageHash(const esp_partition_t *part, char hex[65]) {
+  esp_partition_pos_t pos = {part->address, part->size};
+  esp_image_metadata_t meta;
+  if (esp_image_get_metadata(&pos, &meta) != ESP_OK || !meta.image_len || meta.image_len > part->size) return false;
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  bool ok = true;
+  for (uint32_t off = 0; off < meta.image_len && ok; off += sizeof(s_rx)) {
+    uint32_t n = meta.image_len - off;
+    if (n > sizeof(s_rx)) n = sizeof(s_rx);
+    ok = esp_partition_read(part, off, s_rx, n) == ESP_OK;
+    if (ok) mbedtls_sha256_update(&ctx, s_rx, n);
+    if ((off / sizeof(s_rx)) % 16 == 15) delay(1);
+  }
+  uint8_t dig[32];
+  mbedtls_sha256_finish(&ctx, dig);
+  mbedtls_sha256_free(&ctx);
+  if (!ok) return false;
+  for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", dig[i]);
+  return true;
 }
 
-static void promoteInstalled() {
-  s_prefs.begin("pxt", false);
-  String pending = s_prefs.getString("otapending", "");
-  if (pending.length()) {
-    s_prefs.putString("otasha", pending);
-    s_prefs.remove("otapending");
-    s_prefs.remove("otaslot");
-    s_ota_installed = pending;
-  }
-  s_prefs.end();
+// The cached hash for a partition, or "" when it is not known for the image
+// there now. The running image cannot change during a boot, so its hash
+// stands; the boot image's stands only until an install begins or commits.
+static const char *imageKnown(const ImageHash &h, const esp_partition_t *part, bool follows_installs) {
+  return (part && h.part == part && (!follows_installs || h.gen == s_img_gen)) ? h.hex : "";
 }
 
-// At boot, settle the pending hash by the slot it was written to: drop it
-// after a rollback, promote it after a confirm that power cut short.
-static void settlePending() {
-  const esp_partition_t *running = esp_ota_get_running_partition();
-  esp_ota_img_states_t st;
-  bool confirmed = running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_VALID;
-  s_prefs.begin("pxt", true);
-  bool has = s_prefs.isKey("otapending");
-  String slot = s_prefs.getString("otaslot", "");
-  s_prefs.end();
-  switch (otaPendingFate(has, slot.c_str(), running ? running->label : "", confirmed)) {
-    case PENDING_DROP:
-      s_prefs.begin("pxt", false);
-      s_prefs.remove("otapending");
-      s_prefs.remove("otaslot");
-      s_prefs.end();
-      Serial.println("[ota] rolled back: dropped the pending image");
-      break;
-    case PENDING_PROMOTE:
-      promoteInstalled();
-      Serial.println("[ota] finished an interrupted confirm");
-      break;
-    case PENDING_KEEP:
-      break;
-  }
+static void imageFill(ImageHash &h, const esp_partition_t *part, bool follows_installs) {
+  if (!part || imageKnown(h, part, follows_installs)[0]) return;
+  uint32_t gen = s_img_gen;
+  char hex[65];
+  if (!imageHash(part, hex)) return;  // unknown: otaDecide waits
+  if (follows_installs && gen != s_img_gen) return;  // an install moved the boot image under us
+  memcpy(h.hex, hex, sizeof(hex));
+  h.part = part;
+  h.gen = gen;
+}
+
+// Hashes the running and boot images not cached yet. Only from otaRun: the
+// stream is closed, s_rx is free, and no TLS handshake is under way. First
+// time, a little over a second for two images (estimate).
+static void imagesHash() {
+  uint32_t t = millis();
+  imageFill(s_img_running, esp_ota_get_running_partition(), false);
+  imageFill(s_img_boot, esp_ota_get_boot_partition(), true);
+  Serial.printf("[ota] images hashed in %u ms\n", (unsigned)(millis() - t));
+}
+
+// Skip, install, or wait for a later op when a hash is not known (otaDecide).
+static OtaDecision otaDecision(const String &sha) {
+  const esp_partition_t *run = esp_ota_get_running_partition(), *boot = esp_ota_get_boot_partition();
+  const char *r = imageKnown(s_img_running, run, false);
+  const char *b = boot == run ? r : imageKnown(s_img_boot, boot, true);
+  return otaDecide(sha.c_str(), r, b);
+}
+
+// Firmware before this kept hash records in NVS. Nothing reads them now.
+static void forgetOtaRecords() {
+  static const char *const keys[] = {"otasha", "otapending", "otaslot", "pendapp0", "pendapp1"};
+  prefsBegin(false);
+  for (const char *k : keys)
+    if (s_prefs.isKey(k)) s_prefs.remove(k);
+  prefsEnd();
 }
 
 static String s_ota_path, s_ota_sha;
@@ -971,12 +1043,11 @@ static void otaOp(const char *js) {
     Serial.println("[ota] bad op");
     return;
   }
-  s_prefs.begin("pxt", true);
-  if (!s_ota_installed.length()) s_ota_installed = s_prefs.getString("otasha", "");
-  String pending = s_prefs.getString("otapending", "");
-  s_prefs.end();
-  if (otaIsCurrent(sha.c_str(), s_ota_installed.c_str(), pending.c_str())) {
-    Serial.println("[ota] already running this image");
+  // A cached match answers a re-posted op here, and the stream stays up.
+  // Anything else goes to otaRun, which hashes what is not cached yet once the
+  // stream is closed.
+  if (otaDecision(sha) == OTA_SKIP) {
+    Serial.println("[ota] already on the device");
     return;
   }
   // The stream still holds a TLS session and a second handshake does not fit
@@ -989,9 +1060,19 @@ static void otaOp(const char *js) {
 
 static void otaRun() {
   s_ota_pending = false;
+  imagesHash();
+  switch (otaDecision(s_ota_sha)) {
+    case OTA_SKIP:
+      Serial.println("[ota] already on the device");
+      return;
+    case OTA_WAIT:
+      Serial.println("[ota] could not hash the images in flash; waiting for the next op");
+      return;
+    case OTA_INSTALL:
+      break;
+  }
   Serial.printf("[ota] %s %u\n", s_ota_path.c_str(), (unsigned)s_ota_want);
   if (!otaFrom(s_ota_path, s_ota_want, s_ota_sha)) return;
-  rememberInstalled(s_ota_sha);
   Serial.println("[ota] written, restarting");
   delay(300);
   ESP.restart();
@@ -1025,9 +1106,9 @@ static void applyOp(const char *js) {
       if (lvl < 0) lvl = 0;
       if (lvl > 255) lvl = 255;
       s_brightness = (uint8_t)lvl;
-      s_prefs.begin("pxt", false);
+      prefsBegin(false);
       s_prefs.putUChar("bright", s_brightness);
-      s_prefs.end();
+      prefsEnd();
       panel_setBrightness(s_brightness);
     }
   }
@@ -1047,12 +1128,11 @@ static void frameShown(uint32_t seq, bool complete) {
   if (complete && !s_healthy) s_confirm_due = true;
 }
 
-// Cancels the rollback and records the image. Runs on the pull task only.
+// Cancels the rollback. Runs on the pull task only.
 static void confirmImage() {
   if (!s_confirm_due || s_healthy) return;
   s_healthy = true;
   esp_ota_mark_app_valid_cancel_rollback();
-  promoteInstalled();
   Serial.println("[ota] image confirmed");
 }
 
@@ -1202,8 +1282,7 @@ static mbedtls_md_context_t s_mac;
 static volatile uint32_t s_udp_last = 0;       // millis of the last valid datagram
 static volatile uint32_t s_udp_since = 0;      // start of the current run of valid datagrams
 static volatile bool s_udp_draws = true;       // false while the stream carries frames
-static volatile bool s_udp_pause = false;      // a firmware download owns the link
-static volatile bool s_udp_closed = true;      // the UDP task holds no socket
+static volatile bool s_udp_stop = false;       // a TLS handshake or firmware download needs the heap
 static const uint32_t UDP_RESOLVE_MS = 300000;      // refresh the relay's address this often
 static const uint32_t UDP_RESOLVE_RETRY_MS = 30000; // after a failed refresh, keep the old one this long
 // The last hellos sent this boot: a random nonce the relay echoes, and when
@@ -1444,12 +1523,48 @@ static bool udpResolve(sockaddr_in &to) {
   return true;
 }
 
+static const uint32_t UDP_STACK = 4096;  // about 2 KB used on the panel (udp_stack read 4168 free of 6144)
+static volatile bool s_udp_dead = false;  // the task could not start; do not start it again
+
+static void udpTask(void *);
+
+// Runs only while it has work: from the first 200 that hands over a token,
+// and never across a TLS handshake or a firmware download. Then the task
+// closes its socket, frees its HMAC context and deletes itself, so its stack,
+// its socket and every strip queued in lwIP go back to the heap.
+static void udpStart() {
+  s_udp_stop = false;  // also cancels a stop the task has not acted on yet
+  if (s_udp_task || s_udp_dead || !udpHasToken()) return;
+  // FreeRTOS writes the handle before the task can run, and the task, which
+  // outranks this one, may exit at once and clear it again.
+  xTaskCreatePinnedToCore(udpTask, "udp", UDP_STACK, nullptr, 2, (TaskHandle_t *)&s_udp_task, 0);
+}
+
+// Returns once the task is gone, or after UDP_STOP_MS if it is stuck in a DNS
+// lookup. The idle task frees a deleted task's stack, so wait a tick after.
+static const uint32_t UDP_STOP_MS = 8000;
+
+static void udpStop() {
+  if (!s_udp_task) return;
+  s_udp_stop = true;
+  for (uint32_t t = millis(); s_udp_task && millis() - t < UDP_STOP_MS;) delay(10);
+  delay(20);
+}
+
+static void udpExit(int sock) {
+  if (sock >= 0) close(sock);
+  mbedtls_md_free(&s_mac);
+  s_udp_task = nullptr;
+  vTaskDelete(nullptr);
+}
+
 static void udpTask(void *) {
   mbedtls_md_init(&s_mac);
   if (mbedtls_md_setup(&s_mac, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1) != 0 ||
       mbedtls_md_hmac_starts(&s_mac, (const uint8_t *)PXT_RELAY_KEY, strlen(PXT_RELAY_KEY)) != 0) {
     Serial.println("[udp] no HMAC, frames stay on the stream");
-    vTaskDelete(nullptr);
+    s_udp_dead = true;
+    udpExit(-1);
     return;
   }
   int sock = -1;
@@ -1457,15 +1572,13 @@ static void udpTask(void *) {
   bool known = false;  // relay holds an address
   uint32_t resolved = 0, hello = 0;
   for (;;) {
-    if (s_udp_pause && sock >= 0) {
-      // A firmware download needs the heap its TLS handshake asks for; an open
-      // socket keeps queued datagrams in it.
-      close(sock);
-      sock = -1;
+    s_udp_stack_free = uxTaskGetStackHighWaterMark(nullptr);
+    if (s_udp_stop) {
+      udpExit(sock);
+      return;
     }
-    s_udp_closed = sock < 0;
-    if (WiFi.status() != WL_CONNECTED || !s_fb || s_udp_pause) {
-      delay(s_udp_pause ? 50 : 500);
+    if (WiFi.status() != WL_CONNECTED || !s_fb) {
+      delay(500);
       continue;
     }
     if (sock < 0 && (sock = udpOpen()) < 0) {
@@ -1549,7 +1662,12 @@ static void pullTask(void *) {
     IPAddress rip;
     int drc = WiFi.hostByName(PXT_RELAY_HOST, rip);
     snprintf(s_pull_dns, sizeof(s_pull_dns), "%s", drc == 1 ? rip.toString().c_str() : "fail");
-    if (!c.connect(PXT_RELAY_HOST, PXT_RELAY_PORT)) {
+    udpStop();
+    s_hs_heap = ESP.getFreeHeap();
+    s_hs_block = ESP.getMaxAllocHeap();
+    bool connected = c.connect(PXT_RELAY_HOST, PXT_RELAY_PORT);
+    udpStart();  // keeps UDP frames coming while TLS is down; a no-op before the first token
+    if (!connected) {
       s_pull_errors++;
       s_pull_code = -1;
       char err[64] = "";
@@ -1598,6 +1716,7 @@ static void pullTask(void *) {
       continue;
     }
     udpTokenSet(got_token ? token : nullptr);  // a 200 without one: this relay or path offers no UDP
+    if (got_token) udpStart();
     set_phase(mode.udp ? "udp" : "stream");
     FrameSink sink;
     // One bulk read per socket wake-up. Reading the chunk headers a byte at a
@@ -1650,10 +1769,9 @@ static void pullTask(void *) {
   stream_end:
     c.stop();
     if (s_ota_pending) {
-      s_udp_pause = true;
-      for (int i = 0; i < 40 && !s_udp_closed; i++) delay(25);  // let the UDP task close its socket
+      udpStop();
       otaRun();
-      s_udp_pause = false;
+      udpStart();
     }
     delay(300);
   }
@@ -1671,13 +1789,18 @@ void setup() {
     s_magic = BOOT_MAGIC;
     s_boots = 0;
     s_last_rc = 0;
+    s_guard_hit = 0;
   }
-  s_boots++;
+  // Only a crash, a watchdog, a brownout or the panel guard counts. Power on,
+  // the EN pin (every serial tool pulses it) and asked-for restarts start over.
+  bool guard = s_guard_hit == GUARD_MAGIC;
+  s_guard_hit = 0;
+  s_boots = bootCounts(esp_reset_reason(), guard) ? s_boots + 1 : 0;
 
   loadConfig();
-  settlePending();
-  if (s_boots > MAX_PANEL_ATTEMPTS) {
-    Serial.printf("[pxt] safe mode: %u boot attempts\n", (unsigned)s_boots);
+  forgetOtaRecords();
+  if (s_boots >= MAX_PANEL_ATTEMPTS) {
+    Serial.printf("[pxt] safe mode: %u failed boots in a row\n", (unsigned)s_boots);
     s_safe = true;
   }
 
@@ -1693,7 +1816,6 @@ void setup() {
     bool ok = panel_begin(s_cfg);
     guardDisarm();
     if (ok) {
-      s_boots = 0;
       ensureFb(s_cfg);
       panel_setBrightness(s_brightness);
     } else {
@@ -1707,10 +1829,10 @@ void setup() {
     esp_ota_mark_app_valid_cancel_rollback();
   }
   if (strlen(PXT_RELAY_KEY) && strlen(PXT_RELAY_HOST)) {
+    // The UDP task starts later, from the pull task (udpStart), above it in
+    // priority so a burst of strips is drained before lwIP's small UDP queue
+    // overflows.
     xTaskCreatePinnedToCore(pullTask, "pull", 12288, nullptr, 1, nullptr, 0);
-    // Above the pull task, so a burst of strips is drained before lwIP's
-    // small UDP queue overflows.
-    xTaskCreatePinnedToCore(udpTask, "udp", 6144, nullptr, 2, &s_udp_task, 0);
   }
 
   s_http.on("/", HTTP_GET, handleRoot);
@@ -1772,9 +1894,9 @@ static void serialLine(String line) {
   } else if (line.startsWith("bright ")) {
     int v = line.substring(7).toInt();
     s_brightness = (uint8_t)constrain(v, 0, 255);
-    s_prefs.begin("pxt", false);
+    prefsBegin(false);
     s_prefs.putUChar("bright", s_brightness);
-    s_prefs.end();
+    prefsEnd();
     panel_setBrightness(s_brightness);
     Serial.printf("brightness %u\n", s_brightness);
   } else if (line.startsWith("panel ")) {
@@ -1809,10 +1931,10 @@ static void serialLine(String line) {
       return;
     }
     String ssid = line.substring(5, sp), pass = line.substring(sp + 1);
-    s_prefs.begin("pxt", false);
+    prefsBegin(false);
     s_prefs.putString("ssid", ssid);
     s_prefs.putString("pass", pass);
-    s_prefs.end();
+    prefsEnd();
     Serial.printf("wifi saved for %s, rebooting\n", ssid.c_str());
     delay(200);
     ESP.restart();
@@ -1837,4 +1959,5 @@ static void pollSerial() {
 void loop() {
   s_http.handleClient();
   pollSerial();
+  if (s_boots && millis() > BOOT_STABLE_MS) s_boots = 0;
 }
