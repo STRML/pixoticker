@@ -93,11 +93,13 @@ example `http://127.0.0.1:11234/metrics.json?node=studio1`: the router answers `
 from <url>`, once a minute per status. A bare `/metrics.json` on the router is answered by a different group on each
 read, and one that refuses makes the panel flip between figures and `--`.
 
-**On a Studio.** The agent runs from `~/opt/pixoticker/agent.py` under the launchd agent `local.pixostat`
-(`~/Library/LaunchAgents/local.pixostat.plist`) and logs to `~/.mlx-serve/logs/pixostat.log`. The Studios run
-the stock Python 3.9, so `agent.py` stays standard-library only. `launchctl kickstart -k` restarts the process but
-does not re-read an edited plist; after changing its arguments, run `launchctl bootout gui/$UID/local.pixostat`
-and then `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/local.pixostat.plist`.
+**On a Studio.** The agent runs from `~/opt/pixoticker/agent.py` under the system LaunchDaemon `local.pixostat`
+(`/Library/LaunchDaemons/local.pixostat.plist`, `UserName` set to the owner), so it starts at boot and reports even
+when a box was rebooted and unlocked over ssh with no GUI login (a LaunchAgent would not load then). It logs to
+`~/.mlx-serve/logs/pixostat.log`, errors only. The plist comes from the Studio cluster's Ansible play
+(STRML/local-llm `bench/studio-cluster/ansible`, tag `pixostat`; template `files/pixostat.plist.j2`), so change its
+arguments there and run `ansible-playbook site.yml --tags pixostat`. The Studios run the stock Python 3.9, so
+`agent.py` stays standard-library only. To restart by hand: `sudo launchctl kickstart -k system/local.pixostat`.
 
 **Night dimming.** Set `--dim "20:00-07:30@0.25"` (`BOARD_DIM`, with `--tz` or `BOARD_TZ`) and the board dims every
 frame it sends inside that window. The board does this because firmware brightness ops are not replayed after a
